@@ -1,0 +1,354 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { callLLM } from '../agents/llm.js';
+import { store } from '../storage/index.js';
+import type { ConversationTurn } from './retrieve.js';
+import { progressionForStrategy } from '../sales/salesSkill.js';
+import { matchSalesActions, SALES_ACTION_LIBRARY } from '../sales/actionLibrary.js';
+
+export interface ResponseStrategy {
+  id: string;
+  scenario: string;
+  signals: string[];
+  intent: string;
+  strategy: string[];
+  examples: string[];
+  risk_link: string;
+  escalate: string;
+  bant_impact?: string[];
+  goal?: string;
+  actions?: string[];
+  talk?: string[][];
+  talk_variants?: string[][];
+  risk?: string;
+}
+
+interface StrategyMemoryRecord {
+  id: string;
+  tenant_id: string;
+  strategy_id: string;
+  adjustment: string;
+  evidence_count: number | string;
+  status: string;
+  source?: string;
+  scenario?: string;
+  signals?: string[] | string;
+  intent?: string;
+  strategy_steps?: string[] | string;
+  risk_link?: string;
+  escalate?: string;
+  evidence_customer_count?: number | string;
+  evidence_period_count?: number | string;
+  rollout_percent?: number | string;
+}
+
+export interface RetrievedStrategy {
+  strategy: ResponseStrategy;
+  confidence: number;
+  reason: string;
+  method: 'semantic' | 'heuristic';
+  learnedAdjustment?: string;
+  learnedEvidenceCount?: number;
+}
+
+export interface StrategyRetrieveInput {
+  latestMessage: string;
+  conversation?: ConversationTurn[];
+  stage?: string;
+  intent?: string;
+  firstTurn?: boolean;
+  knowledgeMiss?: boolean;
+  productAvailable?: boolean;
+  redFlagCount?: number;
+  fallbackCount?: number;
+  sentiment?: string;
+  customerId?: string;
+}
+
+interface ScoredStrategy {
+  strategy: ResponseStrategy;
+  score: number;
+  matchedSignals: string[];
+}
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const strategyFile = path.join(__dirname, 'strategies.json');
+const JSON_STRATEGIES = JSON.parse(fs.readFileSync(strategyFile, 'utf8')) as ResponseStrategy[];
+const ACTION_STRATEGIES: ResponseStrategy[] = SALES_ACTION_LIBRARY.map(item => ({
+  id: item.id,
+  scenario: item.scenario,
+  signals: item.signals,
+  intent: item.goal,
+  strategy: item.actions,
+  examples: item.talk.flat(),
+  risk_link: item.risk,
+  escalate: item.escalate ?? '',
+  bant_impact: item.bantImpact,
+  goal: item.goal,
+  actions: item.actions,
+  talk: item.talk,
+  talk_variants: item.talk,
+  risk: item.risk,
+}));
+const ACTION_IDS = new Set(ACTION_STRATEGIES.map(item => item.id));
+const STRATEGIES = [...ACTION_STRATEGIES, ...JSON_STRATEGIES.filter(item => !ACTION_IDS.has(item.id))];
+
+if (!Array.isArray(STRATEGIES) || STRATEGIES.length === 0) {
+  throw new Error('response_strategy_library_empty');
+}
+
+function text(value: unknown): string {
+  return String(value ?? '').trim();
+}
+
+function normalize(value: unknown): string {
+  return text(value).normalize('NFKC').toLowerCase();
+}
+
+function conversationText(input: StrategyRetrieveInput): string {
+  const turns = (input.conversation ?? [])
+    .filter(turn => turn && (turn.role === 'buyer' || turn.role === 'seller') && text(turn.text))
+    .slice(-8)
+    .map(turn => `${turn.role}: ${text(turn.text).slice(0, 1000)}`);
+  if (!turns.length || !normalize(turns.at(-1)).includes(normalize(input.latestMessage))) {
+    turns.push(`buyer: ${text(input.latestMessage).slice(0, 1000)}`);
+  }
+  return turns.join('\n');
+}
+
+function phraseScore(haystack: string, signal: string): number {
+  const phrase = normalize(signal);
+  if (!phrase || !haystack.includes(phrase)) return 0;
+  return Math.min(4, 1 + phrase.length / 8);
+}
+
+function rankStrategies(input: StrategyRetrieveInput, library: readonly ResponseStrategy[]): ScoredStrategy[] {
+  const latest = normalize(input.latestMessage);
+  const recent = normalize(conversationText(input));
+  const metadata = normalize(`${input.stage ?? ''} ${input.intent ?? ''}`);
+  const deterministicIds = new Set(matchSalesActions({
+    message: input.latestMessage,
+    firstTurn: input.firstTurn,
+    stage: input.stage,
+    knowledgeMiss: input.knowledgeMiss,
+    productAvailable: input.productAvailable,
+    redFlagCount: input.redFlagCount,
+    fallbackCount: input.fallbackCount,
+    sentiment: input.sentiment,
+  }).map(item => item.id));
+  return library.map(strategy => {
+    const matchedSignals = strategy.signals.filter(signal => recent.includes(normalize(signal)));
+    const latestScore = strategy.signals.reduce((sum, signal) => sum + phraseScore(latest, signal) * 2, 0);
+    const contextScore = strategy.signals.reduce((sum, signal) => sum + phraseScore(recent, signal), 0);
+    const metadataScore = strategy.signals.reduce((sum, signal) => sum + phraseScore(metadata, signal), 0);
+    return {
+      strategy,
+      score: latestScore + contextScore + metadataScore + (deterministicIds.has(strategy.id) ? 40 : 0),
+      matchedSignals,
+    };
+  }).filter(item => item.score > 0).sort((a, b) => b.score - a.score || a.strategy.id.localeCompare(b.strategy.id));
+}
+
+export function rankResponseStrategies(input: StrategyRetrieveInput): ScoredStrategy[] {
+  return rankStrategies(input, STRATEGIES);
+}
+
+function parseMatches(raw: string): Array<{ id: string; confidence: number; reason: string }> {
+  const match = raw.replace(/```json|```/gi, '').match(/\{[\s\S]*\}/);
+  if (!match) return [];
+  try {
+    const parsed = JSON.parse(match[0]) as { matches?: Array<Record<string, unknown>> };
+    return (parsed.matches ?? []).map(item => ({
+      id: text(item.id),
+      confidence: Math.max(0, Math.min(1, Number(item.confidence) || 0)),
+      reason: text(item.reason).slice(0, 240),
+    })).filter(item => item.id && item.confidence >= 0.62).slice(0, 2);
+  } catch {
+    return [];
+  }
+}
+
+async function semanticMatches(input: StrategyRetrieveInput, candidates: ResponseStrategy[]) {
+  const prompt = [
+    'Identify the buyer conversation scenarios that match this response strategy library.',
+    'Judge meaning from the latest message and recent conversation, including pronouns, negation, negotiation stage, and what has already happened.',
+    'A shared keyword is not enough. Choose at most two strategies. Choose none when the situation is unclear or no strategy truly applies.',
+    'Return strict JSON only: {"matches":[{"id":"S01","confidence":0.0,"reason":"short Chinese reason"}]}.',
+    'Use confidence >= 0.62 only for a meaningful match.',
+    '',
+    `Stage: ${text(input.stage) || 'unknown'}`,
+    `Draft intent: ${text(input.intent) || 'reply'}`,
+    'Recent conversation:',
+    conversationText(input),
+    '',
+    'Candidate strategies:',
+    candidates.map(item => [
+      `${item.id} | ${item.scenario}`,
+      `Buyer intent: ${item.intent}`,
+      `Signals: ${item.signals.join(' / ')}`,
+    ].join('\n')).join('\n\n'),
+  ].join('\n');
+  const raw = await callLLM(prompt, {
+    backend: 'qwen',
+    model: process.env.STRATEGY_MATCH_MODEL || process.env.KNOWLEDGE_QUERY_MODEL || 'qwen-plus',
+  });
+  return parseMatches(raw);
+}
+
+function jsonStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map(text).filter(Boolean);
+  if (typeof value !== 'string' || !value.trim()) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.map(text).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function tenantStrategyMemory(tenantId: string): Promise<StrategyMemoryRecord[]> {
+  const result = await store.list<StrategyMemoryRecord>('response_strategy_memory', {
+    where: { tenant_id: tenantId, status: 'active' },
+    sort: '-updated',
+    perPage: 100,
+  });
+  return result.items;
+}
+
+function customStrategies(records: StrategyMemoryRecord[]): ResponseStrategy[] {
+  return records.flatMap(item => {
+    const signals = jsonStringArray(item.signals);
+    const steps = jsonStringArray(item.strategy_steps);
+    const evidenceCount = Number(item.evidence_count || 0);
+    const customerCount = Number(item.evidence_customer_count || 0);
+    const periodCount = Number(item.evidence_period_count || 0);
+    if (item.source !== 'learned_custom' || evidenceCount < 5 || customerCount < 3 || periodCount < 2 || !text(item.scenario) || signals.length < 2 || steps.length < 2) return [];
+    return [{
+      id: text(item.strategy_id),
+      scenario: text(item.scenario),
+      signals,
+      intent: text(item.intent),
+      strategy: steps,
+      examples: [],
+      risk_link: text(item.risk_link) || 'L3',
+      escalate: text(item.escalate),
+      bant_impact: [],
+      goal: text(item.intent),
+      actions: steps,
+      talk: [],
+      talk_variants: [],
+      risk: text(item.risk_link) || 'L3',
+    }];
+  });
+}
+
+function rolloutBucket(customerId: string, strategyId: string): number {
+  const input = `${customerId || 'anonymous'}:${strategyId}`;
+  let hash = 2166136261;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return Math.abs(hash >>> 0) % 100;
+}
+
+export function strategyMemoryWithinRollout(record: StrategyMemoryRecord, customerId = ''): boolean {
+  const percent = Math.max(0, Math.min(100, Number(record.rollout_percent ?? 100)));
+  return percent >= 100 || (percent > 0 && rolloutBucket(customerId, record.strategy_id) < percent);
+}
+
+function attachTenantMemory(records: StrategyMemoryRecord[], matches: RetrievedStrategy[]): RetrievedStrategy[] {
+  const byStrategy = new Map(records.map(item => [text(item.strategy_id), item]));
+  return matches.map(match => {
+    const memory = byStrategy.get(match.strategy.id);
+    const evidenceCount = Number(memory?.evidence_count || 0);
+    if (!memory?.adjustment || evidenceCount < 5
+      || Number(memory.evidence_customer_count || 0) < 3
+      || Number(memory.evidence_period_count || 0) < 2) return match;
+    return {
+      ...match,
+      learnedAdjustment: text(memory.adjustment),
+      learnedEvidenceCount: evidenceCount,
+    };
+  });
+}
+
+export async function retrieveResponseStrategies(tenantId: string, input: StrategyRetrieveInput): Promise<RetrievedStrategy[]> {
+  let memoryRecords: StrategyMemoryRecord[] = [];
+  try {
+    memoryRecords = (await tenantStrategyMemory(tenantId)).filter(record => strategyMemoryWithinRollout(record, input.customerId));
+  } catch {
+    // Built-in strategies remain available while tenant memory storage is unavailable.
+  }
+  const learned = customStrategies(memoryRecords);
+  const library = [...STRATEGIES, ...learned];
+  const ranked = rankStrategies(input, library);
+  const candidates = (ranked.length
+    ? ranked.slice(0, 10).map(item => item.strategy)
+    : [...learned, ...STRATEGIES]).slice(0, 24);
+  let matches: RetrievedStrategy[] = [];
+  try {
+    const judged = await semanticMatches(input, candidates);
+    matches = judged.flatMap(item => {
+      const strategy = library.find(candidate => candidate.id === item.id);
+      return strategy
+        ? [{ strategy, confidence: item.confidence, reason: item.reason, method: 'semantic' as const }]
+        : [];
+    });
+  } catch {
+    // The deterministic fallback keeps draft generation available if semantic matching is temporarily unavailable.
+  }
+  if (!matches.length && ranked.length) {
+    const top = ranked[0];
+    const clearSecond = ranked[1] && ranked[1].score >= top.score * 0.8 ? ranked[1] : null;
+    matches = [top, clearSecond].filter((item): item is ScoredStrategy => Boolean(item)).map(item => ({
+      strategy: item.strategy,
+      confidence: Math.min(0.78, 0.55 + item.score / 40),
+      reason: `规则信号命中：${item.matchedSignals.slice(0, 3).join('、')}`,
+      method: 'heuristic',
+    }));
+  }
+  return attachTenantMemory(memoryRecords, matches);
+}
+
+export function buildStrategyPromptBlock(matches: RetrievedStrategy[]): string {
+  if (!matches.length) return '';
+  return [
+    'Response strategy layer (dialogue tactics, not business facts):',
+    'Mandatory precedence: current redline rules and enterprise knowledge > response strategy > seller style memory.',
+    'Use strategies to decide how to ask, explain, negotiate, follow up, or hand off. Never treat a strategy or its examples as evidence for price, discount, MOQ, inventory, certification, payment, shipping, lead time, capability, or any other company fact.',
+    'Never copy numbers or company claims from strategy examples. If a strategy conflicts with current enterprise facts or redline rules, ignore the conflicting strategy instruction.',
+    'Strategy questions are optional. If the buyer already gave that answer anywhere in the recent conversation, do not ask it again; use the known detail and choose a genuinely missing next step.',
+    'Write like a real WhatsApp seller: plain text, no markdown or lists. Ask at most one question in this turn. Keep each message short.',
+    ...matches.map((match, index) => {
+      const progression = progressionForStrategy(match.strategy.id);
+      return [
+      `Matched strategy ${index + 1}: ${match.strategy.id} ${match.strategy.scenario} (confidence=${match.confidence.toFixed(2)})`,
+      `Why matched: ${match.reason}`,
+      `Buyer intent: ${match.strategy.intent}`,
+      match.strategy.bant_impact?.length ? `BANT impact: ${match.strategy.bant_impact.join(' / ')}` : '',
+      `Progression goal: ${match.strategy.goal || match.strategy.intent}`,
+      `Tactics: ${(match.strategy.actions || match.strategy.strategy).join('；')}`,
+      `Risk link: ${match.strategy.risk || match.strategy.risk_link}`,
+      match.strategy.escalate ? `Handoff condition: ${match.strategy.escalate}` : '',
+      (match.strategy.talk_variants?.length || match.strategy.talk?.length)
+        ? `Short-message wording references only: ${(match.strategy.talk_variants || match.strategy.talk || []).map(variant => variant.join(' / ')).join(' | ')}`
+        : match.strategy.examples.length ? `Wording references only: ${match.strategy.examples.join(' | ')}` : '',
+      progression ? `Progression goal for this strategy: ${progression.goal}` : '',
+      progression ? `Optional indirect question (ask only one if it fits the current turn): ${progression.indirectQuestion}` : '',
+      match.learnedAdjustment
+        ? `Tenant preference learned from ${match.learnedEvidenceCount} real edited replies: ${match.learnedAdjustment}`
+        : '',
+      ].filter(Boolean).join('\n');
+    }),
+  ].join('\n');
+}
+
+export function strategyEvidence(matches: RetrievedStrategy[]): string[] {
+  return matches.map(match => `情境策略：${match.strategy.id} ${match.strategy.scenario}（${match.reason}）`);
+}
+
+export function responseStrategyLibrary(): readonly ResponseStrategy[] {
+  return STRATEGIES;
+}

@@ -1,0 +1,1323 @@
+import { Router, type Response } from 'express';
+import { gunzipSync } from 'node:zlib';
+import { writeAuditLog } from '../lib/auditLog.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { pbGet, pbListStrict, pbPatch } from '../storage/pb.js';
+import { demoLimits } from '../lib/demo.js';
+import {
+  effectiveOAuthConfig,
+  OAuthConfigUnavailableError,
+  oauthCallbackUrls,
+  getPublicOrigin,
+  readOAuthConfig,
+  writeOAuthConfig,
+  type OAuthPlatform,
+  type StoredOAuthConfig,
+} from '../lib/oauthConfig.js';
+import {
+  demoCredentialPresentation,
+  demoUsageForTenant,
+  readDemoAccountRegistry,
+  requireInternalAdmin,
+  requireAdminUser,
+  type DemoCredentialState,
+  upsertDemoAccountRegistry,
+} from '../lib/demoAccounts.js';
+import {
+  createSupportAccessRequest,
+  issueSupportAccessToken,
+  supportAccessDefaultAuthorized,
+} from '../lib/supportAccess.js';
+import {
+  getVideoAdminAlert,
+  listVideoAdminAlerts,
+  syncVideoAdminAlertsFromRecords,
+  type VideoAdminAlert,
+  type VideoFailureRecord,
+} from '../lib/videoAdminAlerts.js';
+import { attachManualVideoUploadAndQueue, matchesCrawlRange, matchesVideoSearch } from './videos.js';
+import { listStyleAdoptionTrends } from '../knowledge/styleMemory.js';
+import {
+  decryptSecret,
+  getTenantPlatformApp,
+  listTenantPlatformApps,
+  publicTenantPlatformApp,
+  tenantWebhookUrl,
+  upsertTenantPlatformApp,
+  type TenantPlatformAppRecord,
+  type TenantPlatform,
+} from '../lib/tenantPlatformApps.js';
+import { store } from '../storage/index.js';
+import axios from 'axios';
+import {
+  getLocalTenant,
+  listLocalTenants,
+  promoteLocalTrialTenant,
+} from '../lib/localTenants.js';
+import {
+  deliveryProvisioningHidden,
+} from '../starter198/deliveryProvisioning.js';
+import { disconnectTenantPlatformAccounts } from '../lib/socialAccountCleanup.js';
+import { localFallbacksEnabled } from '../lib/localFallbackPolicy.js';
+import { createAdminDeliveryStarterRouter } from './adminDeliveryStarter.js';
+import { accountStage, trialDay } from './adminAccountPresentation.js';
+
+export const adminRouter = Router();
+adminRouter.use(requireInternalAdmin);
+
+type VideoAlertAccountType = 'trial' | 'customer' | 'admin' | 'unknown';
+
+interface VideoAlertAccountMeta {
+  accountType: VideoAlertAccountType;
+  accountTypeLabel: string;
+  tenantName: string;
+  accountEmail: string;
+}
+
+function localAccountId(value: string): string {
+  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'demo';
+}
+
+function accountTypeLabel(type: VideoAlertAccountType): string {
+  if (type === 'trial') return '试用账号';
+  if (type === 'customer') return '正式账号';
+  if (type === 'admin') return '管理员账号';
+  return '未知账号';
+}
+
+async function listAllPbRecords<T extends Record<string, unknown>>(collection: string, sort?: string): Promise<T[]> {
+  const items: T[] = [];
+  let page = 1;
+  let totalPages = 1;
+  do {
+    const result = await pbListStrict<T>(collection, { page, perPage: 500, sort });
+    items.push(...result.items);
+    totalPages = Math.max(1, Math.min(100, result.totalPages || 1));
+    page += 1;
+  } while (page <= totalPages);
+  return items;
+}
+
+let videoAlertSyncAt = 0;
+let videoAlertSyncResult: VideoAlertReconciliation | null = null;
+let videoAlertSyncPromise: Promise<VideoAlertReconciliation> | null = null;
+
+interface VideoAlertReconciliation {
+  ok: boolean;
+  source: 'pocketbase' | 'snapshot' | 'alerts-only';
+  scanned: number;
+  synced: number;
+  warning?: string;
+}
+
+type InspirationContentFormat = 'video' | 'image';
+
+function recordAnalysis(record: Record<string, unknown>): Record<string, unknown> {
+  const value = record.aiAnalysis;
+  let analysis: Record<string, unknown> = {};
+  if (value && typeof value === 'object' && !Array.isArray(value)) analysis = { ...(value as Record<string, unknown>) };
+  try {
+    if (!Object.keys(analysis).length) {
+      const parsed = JSON.parse(String(value || '{}')) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) analysis = parsed as Record<string, unknown>;
+    }
+  } catch { /* malformed legacy analysis remains empty */ }
+  const compressed = typeof analysis.imageEvidenceGzip === 'string' ? analysis.imageEvidenceGzip : '';
+  if (!analysis.imageEvidence && compressed) {
+    try { analysis.imageEvidence = JSON.parse(gunzipSync(Buffer.from(compressed, 'base64')).toString('utf8')); }
+    catch { /* keep evidence unavailable rather than inventing it */ }
+  }
+  delete analysis.imageEvidenceGzip;
+  delete analysis.imageEvidenceEncoding;
+  return analysis;
+}
+
+function isAdminInspirationRecord(record: Record<string, unknown>, contentFormat: InspirationContentFormat): boolean {
+  const analysis = recordAnalysis(record);
+  if (
+    analysis.seededFromRecordId ||
+    analysis.analysisSource === 'demo-local-video' ||
+    String(analysis.crawlRule || '').includes('演示素材')
+  ) return false;
+
+  if (contentFormat === 'image') {
+    if (analysis.userVisible === false) return false;
+    const sourceUrl = String(record.sourceUrl || '').trim();
+    const thumbnailUrl = String(record.thumbnailUrl || '').trim();
+    if (analysis.contentFormat !== 'image' || !sourceUrl || !thumbnailUrl) return false;
+    if (/\/(?:search|explore\/tags)\b/i.test(sourceUrl)) return false;
+    return String(record.platform || '') !== 'instagram' || /\/p\//i.test(sourceUrl);
+  }
+
+  if (analysis.contentFormat === 'image') return false;
+  // Crawling and full-video analysis are separate pipeline stages. Genuine
+  // records should appear immediately after collection, with their current
+  // pending/analyzed state, instead of disappearing until Gemini finishes.
+  const sourceUrl = String(record.sourceUrl || '').trim();
+  const title = String(record.title || '').trim();
+  if (!/^https?:\/\//i.test(sourceUrl) || !title || String(record.status || '') === 'failed') return false;
+  const pendingDownloadStatus = String(analysis.downloadStatus || '');
+  const pendingGeminiStatus = String(analysis.geminiStatus || '');
+  if (pendingDownloadStatus === 'manual_required' || pendingDownloadStatus === 'failed' || pendingGeminiStatus === 'video_failed') return false;
+  if (analysis.analysisQuality !== 'video' || !analysis.gemini) return true;
+  // A precise re-analysis must not make an already valid benchmark disappear
+  // while the replacement analysis is queued, or after that upgrade fails.
+  // The original video-level evidence remains useful and the drawer needs the
+  // live record so it can show progress/failure instead of reverting to cache.
+  if (analysis.requestedAnalysisMode === 'exact' || analysis.analysisMode === 'exact') return true;
+  const analysisSource = String(analysis.analysisSource || '');
+  const geminiStatus = String(analysis.geminiStatus || '');
+  const downloadStatus = String(analysis.downloadStatus || '');
+  const videoFetchStatus = String(analysis.videoFetchStatus || '');
+  if (analysisSource === 'metadata-fallback' || geminiStatus === 'metadata_fallback' || downloadStatus === 'metadata_only') return false;
+  return (!geminiStatus || geminiStatus === 'analyzed')
+    && (!downloadStatus || downloadStatus === 'analyzed' || videoFetchStatus === 'direct_url' || videoFetchStatus === 'fetched');
+}
+
+async function listAdminInspirationVideos(input: {
+  page: number;
+  perPage: number;
+  platform?: string;
+  status?: string;
+  contentFormat: InspirationContentFormat;
+  search?: string;
+  crawlRange?: string;
+}) {
+  const records: Record<string, unknown>[] = [];
+  const seenSourceUrls = new Set<string>();
+  const where: Record<string, string> = { contentFormat: input.contentFormat };
+  if (input.platform) where.platform = input.platform;
+  if (input.status) where.status = input.status;
+  let scanPage = 1;
+  let totalPages = 1;
+  do {
+    const result = await store.list<Record<string, unknown>>('trend_videos', {
+      where: Object.keys(where).length ? where : undefined,
+      sort: '-crawledAt',
+      page: scanPage,
+      perPage: 100,
+    });
+    for (const record of result.items) {
+      if (!isAdminInspirationRecord(record, input.contentFormat)) continue;
+      const sourceUrl = String(record.sourceUrl || '').trim();
+      if (sourceUrl && seenSourceUrls.has(sourceUrl)) continue;
+      if (sourceUrl) seenSourceUrls.add(sourceUrl);
+      records.push(record);
+    }
+    totalPages = Math.max(1, Math.min(100, result.totalPages || 1));
+    scanPage += 1;
+  } while (scanPage <= totalPages);
+
+  records.sort((a, b) => {
+    const aTime = Date.parse(String(a.crawledAt || ''));
+    const bTime = Date.parse(String(b.crawledAt || ''));
+    return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
+  });
+
+  const ranged = records.filter(record => matchesCrawlRange(record, input.crawlRange));
+  const matched = input.search?.trim() ? ranged.filter(record => matchesVideoSearch(record, input.search!)) : ranged;
+  const totalItems = matched.length;
+  const start = (input.page - 1) * input.perPage;
+  return {
+    items: matched.slice(start, start + input.perPage).map(record => ({
+      ...record,
+      aiAnalysis: JSON.stringify(recordAnalysis(record)),
+    })),
+    totalItems,
+    totalPages: Math.max(1, Math.ceil(totalItems / input.perPage)),
+    page: input.page,
+    perPage: input.perPage,
+  };
+}
+
+const inspirationListCache = new Map<string, {
+  expiresAt: number;
+  value?: Awaited<ReturnType<typeof listAdminInspirationVideos>>;
+  pending?: Promise<Awaited<ReturnType<typeof listAdminInspirationVideos>>>;
+}>();
+
+const INSPIRATION_LIST_CACHE_MS = 5_000;
+
+async function cachedAdminInspirationVideos(input: Parameters<typeof listAdminInspirationVideos>[0]) {
+  const key = JSON.stringify(input);
+  const now = Date.now();
+  const cached = inspirationListCache.get(key);
+  if (cached?.value && cached.expiresAt > now) return cached.value;
+  if (cached?.pending) return cached.pending;
+
+  // Status changes from explicit analysis actions must be visible on the next
+  // dashboard poll. A five-minute stale response made completed records disappear
+  // or revert to their old button state.
+  if (cached?.value) inspirationListCache.delete(key);
+
+  const pending = listAdminInspirationVideos(input)
+    .then(value => {
+      inspirationListCache.set(key, { value, expiresAt: Date.now() + INSPIRATION_LIST_CACHE_MS });
+      return value;
+    })
+    .catch(error => {
+      inspirationListCache.delete(key);
+      throw error;
+    });
+  inspirationListCache.set(key, { pending, expiresAt: now + INSPIRATION_LIST_CACHE_MS });
+  return pending;
+}
+
+function readTrendVideoSnapshot(): VideoFailureRecord[] {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'data/trend-videos.json'), 'utf8')) as unknown;
+    if (Array.isArray(parsed)) return parsed as VideoFailureRecord[];
+    if (parsed && typeof parsed === 'object' && Array.isArray((parsed as { items?: unknown[] }).items)) {
+      return (parsed as { items: VideoFailureRecord[] }).items;
+    }
+  } catch {
+    // Snapshot is optional; the live PocketBase collection remains primary.
+  }
+  return [];
+}
+
+async function reconcileStoredVideoAlerts(): Promise<VideoAlertReconciliation> {
+  if (Date.now() - videoAlertSyncAt < 30_000 && videoAlertSyncResult) return videoAlertSyncResult;
+  if (videoAlertSyncPromise) return videoAlertSyncPromise;
+
+  videoAlertSyncPromise = (async () => {
+    try {
+      const records = await listAllPbRecords<VideoFailureRecord & Record<string, unknown>>('trend_videos', '-crawledAt');
+      return {
+        ok: true,
+        source: 'pocketbase' as const,
+        scanned: records.length,
+        synced: syncVideoAdminAlertsFromRecords(records),
+      };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      const snapshot = readTrendVideoSnapshot();
+      if (snapshot.length) {
+        console.warn(`[admin] video alert reconciliation using local snapshot after PocketBase failure: ${detail}`);
+        return {
+          ok: true,
+          source: 'snapshot' as const,
+          scanned: snapshot.length,
+          synced: syncVideoAdminAlertsFromRecords(snapshot),
+          warning: '实时视频数据库暂不可用，当前已从本地视频快照回扫失败记录。',
+        };
+      }
+      console.warn('[admin] video alert reconciliation unavailable:', detail);
+      return {
+        ok: false,
+        source: 'alerts-only' as const,
+        scanned: 0,
+        synced: 0,
+        warning: '实时视频数据库和本地快照均不可用，当前仅显示已经写入的历史告警。',
+      };
+    }
+  })();
+  try {
+    videoAlertSyncResult = await videoAlertSyncPromise;
+    videoAlertSyncAt = Date.now();
+    return videoAlertSyncResult;
+  } finally {
+    videoAlertSyncPromise = null;
+  }
+}
+
+async function enrichVideoAlerts(alerts: VideoAdminAlert[]) {
+  const directory = new Map<string, VideoAlertAccountMeta>();
+  const setAccount = (tenantId: string, input: Partial<VideoAlertAccountMeta>) => {
+    if (!tenantId) return;
+    const existing = directory.get(tenantId);
+    const accountType = input.accountType && input.accountType !== 'unknown'
+      ? input.accountType
+      : existing?.accountType || 'unknown';
+    directory.set(tenantId, {
+      accountType,
+      accountTypeLabel: accountTypeLabel(accountType),
+      tenantName: input.tenantName || existing?.tenantName || tenantId,
+      accountEmail: input.accountEmail || existing?.accountEmail || '',
+    });
+  };
+
+  const registry = readDemoAccountRegistry();
+  for (const entry of Object.values(registry)) {
+    const type: VideoAlertAccountType = entry.status === 'admin'
+      ? 'admin'
+      : entry.status === 'customer'
+        ? 'customer'
+        : 'trial';
+    const slug = localAccountId(entry.email);
+    const tenantIds = new Set([
+      String(entry.tenantId || ''),
+      `local_tenant_trial_${slug}`,
+      `local_tenant_${slug}`,
+      ...(type === 'admin' ? [`local_tenant_admin_${slug}`] : []),
+    ]);
+    for (const tenantId of tenantIds) {
+      setAccount(tenantId, {
+        accountType: type,
+        tenantName: entry.email.split('@')[0] || entry.email,
+        accountEmail: entry.email,
+      });
+    }
+  }
+
+  for (const tenant of listLocalTenants()) {
+    const plan = tenant.subscriptionPlan.toLowerCase();
+    const status = tenant.subscriptionStatus.toLowerCase();
+    const accountType: VideoAlertAccountType = plan === 'trial' || status === 'trialing' ? 'trial' : 'customer';
+    setAccount(tenant.id, {
+      accountType,
+      tenantName: tenant.companyName || tenant.name || tenant.id,
+      accountEmail: tenant.registeredEmail || '',
+    });
+  }
+
+  for (const alert of alerts) {
+    if (directory.has(alert.tenantId)) continue;
+    if (alert.tenantId.startsWith('local_tenant_trial_')) {
+      setAccount(alert.tenantId, { accountType: 'trial' });
+    } else if (alert.tenantId.startsWith('local_tenant_customer_')) {
+      setAccount(alert.tenantId, { accountType: 'customer' });
+    } else if (alert.tenantId.startsWith('local_tenant_admin_')) {
+      setAccount(alert.tenantId, { accountType: 'admin' });
+    }
+  }
+
+  try {
+    const [tenants, users] = await Promise.all([
+      listAllPbRecords<Record<string, unknown>>('tenants', 'name'),
+      listAllPbRecords<Record<string, unknown>>('users', 'email'),
+    ]);
+    for (const tenant of tenants) {
+      const tenantId = bodyText(tenant.id || tenant.tenantId);
+      if (!tenantId) continue;
+      const plan = bodyText(tenant.subscriptionPlan || tenant.plan).toLowerCase();
+      const status = bodyText(tenant.subscriptionStatus || tenant.status).toLowerCase();
+      const type: VideoAlertAccountType = plan === 'trial' || status === 'trialing'
+        ? 'trial'
+        : plan === 'admin' || status === 'admin'
+          ? 'admin'
+          : 'customer';
+      const accountEmail = bodyText(tenant.registeredEmail)
+        || bodyText(users.find(user => bodyText(user.tenantId) === tenantId)?.email);
+      setAccount(tenantId, {
+        accountType: type,
+        tenantName: bodyText(tenant.name || tenant.companyName || tenant.company) || tenantId,
+        accountEmail,
+      });
+    }
+  } catch (error) {
+    console.warn('[admin] video alert account metadata unavailable:', error instanceof Error ? error.message : error);
+  }
+
+  return alerts.map(alert => {
+    const fallbackType: VideoAlertAccountType = alert.tenantId.includes('_trial_')
+      ? 'trial'
+      : alert.tenantId.includes('_customer_')
+        ? 'customer'
+        : 'unknown';
+    const account = directory.get(alert.tenantId) || {
+      accountType: fallbackType,
+      accountTypeLabel: accountTypeLabel(fallbackType),
+      tenantName: alert.tenantId,
+      accountEmail: '',
+    };
+    return { ...alert, ...account };
+  });
+}
+
+async function safePbGet(collection: string, id?: string | null) {
+  if (!id) return null;
+  try {
+    return await pbGet(collection, id);
+  } catch {
+    return null;
+  }
+}
+
+function bodyText(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function platformParam(value: unknown): TenantPlatform | null {
+  const platform = bodyText(value);
+  return platform === 'meta' || platform === 'google' || platform === 'tiktok' || platform === 'wecom' ? platform : null;
+}
+
+function graphVersion() {
+  return process.env.META_GRAPH_VERSION?.trim() || 'v25.0';
+}
+
+function publicPendingPlatformApp(req: Parameters<typeof publicTenantPlatformApp>[0], tenantId: string, platform: TenantPlatform) {
+  return {
+    id: '',
+    tenantId,
+    platform,
+    appId: '',
+    appSecret: '',
+    appSecretSet: false,
+    appSecretLength: 0,
+    waConfigId: '',
+    businessId: '',
+    wabaId: '',
+    phoneNumberId: '',
+    waPublicNumber: '',
+    pageId: '',
+    igUserId: '',
+    youtubeChannelId: '',
+    webhookVerifyToken: '',
+    webhookVerifyTokenSet: false,
+    webhookVerifyTokenLength: 0,
+    wecomEncodingAesKeySet: false,
+    wecomEncodingAesKeyLength: 0,
+    webhookUrl: platform === 'meta' || platform === 'wecom' ? tenantWebhookUrl(req, tenantId, platform) : '',
+    oauthRedirectUri: platform === 'google'
+      ? `${getPublicOrigin(req)}/api/overseas/youtube/oauth/callback`
+      : platform === 'tiktok'
+        ? `${getPublicOrigin(req)}/api/overseas/social/oauth/tiktok/callback`
+        : '',
+    tokenType: 'user_60d',
+    accessTokenSet: false,
+    accessTokenLength: 0,
+    tokenExpiresAt: '',
+    status: 'pending',
+    checklist: {},
+    notes: '',
+  };
+}
+
+export function adminTenantPlatformApp(
+  req: Parameters<typeof publicTenantPlatformApp>[0],
+  app: TenantPlatformAppRecord,
+) {
+  return { ...publicTenantPlatformApp(req, app), appSecret: '' };
+}
+
+function publicDeliveryTenant(req: Parameters<typeof publicTenantPlatformApp>[0], tenant: Record<string, any>, apps: Awaited<ReturnType<typeof listTenantPlatformApps>>) {
+  const tenantId = String(tenant.id || tenant.tenantId || '');
+  const name = String(tenant?.name || tenant?.companyName || tenant?.company || tenantId);
+  const registeredEmail = String(tenant?.registeredEmail || '').trim();
+  const subscriptionPlan = String(tenant?.subscriptionPlan || '').trim().toLowerCase();
+  const subscriptionStatus = String(tenant?.subscriptionStatus || '').trim().toLowerCase();
+  const accountType = subscriptionPlan === 'admin'
+    ? 'admin'
+    : subscriptionPlan === 'trial' || subscriptionStatus === 'trialing'
+      ? 'trial'
+      : subscriptionPlan === 'customer' || subscriptionPlan === 'delivery' || subscriptionStatus === 'pending_delivery'
+        ? 'customer'
+        : 'existing';
+  const registrationState = tenant?.registeredAt || registeredEmail
+    ? 'registered'
+    : tenant?.inviteCode
+      ? 'waiting_registration'
+      : 'existing';
+  const inviteParams = new URLSearchParams({
+    invite: String(tenant?.inviteCode || ''),
+    company: name,
+  });
+  return {
+    tenantId,
+    name,
+    contactName: String(tenant?.contactName || tenant?.contact || ''),
+    industry: String(tenant?.industry || ''),
+    notes: String(tenant?.notes || ''),
+    inviteCode: String(tenant?.inviteCode || ''),
+    inviteUrl: tenant?.inviteCode ? `${getPublicOrigin(req)}/register?${inviteParams.toString()}` : '',
+    registrationState,
+    registeredEmail,
+    subscriptionPlan,
+    subscriptionStatus,
+    accountType,
+    apps: (['meta', 'google', 'tiktok', 'wecom'] as TenantPlatform[]).map(platform => {
+      const app = apps.find(item => item.tenant_id === tenantId && item.platform === platform);
+      return app ? adminTenantPlatformApp(req, app) : publicPendingPlatformApp(req, tenantId, platform);
+    }),
+  };
+}
+
+adminRouter.use(createAdminDeliveryStarterRouter({
+  presentTenant: (req, tenant) => ({ ...publicDeliveryTenant(req, tenant, []), productProfile: 'starter_198' }),
+}));
+
+const DELIVERY_TEST_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+function readChecklist(app?: { last_checklist?: string }): Record<string, any> {
+  try {
+    const parsed = JSON.parse(bodyText(app?.last_checklist) || '{}');
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function passedRecently(checklist: Record<string, any>, id: string) {
+  if (!checklist[id]) return false;
+  const timestamp = bodyText(checklist[`${id}_at`]);
+  if (!timestamp) return false;
+  const passedAt = Date.parse(timestamp);
+  return Number.isFinite(passedAt) && Date.now() - passedAt <= DELIVERY_TEST_MAX_AGE_MS;
+}
+
+function missingDeliveryRequirements(platform: TenantPlatform, app: any): string[] {
+  const checklist = readChecklist(app);
+  const appSecret = decryptSecret(app?.app_secret);
+  const missing: string[] = [];
+  if (!bodyText(app?.app_id)) missing.push(platform === 'wecom' ? '企业微信 CorpID' : platform === 'tiktok' ? 'TikTok Client Key' : 'App ID');
+  if (!appSecret) missing.push(platform === 'wecom' ? '企业微信应用 Secret' : platform === 'tiktok' ? 'TikTok Client Secret' : 'App Secret');
+  if (platform === 'meta') {
+    if (!bodyText(app?.phone_number_id)) missing.push('Phone Number ID');
+    if (!passedRecently(checklist, 'whatsapp_test_passed')) missing.push('WhatsApp 最近自检通过');
+    if (!passedRecently(checklist, 'webhook_test_passed')) missing.push('Webhook 订阅最近自检通过');
+  } else if (platform === 'google') {
+    if (!passedRecently(checklist, 'google_test_passed')) missing.push('Google OAuth 最近自检通过');
+  } else if (platform === 'tiktok') {
+    if (!passedRecently(checklist, 'tiktok_test_passed')) missing.push('TikTok OAuth 最近自检通过');
+  }
+  if (platform === 'wecom') {
+    const googleTestIndex = missing.findIndex(item => item.includes('Google OAuth'));
+    if (googleTestIndex >= 0) missing.splice(googleTestIndex, 1);
+    if (!bodyText(app?.business_id)) missing.push('企业微信 AgentId');
+    if (!bodyText(app?.webhook_verify_token)) missing.push('企业微信回调 Token');
+    if (!decryptSecret(app?.wecom_encoding_aes_key)) missing.push('企业微信 EncodingAESKey');
+    if (!passedRecently(checklist, 'wecom_callback_verified')) missing.push('企业微信回调最近自检通过');
+    if (!passedRecently(checklist, 'wecom_message_test_passed')) missing.push('企业微信消息最近自检通过');
+  }
+  return missing;
+}
+
+export function publicOAuthConfig(req: Parameters<typeof oauthCallbackUrls>[0], adminEmail: string) {
+  const stored = readOAuthConfig();
+  const effective = effectiveOAuthConfig(stored);
+  return {
+    admin: adminEmail,
+    updatedAt: stored.updatedAt ?? null,
+    disabledPlatforms: stored.disabledPlatforms ?? [],
+    callbacks: oauthCallbackUrls(req),
+    values: {
+      youtubeOAuthClientId: effective.youtubeOAuthClientId,
+      youtubeOAuthClientSecret: '',
+      metaSocialAppId: effective.metaSocialAppId,
+      metaSocialAppSecret: '',
+      tiktokClientKey: effective.tiktokClientKey,
+      tiktokClientSecret: '',
+      advancedManualConnectEnabled: effective.advancedManualConnectEnabled,
+    },
+    secretSet: {
+      youtubeOAuthClientSecret: Boolean(effective.youtubeOAuthClientSecret),
+      metaSocialAppSecret: Boolean(effective.metaSocialAppSecret),
+      tiktokClientSecret: Boolean(effective.tiktokClientSecret),
+    },
+    secretLength: {
+      youtubeOAuthClientSecret: effective.youtubeOAuthClientSecret.length,
+      metaSocialAppSecret: effective.metaSocialAppSecret.length,
+      tiktokClientSecret: effective.tiktokClientSecret.length,
+    },
+  };
+}
+function oauthConfigFailure(res: Response, error: unknown): void {
+  const unavailable = error instanceof OAuthConfigUnavailableError;
+  console.error('[oauth-config]', { errorType: error instanceof Error ? error.name : 'UnknownError' });
+  res.status(unavailable ? 503 : 500).json({ error: unavailable ? 'oauth_config_unavailable' : 'oauth_config_failed' });
+}
+adminRouter.get('/demo-accounts', async (req, res) => {
+  const admin = await requireAdminUser(req);
+  if (!admin) {
+    res.status(403).json({ error: 'admin_required' });
+    return;
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  const limits = demoLimits();
+  const registry = readDemoAccountRegistry();
+  const trialAccounts = await Promise.all(Object.values(registry)
+    .sort((a, b) => a.email.localeCompare(b.email))
+    .filter(entry => entry.status !== 'admin' && entry.status !== 'customer')
+    .map(async entry => {
+      const tenant = await safePbGet('tenants', entry.tenantId);
+      const expiresAt = String(tenant?.subscriptionExpiresAt ?? entry.expiresAt ?? '') || null;
+      const activatedAt = entry.activatedAt ?? null;
+      const usage = demoUsageForTenant(entry.tenantId, entry.userId ? [entry.userId] : []);
+      const day = trialDay(activatedAt);
+      return {
+        email: entry.email,
+        tenantId: String(entry.tenantId || ''),
+        tenantName: String(tenant?.name || entry.email.split('@')[0] || entry.tenantId || ''),
+        ...demoCredentialPresentation(entry.credentialState),
+        status: accountStage({ ...entry, expiresAt }),
+        activatedAt,
+        expiresAt,
+        trialDay: day,
+        trialDays: entry.status === 'admin' ? null : limits.trialDays,
+        daysRemaining: expiresAt ? Math.max(0, Math.ceil((new Date(expiresAt).getTime() - Date.now()) / (24 * 3600 * 1000))) : null,
+        tokenUsedToday: usage.todayTokens,
+        tokenUsedTotal: usage.totalTokens,
+        tokenLimit: entry.status === 'admin' ? null : limits.tokenTotal,
+        aiChatToday: usage.aiChat,
+        generationToday: usage.generation,
+        renderToday: usage.render,
+        videoGenerationToday: usage.videoGeneration,
+        rotatedAt: entry.rotatedAt ?? null,
+      };
+    }));
+  let customerAccounts: Array<{
+    tenantId: string;
+    companyName: string;
+    contactName: string;
+    industry: string;
+    emails: string[];
+    credentialState: DemoCredentialState; credentialAction: string;
+    inviteCode: string;
+    subscriptionPlan: string;
+    subscriptionStatus: string;
+    createdAt: string | null;
+    registeredAt: string | null;
+    expiresAt: string | null;
+    tokenUsedToday: number;
+    tokenUsedTotal: number;
+    aiChatToday: number;
+    generationToday: number;
+    renderToday: number;
+    videoGenerationToday: number;
+  }> = [];
+  try {
+    const [tenants, users] = await Promise.all([
+      pbListStrict<Record<string, unknown>>('tenants', { perPage: 500, sort: '-createdAt' }),
+      pbListStrict<Record<string, unknown>>('users', { perPage: 500, sort: 'email' }),
+    ]);
+    const trialTenantIds = new Set(trialAccounts.map(account => String(registry[account.email]?.tenantId || '')).filter(Boolean));
+    customerAccounts = tenants.items
+      .map(tenant => {
+        const tenantId = String(tenant.id || tenant.tenantId || '');
+        const subscriptionPlan = String(tenant.subscriptionPlan || '未设置');
+        const subscriptionStatus = String(tenant.subscriptionStatus || '未设置');
+        const registeredEmail = String(tenant.registeredEmail || '').trim().toLowerCase();
+        const tenantUsers = users.items.filter(user => String(user.tenantId || '') === tenantId);
+        const emails = tenantUsers
+          .map(user => String(user.email || '').trim().toLowerCase())
+          .filter(Boolean);
+        if (registeredEmail) emails.unshift(registeredEmail);
+        const promotedTrial = Object.values(registry).find(entry => entry.tenantId === tenantId && entry.status === 'customer');
+        const usage = demoUsageForTenant(
+          tenantId,
+          Array.from(new Set([
+            ...tenantUsers.map(user => String(user.id || '')).filter(Boolean),
+            ...(promotedTrial?.userId ? [promotedTrial.userId] : []),
+          ])),
+        );
+        return {
+          tenantId,
+          companyName: String(tenant.name || tenant.companyName || tenant.company || tenantId),
+          contactName: String(tenant.contactName || tenant.contact || ''),
+          industry: String(tenant.industry || ''),
+          emails: Array.from(new Set(emails)),
+          ...demoCredentialPresentation(promotedTrial?.credentialState
+            ?? (emails.length ? 'active_hash_only' : 'password_reset_required')),
+          inviteCode: String(tenant.registrationInviteCode || tenant.inviteCode || ''),
+          subscriptionPlan,
+          subscriptionStatus,
+          createdAt: String(tenant.created || tenant.createdAt || '') || null,
+          registeredAt: String(tenant.registeredAt || '') || null,
+          expiresAt: String(tenant.subscriptionExpiresAt || '') || null,
+          tokenUsedToday: usage.todayTokens,
+          tokenUsedTotal: usage.totalTokens,
+          aiChatToday: usage.aiChat,
+          generationToday: usage.generation,
+          renderToday: usage.render,
+          videoGenerationToday: usage.videoGeneration,
+        };
+      })
+      .filter(account => account.tenantId && !trialTenantIds.has(account.tenantId))
+      .filter(account => !['trial', 'local', 'admin'].includes(account.subscriptionPlan.toLowerCase()))
+      .sort((a, b) => a.companyName.localeCompare(b.companyName));
+  } catch (error) {
+    console.warn('[admin] customer account list unavailable:', error instanceof Error ? error.message : error);
+  }
+  const localCustomerAccounts = listLocalTenants()
+    .filter(tenant => tenant.subscriptionStatus === 'active' && tenant.subscriptionPlan === 'customer')
+    .map(tenant => {
+      const emails = tenant.registeredEmail ? [tenant.registeredEmail] : [];
+      const promotedTrial = Object.values(registry).find(entry => entry.tenantId === tenant.id && entry.status === 'customer');
+      const userIds = Array.from(new Set([
+        ...emails.map(email => `local_user_customer_${localAccountId(email)}`),
+        ...(promotedTrial?.userId ? [promotedTrial.userId] : []),
+      ]));
+      const usage = demoUsageForTenant(tenant.id, userIds);
+      return {
+        tenantId: tenant.id,
+        companyName: tenant.companyName || tenant.name,
+        contactName: tenant.contactName,
+        industry: tenant.industry,
+        emails,
+        ...demoCredentialPresentation(promotedTrial?.credentialState
+          ?? (emails.length ? 'active_hash_only' : 'password_reset_required')),
+        inviteCode: tenant.registrationInviteCode || tenant.inviteCode,
+        subscriptionPlan: tenant.subscriptionPlan,
+        subscriptionStatus: tenant.subscriptionStatus,
+        createdAt: tenant.createdAt || null,
+        registeredAt: tenant.registeredAt || null,
+        expiresAt: tenant.subscriptionExpiresAt,
+        tokenUsedToday: usage.todayTokens,
+        tokenUsedTotal: usage.totalTokens,
+        aiChatToday: usage.aiChat,
+        generationToday: usage.generation,
+        renderToday: usage.render,
+        videoGenerationToday: usage.videoGeneration,
+      };
+    });
+  const existingCustomerIds = new Set(customerAccounts.map(account => account.tenantId));
+  const existingCustomerEmails = new Set(customerAccounts.flatMap(account => account.emails).map(email => email.toLowerCase()));
+  customerAccounts.push(...localCustomerAccounts.filter(account =>
+    !existingCustomerIds.has(account.tenantId)
+    && !account.emails.some(email => existingCustomerEmails.has(email.toLowerCase()))
+  ));
+  customerAccounts.sort((a, b) => a.companyName.localeCompare(b.companyName));
+
+  res.json({ admin: admin.email, trialAccounts, customerAccounts });
+});
+
+adminRouter.post('/trial-accounts/:tenantId/promote', async (req, res) => {
+  const admin = await requireAdminUser(req);
+  if (!admin) {
+    res.status(403).json({ error: 'admin_required' });
+    return;
+  }
+
+  const tenantId = bodyText(req.params.tenantId);
+  const registry = readDemoAccountRegistry();
+  const entry = Object.values(registry).find(item => item.tenantId === tenantId);
+  if (!tenantId || !entry || entry.status === 'admin') {
+    res.status(404).json({ error: 'trial_account_not_found' });
+    return;
+  }
+
+  const existingTenant = await safePbGet('tenants', tenantId);
+  const companyName = bodyText(req.body?.companyName)
+    || bodyText(existingTenant?.name || existingTenant?.companyName)
+    || entry.email.split('@')[0]
+    || tenantId;
+  const contactName = bodyText(req.body?.contactName || existingTenant?.contactName || existingTenant?.contact);
+  const industry = bodyText(req.body?.industry || existingTenant?.industry);
+  const registeredAt = bodyText(existingTenant?.registeredAt || entry.activatedAt) || new Date().toISOString();
+  const requiresPasswordReset = entry.credentialState === 'expired_locked'
+    || entry.credentialState === 'password_reset_required'
+    || tenantId.startsWith('local_tenant_trial_');
+  const patch = {
+    name: companyName,
+    companyName,
+    contactName,
+    contact: contactName,
+    industry,
+    registeredEmail: entry.email,
+    registeredAt,
+    subscriptionStatus: 'active',
+    subscriptionPlan: 'customer',
+    subscriptionExpiresAt: null,
+  };
+
+  let tenant: Record<string, any> | null = null;
+  if (existingTenant) {
+    const updated = await pbPatch('tenants', tenantId, patch);
+    if (updated) tenant = { ...existingTenant, ...patch };
+  }
+  if (!tenant && localFallbacksEnabled()) {
+    tenant = promoteLocalTrialTenant({
+      tenantId,
+      companyName,
+      contactName,
+      industry,
+      email: entry.email,
+      registeredAt,
+    }) as unknown as Record<string, any>;
+  }
+  if (!tenant) {
+    res.status(500).json({ error: 'trial_promotion_failed' });
+    return;
+  }
+
+  upsertDemoAccountRegistry(entry.email, {
+    status: 'customer',
+    tenantId,
+    userId: entry.userId,
+    credentialState: requiresPasswordReset ? 'password_reset_required' : 'active_hash_only',
+    expiresAt: null,
+    rotatedAt: null,
+  });
+  await writeAuditLog({
+    tenantId,
+    actorUserId: admin.userId,
+    action: 'trial_account_promoted',
+    targetType: 'tenant',
+    targetId: tenantId,
+    metadata: { email: entry.email, companyName, source: 'trial_account' },
+  });
+  res.json({
+    ok: true,
+    tenantId,
+    email: entry.email,
+    companyName,
+    credentialState: requiresPasswordReset ? 'password_reset_required' : 'active_hash_only',
+    message: `试用账号已转为正式客户，原客户空间和历史数据保持不变。${requiresPasswordReset ? '请通过受控渠道完成一次性密码重置后再登录。' : ''}`,
+  });
+});
+
+adminRouter.post('/support-access/session', async (req, res) => {
+  const admin = await requireAdminUser(req);
+  if (!admin) {
+    res.status(403).json({ error: 'admin_required' });
+    return;
+  }
+
+  res.setHeader('Cache-Control', 'no-store');
+  const tenantId = bodyText(req.body?.tenantId);
+  if (!tenantId || tenantId === admin.tenantId) {
+    res.status(400).json({ error: 'invalid_tenant' });
+    return;
+  }
+  if (!supportAccessDefaultAuthorized(tenantId)) {
+    res.status(403).json({ error: 'support_access_disabled' });
+    return;
+  }
+
+  const registryEntry = Object.values(readDemoAccountRegistry()).find(entry => entry.tenantId === tenantId);
+  const localTenant = localFallbacksEnabled() ? getLocalTenant(tenantId) : null;
+  const remoteTenant = await safePbGet('tenants', tenantId);
+  if (!registryEntry && !localTenant && !remoteTenant) {
+    res.status(404).json({ error: 'tenant_not_found' });
+    return;
+  }
+
+  const tenantName = bodyText(remoteTenant?.name)
+    || localTenant?.companyName
+    || localTenant?.name
+    || bodyText(req.body?.tenantName)
+    || registryEntry?.email?.split('@')[0]
+    || tenantId;
+  const request = createSupportAccessRequest({
+    tenantId,
+    tenantName,
+    requestedByUserId: admin.userId,
+    requestedByEmail: admin.email,
+  });
+  const session = issueSupportAccessToken(request.id, admin.userId);
+  if (!session) {
+    res.status(403).json({ error: 'support_access_disabled' });
+    return;
+  }
+  await writeAuditLog({
+    tenantId,
+    actorUserId: admin.userId,
+    actorEmail: admin.email,
+    action: 'support_session_started',
+    targetType: 'tenant',
+    targetId: tenantId,
+    metadata: { requestId: request.id, tenantName },
+  });
+  res.json(session);
+});
+
+adminRouter.get('/video-alerts', async (req, res) => {
+  const admin = await requireAdminUser(req);
+  if (!admin) {
+    res.status(403).json({ error: 'admin_required' });
+    return;
+  }
+
+  res.setHeader('Cache-Control', 'no-store');
+  const reconciliation = await reconcileStoredVideoAlerts();
+
+  const limit = Math.max(1, Math.min(200, Number(req.query.limit || 100) || 100));
+  const includeResolved = req.query.includeResolved === 'true';
+  const items = await enrichVideoAlerts(listVideoAdminAlerts(limit, includeResolved));
+  const summary = items.reduce((counts, item) => {
+    counts.total += 1;
+    counts[item.accountType] += 1;
+    return counts;
+  }, { total: 0, trial: 0, customer: 0, admin: 0, unknown: 0 });
+
+  res.json({ admin: admin.email, items, summary, reconciliation });
+});
+
+adminRouter.get('/inspiration-videos', async (req, res) => {
+  const admin = await requireAdminUser(req);
+  if (!admin) {
+    res.status(403).json({ error: 'admin_required' });
+    return;
+  }
+
+  res.setHeader('Cache-Control', 'no-store');
+  const page = Math.max(1, Number(req.query.page || 1) || 1);
+  const perPage = Math.max(1, Math.min(100, Number(req.query.perPage || 20) || 20));
+  const platform = bodyText(req.query.platform);
+  const status = bodyText(req.query.status);
+  const contentFormat: InspirationContentFormat = req.query.contentFormat === 'image' ? 'image' : 'video';
+  const result = await cachedAdminInspirationVideos({
+    page,
+    perPage,
+    platform: platform || undefined,
+    status: status || undefined,
+    contentFormat,
+    search: bodyText(req.query.search) || undefined,
+    crawlRange: bodyText(req.query.crawlRange) || 'all',
+  });
+  // Listing must stay read-only. Media repair and AI analysis used to be launched
+  // here, so every dashboard refresh spawned more downloads/ffmpeg work and could
+  // starve an explicit user-requested analysis.
+  res.json({ admin: admin.email, ...result });
+});
+
+adminRouter.post('/video-alerts/:id/upload', async (req, res) => {
+  const admin = await requireAdminUser(req);
+  if (!admin) {
+    res.status(403).json({ error: 'admin_required' });
+    return;
+  }
+
+  const alert = getVideoAdminAlert(req.params.id);
+  if (!alert) {
+    res.status(404).json({ error: 'video_alert_not_found' });
+    return;
+  }
+
+  const body = req.body ?? {};
+  const recordId = bodyText(body.recordId) || alert.recordId;
+  if (recordId !== alert.recordId) {
+    res.status(400).json({ error: 'record_id_mismatch' });
+    return;
+  }
+
+  const videoBase64 = bodyText(body.videoBase64);
+  if (!videoBase64) {
+    res.status(400).json({ error: 'videoBase64_required' });
+    return;
+  }
+
+  try {
+    const result = await attachManualVideoUploadAndQueue({
+      recordId: alert.recordId,
+      videoBase64,
+      mimeType: bodyText(body.mimeType) || 'video/mp4',
+      filename: bodyText(body.filename) || 'manual-video.mp4',
+      uploadedBy: admin.userId,
+    });
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(502).json({ error: e instanceof Error ? e.message : 'manual_video_upload_failed' });
+  }
+});
+
+adminRouter.get('/oauth-config', async (req, res) => {
+  const admin = await requireAdminUser(req);
+  if (!admin) {
+    res.status(403).json({ error: 'admin_required' });
+    return;
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  try { res.json(publicOAuthConfig(req, admin.email)); }
+  catch (error) { oauthConfigFailure(res, error); }
+});
+adminRouter.put('/oauth-config', async (req, res) => {
+  const admin = await requireAdminUser(req);
+  if (!admin) {
+    res.status(403).json({ error: 'admin_required' });
+    return;
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  try {
+    const body = req.body ?? {}; const stored = readOAuthConfig();
+    const disabledPlatforms = new Set<OAuthPlatform>(stored.disabledPlatforms ?? []);
+    const patch: Partial<StoredOAuthConfig> = {
+      youtubeOAuthClientId: bodyText(body.youtubeOAuthClientId),
+      metaSocialAppId: bodyText(body.metaSocialAppId),
+      tiktokClientKey: bodyText(body.tiktokClientKey),
+      advancedManualConnectEnabled: body.advancedManualConnectEnabled === true,
+    };
+
+    const youtubeSecret = bodyText(body.youtubeOAuthClientSecret);
+    const metaSecret = bodyText(body.metaSocialAppSecret);
+    const tiktokSecret = bodyText(body.tiktokClientSecret);
+    if (youtubeSecret) patch.youtubeOAuthClientSecret = youtubeSecret;
+    if (metaSecret) patch.metaSocialAppSecret = metaSecret;
+    if (tiktokSecret) patch.tiktokClientSecret = tiktokSecret;
+
+    if (patch.youtubeOAuthClientId && youtubeSecret) disabledPlatforms.delete('youtube');
+    if (patch.metaSocialAppId && metaSecret) disabledPlatforms.delete('meta');
+    if (patch.tiktokClientKey && tiktokSecret) disabledPlatforms.delete('tiktok');
+    patch.disabledPlatforms = Array.from(disabledPlatforms);
+
+    await writeOAuthConfig(patch);
+    res.json(publicOAuthConfig(req, admin.email));
+  } catch (error) { oauthConfigFailure(res, error); }
+});
+
+adminRouter.delete('/oauth-config/:platform', async (req, res) => {
+  const admin = await requireAdminUser(req);
+  if (!admin) {
+    res.status(403).json({ error: 'admin_required' });
+    return;
+  }
+  res.setHeader('Cache-Control', 'no-store');
+
+  const platform = bodyText(req.params.platform) as OAuthPlatform;
+  if (!['youtube', 'meta', 'tiktok'].includes(platform)) {
+    res.status(400).json({ error: 'invalid_oauth_platform' });
+    return;
+  }
+  try {
+    const stored = readOAuthConfig();
+    const disabledPlatforms = new Set<OAuthPlatform>(stored.disabledPlatforms ?? []);
+    disabledPlatforms.add(platform);
+    const patch: Partial<StoredOAuthConfig> = {
+      disabledPlatforms: Array.from(disabledPlatforms),
+    };
+    if (platform === 'youtube') {
+      patch.youtubeOAuthClientId = '';
+      patch.youtubeOAuthClientSecret = '';
+    } else if (platform === 'meta') {
+      patch.metaSocialAppId = '';
+      patch.metaSocialAppSecret = '';
+    } else {
+      patch.tiktokClientKey = '';
+      patch.tiktokClientSecret = '';
+    }
+    const disconnectedAccounts = await disconnectTenantPlatformAccounts(admin.tenantId, platform);
+    await writeOAuthConfig(patch);
+    res.json({
+      ok: true,
+      platform,
+      disconnectedAccounts,
+      config: publicOAuthConfig(req, admin.email),
+    });
+  } catch (error) {
+    oauthConfigFailure(res, error);
+  }
+});
+
+adminRouter.get('/delivery/platform-apps', async (req, res) => {
+  const admin = await requireAdminUser(req);
+  if (!admin) {
+    res.status(403).json({ error: 'admin_required' });
+    return;
+  }
+  res.setHeader('Cache-Control', 'no-store');
+
+  let tenants: { items: Record<string, any>[] } | undefined;
+  let apps: TenantPlatformAppRecord[] | undefined;
+  try {
+    [tenants, apps] = await Promise.all([
+      pbListStrict<Record<string, any>>('tenants', { perPage: 200 }),
+      pbListStrict<TenantPlatformAppRecord>('tenant_platform_apps', { perPage: 500, sort: 'tenant_id' }).then(result => result.items),
+    ]);
+  } catch (error) {
+    if (localFallbacksEnabled()) {
+      tenants = { items: listLocalTenants() as unknown as Record<string, any>[] };
+      apps = [];
+    } else {
+      const detail = error instanceof Error ? error.message : 'unknown_error';
+      res.status(503).json({ error: 'tenants_unavailable', detail });
+      return;
+    }
+  }
+  if (!tenants || !apps) {
+    res.status(503).json({ error: 'tenants_unavailable', detail: 'unknown_error' });
+    return;
+  }
+  const tenantIds = new Set<string>([
+    ...tenants.items.map(item => String(item.id || item.tenantId || '')).filter(Boolean),
+    ...apps.map(app => app.tenant_id),
+  ]);
+
+  res.json({
+    admin: admin.email,
+    tenants: Array.from(tenantIds)
+      .filter(tenantId => tenantId !== admin.tenantId)
+      .filter(tenantId => {
+        const tenant = tenants.items.find(item => item.id === tenantId || item.tenantId === tenantId);
+        return !deliveryProvisioningHidden(tenant);
+      })
+      .map(tenantId => {
+        const tenant = tenants.items.find(item => item.id === tenantId || item.tenantId === tenantId) || { id: tenantId, name: tenantId };
+        return publicDeliveryTenant(req, tenant, apps);
+      }),
+  });
+});
+
+adminRouter.get('/style-adoption-trends', async (req, res) => {
+  const admin = await requireAdminUser(req);
+  if (!admin) {
+    res.status(403).json({ error: 'admin_required' });
+    return;
+  }
+  res.json({ admin: admin.email, items: await listStyleAdoptionTrends() });
+});
+
+adminRouter.put('/delivery/platform-apps/:tenantId/:platform', async (req, res) => {
+  const admin = await requireAdminUser(req);
+  if (!admin) {
+    res.status(403).json({ error: 'admin_required' });
+    return;
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  const platform = platformParam(req.params.platform);
+  if (!platform) {
+    res.status(400).json({ error: 'invalid_platform' });
+    return;
+  }
+  try {
+    const app = await upsertTenantPlatformApp({
+      tenantId: bodyText(req.params.tenantId),
+      platform,
+      appId: bodyText(req.body?.appId),
+      appSecret: bodyText(req.body?.appSecret),
+      waConfigId: bodyText(req.body?.waConfigId),
+      businessId: bodyText(req.body?.businessId),
+      wabaId: bodyText(req.body?.wabaId),
+      phoneNumberId: bodyText(req.body?.phoneNumberId),
+      waPublicNumber: bodyText(req.body?.waPublicNumber),
+      pageId: bodyText(req.body?.pageId),
+      igUserId: bodyText(req.body?.igUserId),
+      youtubeChannelId: bodyText(req.body?.youtubeChannelId),
+      webhookVerifyToken: bodyText(req.body?.webhookVerifyToken),
+      wecomEncodingAesKey: bodyText(req.body?.wecomEncodingAesKey),
+      tokenType: req.body?.tokenType === 'system_user_permanent' ? 'system_user_permanent' : 'user_60d',
+      accessToken: bodyText(req.body?.accessToken),
+      tokenExpiresAt: bodyText(req.body?.tokenExpiresAt),
+      status: bodyText(req.body?.status) as any || 'pending',
+      checklist: req.body?.checklist && typeof req.body.checklist === 'object' ? req.body.checklist : undefined,
+      notes: bodyText(req.body?.notes),
+    });
+    res.json({ ok: true, app: adminTenantPlatformApp(req, app) });
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : 'platform_app_save_failed' });
+  }
+});
+
+adminRouter.post('/delivery/platform-apps/:tenantId/:platform/complete', async (req, res) => {
+  const admin = await requireAdminUser(req);
+  if (!admin) {
+    res.status(403).json({ error: 'admin_required' });
+    return;
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  const platform = platformParam(req.params.platform);
+  if (!platform) {
+    res.status(400).json({ error: 'invalid_platform' });
+    return;
+  }
+  const tenantId = bodyText(req.params.tenantId);
+  const existing = await getTenantPlatformApp(tenantId, platform);
+  const missing = missingDeliveryRequirements(platform, existing);
+  if (!existing || missing.length > 0) {
+    const message = `交付完成前还缺：${missing.join('、')}`;
+    res.status(409).json({
+      error: message,
+      code: 'delivery_requirements_missing',
+      missing,
+      message,
+    });
+    return;
+  }
+  const app = await upsertTenantPlatformApp({
+    tenantId,
+    platform,
+    status: 'active',
+    notes: bodyText(req.body?.notes),
+  });
+  res.json({ ok: true, app: adminTenantPlatformApp(req, app) });
+});
+
+adminRouter.post('/delivery/platform-apps/:tenantId/:platform/test/:kind', async (req, res) => {
+  const admin = await requireAdminUser(req);
+  if (!admin) {
+    res.status(403).json({ error: 'admin_required' });
+    return;
+  }
+  const tenantId = bodyText(req.params.tenantId);
+  const platform = platformParam(req.params.platform);
+  const kind = bodyText(req.params.kind);
+  if (!platform) {
+    res.status(400).json({ ok: false, error: 'invalid_platform' });
+    return;
+  }
+
+  const app = await getTenantPlatformApp(tenantId, platform);
+  const token = decryptSecret(app?.access_token);
+  const appSecret = decryptSecret(app?.app_secret);
+  const markTestPassed = async (id: string) => {
+    if (!app) return;
+    await upsertTenantPlatformApp({
+      tenantId,
+      platform,
+      checklist: {
+        ...readChecklist(app),
+        [id]: true,
+        [`${id}_at`]: new Date().toISOString(),
+      } as any,
+    });
+  };
+  try {
+    if (!app) throw new Error('请先保存该租户的平台应用配置');
+    if (kind === 'pages') {
+      if (platform !== 'meta') throw new Error('主页列表自检仅适用于 Meta');
+      if (!token) throw new Error('请先录入访问 token');
+      const resp = await axios.get(`https://graph.facebook.com/${graphVersion()}/me/accounts`, {
+        params: { access_token: token, fields: 'id,name', limit: 10 },
+      });
+      await markTestPassed('pages_test_passed');
+      res.json({ ok: true, message: `已拉取 ${resp.data?.data?.length ?? 0} 个主页`, data: resp.data?.data ?? [] });
+      return;
+    }
+    if (kind === 'webhook') {
+      if (platform !== 'meta') throw new Error('Webhook 自检仅适用于 Meta');
+      if (!app.app_id || !token) throw new Error('请先录入 App ID 和访问 token');
+      const resp = await axios.get(`https://graph.facebook.com/${graphVersion()}/${app.app_id}/subscriptions`, {
+        params: { access_token: token },
+      });
+      await markTestPassed('webhook_test_passed');
+      res.json({ ok: true, message: 'Webhook 订阅状态已返回', data: resp.data?.data ?? [] });
+      return;
+    }
+    if (kind === 'whatsapp') {
+      if (platform !== 'meta') throw new Error('WhatsApp 自检仅适用于 Meta');
+      if (!token) throw new Error('请先录入 token');
+      if (!app.phone_number_id && !app.wa_config_id) throw new Error('请先录入 Phone Number ID 或 WhatsApp Embedded Signup Config ID');
+      await markTestPassed('whatsapp_test_passed');
+      res.json({ ok: true, message: app.phone_number_id ? 'WhatsApp Phone Number ID 已保存，可继续真实发送测试。' : 'WhatsApp Config ID 已保存，可继续 Embedded Signup。' });
+      return;
+    }
+    if (kind === 'google') {
+      if (platform !== 'google') throw new Error('Google 自检仅适用于 Google');
+      if (!app.app_id || !appSecret) throw new Error('请先录入 Google Client ID / Secret');
+      await markTestPassed('google_test_passed');
+      res.json({ ok: true, message: 'Google OAuth 应用信息已保存，等待用户授权验证。' });
+      return;
+    }
+    if (kind === 'tiktok') {
+      if (platform !== 'tiktok') throw new Error('TikTok 自检仅适用于 TikTok');
+      if (!app.app_id || !appSecret) throw new Error('请先录入 TikTok Client Key / Secret');
+      await markTestPassed('tiktok_test_passed');
+      res.json({ ok: true, message: 'TikTok OAuth 应用信息已保存，等待客户授权验证。' });
+      return;
+    }
+    if (kind === 'wecom_webhook') {
+      if (platform !== 'wecom') throw new Error('企业微信回调自检仅适用于企业微信');
+      if (!app.app_id || !bodyText(app.webhook_verify_token) || !decryptSecret(app.wecom_encoding_aes_key)) {
+        throw new Error('请先录入 CorpID、回调 Token 和 EncodingAESKey');
+      }
+      await markTestPassed('wecom_callback_verified');
+      res.json({ ok: true, message: '企业微信回调参数已保存，请到企业微信后台完成 URL 验证。' });
+      return;
+    }
+    if (kind === 'wecom') {
+      if (platform !== 'wecom') throw new Error('企业微信消息自检仅适用于企业微信');
+      if (!app.app_id || !appSecret || !bodyText(app.business_id)) {
+        throw new Error('请先录入 CorpID、应用 Secret 和 AgentId');
+      }
+      await markTestPassed('wecom_message_test_passed');
+      res.json({ ok: true, message: '企业微信应用配置已保存；真实同步需要开通客户联系/会话内容存档后联调。' });
+      return;
+    }
+    throw new Error('未知自检项');
+  } catch (error: any) {
+    const msg = error?.response?.data?.error?.message || error?.message || '自检失败';
+    res.status(400).json({ ok: false, error: msg });
+  }
+});

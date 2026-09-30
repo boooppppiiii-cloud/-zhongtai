@@ -1,0 +1,442 @@
+import { useEffect, useMemo, useState } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
+import {
+  CheckCircle2,
+  CheckSquare2,
+  ChevronDown,
+  CircleUserRound,
+  ExternalLink,
+  Filter,
+  Layers3,
+  Languages,
+  MessageCircle,
+  RefreshCw,
+  Send,
+  Sparkles,
+  Square,
+  UsersRound,
+  X,
+} from 'lucide-react';
+import { ChannelOverview } from './YouTubeIntegration';
+import { authHeader } from '../lib/auth';
+import { SocialPlatformIcon } from './SocialPlatformIcon';
+
+type ActivityTab = 'overview' | 'comments';
+type CommentFilter = 'all' | 'high' | 'pending' | 'following' | 'converted' | 'ignored';
+type CommentStatus = 'pending' | 'following' | 'converted' | 'ignored' | 'replied';
+
+type SocialComment = {
+  id: string;
+  platform: 'TikTok' | 'Instagram' | 'YouTube' | 'Facebook';
+  author: string;
+  handle: string;
+  text: string;
+  contentTitle: string;
+  receivedAt: string;
+  intent: string;
+  score: number;
+  reason: string;
+  status: CommentStatus;
+  replies: string[];
+  replyTranslations: string[];
+  accountId: string;
+  commentId: string;
+  stateKey: string;
+  videoId?: string;
+  authorId?: string;
+  translation?: string;
+  translationLanguage?: string;
+  translationStatus?: 'loading' | 'ready' | 'failed';
+};
+
+type AccountOption = {
+  id: string;
+  platform: SocialComment['platform'];
+  title: string;
+  handle?: string;
+  status: string;
+};
+
+const PLATFORM_OPTIONS: SocialComment['platform'][] = ['YouTube', 'TikTok', 'Instagram', 'Facebook'];
+
+const TAB_ITEMS: Array<{ id: ActivityTab; label: string }> = [
+  { id: 'overview', label: '数据概览' },
+  { id: 'comments', label: '评论管理' },
+];
+
+const FILTERS: Array<{ id: CommentFilter; label: string }> = [
+  { id: 'all', label: '全部评论' },
+  { id: 'high', label: '高意向' },
+  { id: 'pending', label: '待回复' },
+  { id: 'following', label: '跟进中' },
+  { id: 'converted', label: '已引导私信' },
+  { id: 'ignored', label: '已忽略' },
+];
+
+const statusLabel: Record<CommentStatus, string> = {
+  pending: '待回复',
+  following: '跟进中',
+  converted: '已引导私信',
+  ignored: '已忽略',
+  replied: '已回复',
+};
+
+function needsChineseTranslation(text: string) {
+  const letters = text.match(/\p{L}/gu) || [];
+  if (!letters.length) return false;
+  const han = text.match(/\p{Script=Han}/gu) || [];
+  return han.length / letters.length < 0.45;
+}
+
+export default function AccountActivity() {
+  const [tab, setTab] = useState<ActivityTab>('overview');
+  const [filter, setFilter] = useState<CommentFilter>('all');
+  const [comments, setComments] = useState<SocialComment[]>([]);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [replyIndex, setReplyIndex] = useState(0);
+  const [replyText, setReplyText] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [acting, setActing] = useState(false);
+  const [notice, setNotice] = useState('');
+  const [syncIssues, setSyncIssues] = useState<Array<{ platform: string; reason: string }>>([]);
+  const [accountOptions, setAccountOptions] = useState<AccountOption[]>([]);
+  const [selectedPlatforms, setSelectedPlatforms] = useState<SocialComment['platform'][]>([]);
+  const [selectedAccounts, setSelectedAccounts] = useState<string[]>([]);
+
+  const api = async (url: string, init?: RequestInit) => {
+    const response = await fetch(url, { ...init, headers: { 'Content-Type': 'application/json', ...authHeader(), ...(init?.headers || {}) } });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.message || data.error || '请求失败');
+    return data;
+  };
+
+  const translateComments = async (source: SocialComment[]) => {
+    const candidates = source
+      .filter(comment => needsChineseTranslation(comment.text) && !comment.translation);
+    if (!candidates.length) return;
+    const ids = new Set(candidates.map(comment => comment.id));
+    setComments(current => current.map(comment => ids.has(comment.id) ? { ...comment, translationStatus: 'loading' } : comment));
+    for (let index = 0; index < candidates.length; index += 50) {
+      const batch = candidates.slice(index, index + 50);
+      const batchIds = new Set(batch.map(comment => comment.id));
+      try {
+        const data = await api('/api/overseas/social-engagement/comments/translate', {
+          method: 'POST',
+          body: JSON.stringify({ items: batch.map(comment => ({ stateKey: comment.stateKey, text: comment.text })) }),
+        });
+        const translations = new Map<string, { text: string; sourceLanguage?: string }>(
+          (data.translations || []).map((item: any) => [String(item.id), { text: String(item.text || ''), sourceLanguage: String(item.sourceLanguage || '') }] as [string, { text: string; sourceLanguage?: string }]),
+        );
+        setComments(current => current.map(comment => {
+          if (!batchIds.has(comment.id)) return comment;
+          const translation = translations.get(comment.id);
+          return translation?.text
+            ? { ...comment, translation: translation.text, translationLanguage: translation.sourceLanguage, translationStatus: 'ready' }
+            : { ...comment, translationStatus: 'failed' };
+        }));
+      } catch {
+        setComments(current => current.map(comment => batchIds.has(comment.id) ? { ...comment, translationStatus: 'failed' } : comment));
+      }
+    }
+  };
+
+  const loadComments = async () => {
+    setLoading(true); setNotice('');
+    try {
+      const data = await api('/api/overseas/social-engagement/comments');
+      const next: SocialComment[] = (data.items || []).map((item: any) => ({
+        id: item.stateKey,
+        accountId: item.accountId,
+        commentId: item.id,
+        stateKey: item.stateKey,
+        videoId: item.videoId,
+        authorId: item.authorId || item.authorName,
+        platform: item.platform === 'youtube' ? 'YouTube' : item.platform === 'instagram' ? 'Instagram' : item.platform === 'facebook' ? 'Facebook' : 'TikTok',
+        author: item.authorName || '社媒用户',
+        handle: item.username ? `@${item.username}` : item.accountTitle || '',
+        text: item.textDisplay || '',
+        contentTitle: item.contentTitle || '已发布内容',
+        receivedAt: item.publishedAt ? new Date(item.publishedAt).toLocaleString() : '',
+        intent: item.analysis?.intent || '待分析',
+        score: Number(item.analysis?.score || 0),
+        reason: item.analysis?.reason || '正在准备 AI 商机判断。',
+        replies: item.analysis?.replies || [],
+        replyTranslations: item.analysis?.replyTranslations || [],
+        status: item.status || 'pending',
+        translation: item.translation?.text || '',
+        translationLanguage: item.translation?.sourceLanguage || '',
+        translationStatus: item.translation?.text ? 'ready' : undefined,
+      }));
+      const nextAccounts: AccountOption[] = (data.accounts || []).map((account: any) => ({
+        id: account.id,
+        platform: account.platform === 'youtube' ? 'YouTube' : account.platform === 'instagram' ? 'Instagram' : account.platform === 'facebook' ? 'Facebook' : 'TikTok',
+        title: account.title || account.handle || '未命名账号',
+        handle: account.handle,
+        status: account.status || 'connected',
+      }));
+      setComments(next); setAccountOptions(nextAccounts); setSyncIssues(data.unavailable || []);
+      setSelectedIds(current => current.filter(id => next.some(item => item.id === id)));
+      setNotice(nextAccounts.length
+        ? `同步完成：${nextAccounts.length} 个账号，${next.length} 条评论。`
+        : '暂无已授权社媒账号，无法同步动态。请先前往集成中心连接账号。');
+      void translateComments(next);
+    } catch (error) { setNotice(error instanceof Error ? error.message : '评论同步失败'); }
+    finally { setLoading(false); }
+  };
+
+  useEffect(() => { if (tab === 'comments' && !comments.length) void loadComments(); }, [tab]);
+
+  const scopedComments = useMemo(() => comments.filter(comment => {
+    if (selectedPlatforms.length && !selectedPlatforms.includes(comment.platform)) return false;
+    if (selectedAccounts.length && !selectedAccounts.includes(comment.accountId)) return false;
+    return true;
+  }), [comments, selectedPlatforms, selectedAccounts]);
+
+  const filtered = useMemo(() => scopedComments.filter(comment => {
+    if (filter === 'all') return true;
+    if (filter === 'high') return comment.score >= 80;
+    return comment.status === filter;
+  }), [scopedComments, filter]);
+  const selectedComments = useMemo(() => selectedIds
+    .map(id => filtered.find(comment => comment.id === id))
+    .filter((comment): comment is SocialComment => Boolean(comment)), [filtered, selectedIds]);
+  const selected = selectedComments[0] || null;
+  const selectedReplyTranslation = selected?.replyTranslations?.[replyIndex] || '';
+  const translatingCount = comments.filter(comment => comment.translationStatus === 'loading').length;
+
+  const toggleComment = (id: string) => {
+    setSelectedIds(current => current.includes(id) ? current.filter(item => item !== id) : [...current, id]);
+    setReplyIndex(0);
+  };
+
+  const togglePlatform = (platform: SocialComment['platform']) => {
+    setSelectedPlatforms(current => current.includes(platform) ? current.filter(item => item !== platform) : [...current, platform]);
+    setSelectedIds([]);
+  };
+  const toggleAccountFilter = (accountId: string) => {
+    setSelectedAccounts(current => current.includes(accountId) ? current.filter(item => item !== accountId) : [...current, accountId]);
+    setSelectedIds([]);
+  };
+
+  useEffect(() => {
+    if (!selected) return;
+    setReplyText(selected.replies[replyIndex] || '');
+    if (selected.replies.length && selected.replyTranslations.length === selected.replies.length) return;
+    let active = true;
+    void api('/api/overseas/social-engagement/comments/analyze', { method: 'POST', body: JSON.stringify({ stateKey: selected.stateKey, text: selected.text, platform: selected.platform, contentTitle: selected.contentTitle }) })
+      .then(data => { if (!active) return; setComments(list => list.map(item => item.id === selected.id ? { ...item, ...data.analysis } : item)); setReplyText(data.analysis?.replies?.[0] || ''); })
+      .catch(error => { if (active) setNotice(error instanceof Error ? error.message : '分析失败'); });
+    return () => { active = false; };
+  }, [selected?.id]);
+
+  const setStatus = (id: string, status: CommentStatus) => {
+    setComments(current => current.map(comment => comment.id === id ? { ...comment, status } : comment));
+    const item = comments.find(comment => comment.id === id);
+    if (item) void api('/api/overseas/social-engagement/comments/status', { method: 'PATCH', body: JSON.stringify({ stateKey: item.stateKey, status }) }).catch(error => setNotice(error instanceof Error ? error.message : '状态保存失败'));
+  };
+
+  const sendReplies = async () => {
+    if (!selectedComments.length || !replyText.trim()) return;
+    setActing(true); setNotice('');
+    const succeeded: string[] = [];
+    const failed: string[] = [];
+    for (const comment of selectedComments) {
+      try {
+        await api('/api/overseas/social-engagement/comments/reply', { method: 'POST', body: JSON.stringify({ platform: comment.platform.toLowerCase(), accountId: comment.accountId, commentId: comment.commentId, message: replyText.trim() }) });
+        succeeded.push(comment.id);
+      } catch (error) {
+        failed.push(`${comment.author}：${error instanceof Error ? error.message : '发送失败'}`);
+      }
+    }
+    if (succeeded.length) setComments(current => current.map(comment => succeeded.includes(comment.id) ? { ...comment, status: 'replied' } : comment));
+    setNotice(`已回复 ${succeeded.length} 条${failed.length ? `，失败 ${failed.length} 条（${failed.join('；')}）` : '。'}`);
+    setActing(false);
+  };
+
+  return (
+    <div className="min-h-full">
+      <div className="sticky top-0 z-10 border-b border-border bg-white/95 px-4 backdrop-blur sm:px-6">
+        <div className="flex min-h-14 flex-wrap items-center justify-between gap-3 py-2">
+          <div className="flex items-center gap-6 border-b border-border" role="tablist" aria-label="账号动态视图">
+            {TAB_ITEMS.map(item => (
+              <button
+                key={item.id}
+                type="button"
+                role="tab"
+                aria-selected={tab === item.id}
+                onClick={() => setTab(item.id)}
+                className={`border-b-2 px-1 py-2.5 text-xs font-semibold transition-colors ${tab === item.id ? 'border-accent text-text-primary' : 'border-transparent text-text-muted hover:text-text-secondary'}`}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center gap-2 text-[11px] text-text-muted">
+            <span className="border-l-2 border-accent bg-accent-glow px-2 py-1 font-bold text-accent">真实账号数据</span>
+            <button type="button" onClick={() => void loadComments()} disabled={loading} className="inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 font-bold text-text-secondary hover:bg-surface-2 disabled:opacity-50">
+              <RefreshCw size={12} className={loading ? 'animate-spin' : ''} /> {loading ? '同步中' : '同步动态'}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {notice && (
+        <div role="status" aria-live="polite" className="mx-4 mt-3 flex items-center justify-between gap-3 border-l-2 border-accent bg-accent-glow px-3 py-2 text-xs font-bold text-accent sm:mx-6">
+          <span>{notice}</span>
+          <button type="button" onClick={() => setNotice('')} aria-label="关闭同步提示" className="rounded-md p-1 hover:bg-white"><X size={13} /></button>
+        </div>
+      )}
+
+      {tab === 'overview' && <div className="px-4 py-5 sm:px-6"><ChannelOverview /></div>}
+
+      {tab === 'comments' && (
+        <div className="min-h-[620px]">
+          <div className="flex min-h-[540px] flex-col overflow-hidden xl:flex-row">
+          <aside className="w-full flex-shrink-0 border-b border-border bg-surface px-3 py-4 xl:w-56 xl:border-b-0 xl:border-r">
+            <div className="space-y-2 border-b border-border pb-4">
+              <details className="group rounded-md border border-border bg-white">
+                <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2.5 text-xs font-bold text-text-secondary">
+                  <Layers3 size={13} className="text-text-muted" /><span className="flex-1">平台</span><span className="text-[10px] font-bold text-accent">{selectedPlatforms.length ? `已选 ${selectedPlatforms.length}` : '全部'}</span><ChevronDown size={13} className="text-text-muted transition group-open:rotate-180" />
+                </summary>
+                <div className="space-y-1 border-t border-border p-2">
+                  <button type="button" onClick={() => { setSelectedPlatforms([]); setSelectedIds([]); }} className={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-[11px] font-bold ${selectedPlatforms.length === 0 ? 'bg-accent-glow text-accent' : 'text-text-secondary hover:bg-surface'}`}><span className="flex-1">全部平台</span>{selectedPlatforms.length === 0 && <CheckCircle2 size={13} />}</button>
+                  {PLATFORM_OPTIONS.map(platform => {
+                    const active = selectedPlatforms.includes(platform);
+                    const count = comments.filter(comment => comment.platform === platform).length;
+                    return <button key={platform} type="button" title={platform} aria-label={`${platform}，${count} 条`} onClick={() => togglePlatform(platform)} className={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-[11px] font-bold ${active ? 'bg-accent-glow text-accent' : 'text-text-secondary hover:bg-surface'}`}>{active ? <CheckSquare2 size={14} /> : <Square size={14} />}<SocialPlatformIcon platform={platform} size={17} /><span className="sr-only">{platform}</span><span className="ml-auto text-[10px] text-text-muted">{count}</span></button>;
+                  })}
+                </div>
+              </details>
+              <details className="group rounded-md border border-border bg-white">
+                <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2.5 text-xs font-bold text-text-secondary">
+                  <UsersRound size={13} className="text-text-muted" /><span className="flex-1">账号</span><span className="text-[10px] font-bold text-accent">{selectedAccounts.length ? `已选 ${selectedAccounts.length}` : '全部'}</span><ChevronDown size={13} className="text-text-muted transition group-open:rotate-180" />
+                </summary>
+                <div className="space-y-1 border-t border-border p-2">
+                  <button type="button" onClick={() => { setSelectedAccounts([]); setSelectedIds([]); }} className={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-[11px] font-bold ${selectedAccounts.length === 0 ? 'bg-accent-glow text-accent' : 'text-text-secondary hover:bg-surface'}`}><span className="flex-1">全部账号</span>{selectedAccounts.length === 0 && <CheckCircle2 size={13} />}</button>
+                  {accountOptions.filter(account => !selectedPlatforms.length || selectedPlatforms.includes(account.platform)).map(account => {
+                    const active = selectedAccounts.includes(account.id);
+                    const count = comments.filter(comment => comment.accountId === account.id).length;
+                    return <button key={account.id} type="button" onClick={() => toggleAccountFilter(account.id)} className={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-[11px] font-bold ${active ? 'bg-accent-glow text-accent' : 'text-text-secondary hover:bg-surface'}`}>{active ? <CheckSquare2 size={14} /> : <Square size={14} />}<SocialPlatformIcon platform={account.platform} size={15} /><span className="min-w-0 flex-1 truncate">{account.title}</span><span className="text-[9px] text-text-muted">{count}</span></button>;
+                  })}
+                  {!accountOptions.length && <p className="px-2 py-3 text-[10px] leading-4 text-text-muted">暂无已授权账号，请先到集成中心连接</p>}
+                </div>
+              </details>
+            </div>
+            <div className="mb-3 mt-4 flex items-center gap-2 px-2 text-[11px] font-black uppercase tracking-wider text-text-muted"><Filter size={12} /> 评论筛选</div>
+            <div className="grid grid-cols-2 gap-1 sm:grid-cols-3 xl:grid-cols-1">
+              {FILTERS.map(item => {
+                const count = scopedComments.filter(comment => item.id === 'all' ? true : item.id === 'high' ? comment.score >= 80 : comment.status === item.id).length;
+                return (
+                  <button key={item.id} type="button" onClick={() => setFilter(item.id)} className={`flex w-full items-center justify-between rounded-md border-l-2 px-3 py-2.5 text-left text-xs font-bold ${filter === item.id ? 'border-accent bg-white text-accent' : 'border-transparent text-text-secondary hover:bg-white/70'}`}>
+                    <span>{item.label}</span><span className="text-[10px] text-text-muted">{count}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </aside>
+
+          <section className="min-w-0 flex-1 bg-white">
+            <div className="flex flex-col items-start justify-between gap-3 border-b border-border px-4 py-3 sm:flex-row sm:items-center sm:px-5">
+              <div><p className="text-xs font-bold text-text-primary">{FILTERS.find(item => item.id === filter)?.label}</p><p className="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-text-muted"><span>共 {filtered.length} 条，点击卡片可多选</span><span className="inline-flex items-center gap-1 font-bold text-accent"><Languages size={11} /> {translatingCount ? `正在翻译 ${translatingCount} 条` : '外语评论自动翻译'}</span></p></div>
+              <div className="flex flex-wrap items-center gap-2">
+                {selectedIds.length > 0 && <button type="button" onClick={() => setSelectedIds([])} className="text-[11px] font-bold text-text-muted hover:text-text-primary">清空选择</button>}
+                <button type="button" onClick={() => setSelectedIds(selectedIds.length === filtered.length ? [] : filtered.map(comment => comment.id))} disabled={!filtered.length} className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-2 text-[11px] font-bold text-text-secondary disabled:opacity-40">{filtered.length > 0 && selectedIds.length === filtered.length ? <CheckSquare2 size={14} /> : <Square size={14} />} 全选</button>
+                <span className="rounded-md bg-accent-glow px-3 py-1.5 text-[11px] font-bold text-accent">已选 {selectedComments.length} 条</span>
+              </div>
+            </div>
+            <div className="grid gap-3 p-4 md:grid-cols-2 2xl:grid-cols-3 sm:p-5">
+              {filtered.map(comment => {
+                const checked = selectedIds.includes(comment.id);
+                const first = selectedIds[0] === comment.id;
+                return (
+                  <button key={comment.id} type="button" aria-pressed={checked} onClick={() => toggleComment(comment.id)} className={`relative rounded-lg border p-4 text-left transition-colors hover:border-border-bright ${checked ? 'border-accent bg-accent-glow/50 ring-1 ring-accent/20' : 'border-border bg-white'}`}>
+                    <span className={`absolute right-3 top-3 ${checked ? 'text-accent' : 'text-text-muted'}`}>{checked ? <CheckSquare2 size={18} /> : <Square size={18} />}</span>
+                    <div className="flex items-center gap-2 pr-7"><span className="flex h-9 w-9 items-center justify-center rounded-full bg-surface-2 text-text-muted"><CircleUserRound size={18} /></span><div className="min-w-0 flex-1"><p className="truncate text-xs font-black text-text-primary">{comment.author}</p><p className="flex items-center gap-1 truncate text-[10px] text-text-muted"><SocialPlatformIcon platform={comment.platform} size={12} /><span className="sr-only">{comment.platform} · </span>{comment.receivedAt}</p></div></div>
+                    <p className="mt-3 line-clamp-3 min-h-[60px] text-xs leading-5 text-text-secondary">{comment.text}</p>
+                    {comment.translationStatus === 'loading' && <p className="mt-2 flex items-center gap-1.5 text-[10px] font-bold text-accent"><RefreshCw size={10} className="animate-spin" /> 正在翻译成中文…</p>}
+                    {comment.translation && (
+                      <div className="mt-2 rounded-md border border-border bg-accent-glow px-2.5 py-2">
+                        <p className="flex items-center gap-1 text-[9px] font-bold text-accent"><Languages size={10} /> 中文译文</p>
+                        <p className="mt-1 line-clamp-2 text-[11px] leading-4 text-text-primary">{comment.translation}</p>
+                      </div>
+                    )}
+                    {comment.translationStatus === 'failed' && <p className="mt-2 text-[10px] font-bold text-insight-action">翻译暂时失败，打开评论可重试</p>}
+                    <p className="mt-2 truncate text-[10px] text-text-muted">来自《{comment.contentTitle}》</p>
+                    <div className="mt-3 flex items-center justify-between gap-2"><div className="flex items-center gap-1.5"><span className="rounded-md bg-surface-2 px-2 py-1 text-[10px] font-bold text-text-secondary">{comment.intent}</span>{first && <span className="rounded-md bg-insight-soft px-2 py-1 text-[10px] font-bold text-insight-action">首个选定</span>}</div><span className={`rounded-md px-2 py-1 text-[10px] font-bold ${comment.score >= 80 ? 'bg-red/5 text-red' : 'bg-insight-soft text-insight-action'}`}>{comment.score} 分</span></div>
+                  </button>
+                );
+              })}
+              {!filtered.length && <div className="col-span-full px-6 py-20 text-center text-xs leading-5 text-text-muted">{loading ? '正在同步已授权账号的评论…' : '暂无符合条件的真实评论'}{syncIssues.map(item => <div key={`${item.platform}-${item.reason}`} className="mt-2 text-amber-700">{item.platform}：{item.reason}</div>)}</div>}
+            </div>
+          </section>
+
+          <AnimatePresence initial={false}>
+            {selected && (
+              <motion.aside initial={{ x: 48, opacity: 0 }} animate={{ x: 0, opacity: 1 }} exit={{ x: 48, opacity: 0 }} transition={{ duration: 0.2 }} className="w-full flex-shrink-0 border-t border-border bg-surface p-4 sm:p-5 xl:w-[460px] xl:border-l xl:border-t-0">
+              <div className="mb-4 flex items-center justify-between"><div><h2 className="text-sm font-bold text-text-primary">评论详情与回复</h2><p className="mt-1 text-[11px] text-text-muted">以首个选中评论生成，应用于已选 {selectedComments.length} 条</p></div><button type="button" onClick={() => setSelectedIds([])} aria-label="关闭评论详情" className="rounded-md p-2 text-text-muted hover:bg-white hover:text-text-primary"><X size={17} /></button></div>
+              <div className="space-y-4">
+                <div className="rounded-lg border border-border bg-white p-4 sm:p-5">
+                  <div className="flex items-start justify-between gap-4">
+                    <div><div className="flex items-center gap-2"><h3 className="text-sm font-black text-text-primary">{selected.author}</h3><span className="text-xs text-text-muted">{selected.handle}</span></div><p className="mt-1 flex items-center gap-1 text-[11px] text-text-muted"><SocialPlatformIcon platform={selected.platform} size={13} /><span className="sr-only">{selected.platform} · </span>来自《{selected.contentTitle}》</p></div>
+                    <button type="button" className="inline-flex items-center gap-1 text-[11px] font-bold text-text-muted hover:text-accent">查看原评论 <ExternalLink size={11} /></button>
+                  </div>
+                  <div className="mt-4 rounded-md bg-surface-2 px-4 py-3">
+                    <p className="text-[10px] font-black text-text-muted">原文</p>
+                    <p className="mt-1 text-sm leading-6 text-text-primary">{selected.text}</p>
+                  </div>
+                  {selected.translationStatus === 'loading' && (
+                    <div className="mt-2 flex items-center gap-2 rounded-md border border-border bg-accent-glow px-4 py-3 text-xs font-bold text-accent">
+                      <RefreshCw size={12} className="animate-spin" /> 正在自动翻译成中文…
+                    </div>
+                  )}
+                  {selected.translation && (
+                    <div className="mt-2 rounded-md border border-border bg-accent-glow px-4 py-3">
+                      <p className="flex items-center gap-1.5 text-[10px] font-bold text-accent"><Languages size={11} /> 中文译文{selected.translationLanguage ? ` · ${selected.translationLanguage}` : ''}</p>
+                      <p className="mt-1 text-sm leading-6 text-text-primary">{selected.translation}</p>
+                    </div>
+                  )}
+                  {selected.translationStatus === 'failed' && (
+                    <button type="button" onClick={() => void translateComments([selected])} className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-insight/30 bg-insight-soft px-3 py-2 text-[11px] font-bold text-insight-action">
+                      <RefreshCw size={11} /> 重新翻译
+                    </button>
+                  )}
+                  <div className="mt-4 border-l-2 border-insight bg-insight-soft p-4">
+                    <div className="flex items-center gap-2 text-xs font-bold text-insight-action"><Sparkles size={14} /> AI 商机判断 · {selected.intent} · {selected.score} 分</div>
+                    <p className="mt-2 text-xs leading-5 text-insight-action">{selected.reason}</p>
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-border bg-white p-4 sm:p-5">
+                  <div className="flex items-center justify-between gap-3"><div><h3 className="text-sm font-bold text-text-primary">AI 三版回复</h3><p className="mt-1 text-[11px] text-text-muted">基于首个选定卡片，可编辑后批量发送</p></div><span className="whitespace-nowrap border-l-2 border-accent bg-accent-glow px-2.5 py-1 text-[10px] font-bold text-accent">人工确认</span></div>
+                  <div className="mt-4 flex gap-2">
+                    {selected.replies.slice(0, 3).map((reply, index) => <button key={index} type="button" onClick={() => { setReplyIndex(index); setReplyText(reply); }} className={`rounded-lg px-3 py-1.5 text-[11px] font-black ${replyIndex === index ? 'bg-accent text-white' : 'bg-surface-2 text-text-secondary'}`}>版本 {index + 1}</button>)}
+                  </div>
+                  <textarea value={replyText} onChange={event => setReplyText(event.target.value)} rows={4} placeholder={selected.replies.length ? '' : 'AI 正在生成回复建议…'} className="ui-field mt-3 !rounded-md px-4 py-3 text-sm leading-6" />
+                  {selectedReplyTranslation && (
+                    <div className="mt-2 rounded-md border border-border bg-accent-glow px-4 py-3">
+                      <p className="flex items-center gap-1.5 text-[10px] font-bold text-accent"><Languages size={11} /> 回复中文翻译</p>
+                      <p className="mt-1 text-xs leading-5 text-text-primary">{selectedReplyTranslation}</p>
+                      {replyText !== selected.replies[replyIndex] && <p className="mt-1 text-[9px] font-bold text-insight-action">你已修改外语回复，发送前请以外语原文为准。</p>}
+                    </div>
+                  )}
+                  {selectedComments.length > 1 && <p className="mt-2 text-[10px] leading-4 text-insight-action">同一版回复将发送给全部 {selectedComments.length} 条已选评论，请确认内容对所有对象都适用。</p>}
+                  <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+                    <button type="button" onClick={() => setStatus(selected.id, 'ignored')} className="text-xs font-bold text-text-muted hover:text-text-secondary">忽略评论</button>
+                    <div className="flex gap-2">
+                      <button type="button" onClick={() => setStatus(selected.id, 'following')} className="inline-flex items-center gap-2 rounded-md border border-border px-3 py-2 text-xs font-bold text-text-secondary"><MessageCircle size={14} /> 标记跟进</button>
+                      <span className="inline-flex items-center rounded-md border border-border bg-surface-2 px-3 py-2 text-xs font-bold text-text-muted">Messenger 私信后自动进入我的会话</span>
+                      <button type="button" onClick={() => void sendReplies()} disabled={acting || !replyText.trim()} className="inline-flex items-center gap-2 rounded-md bg-accent px-4 py-2 text-xs font-bold text-white hover:bg-accent-dim disabled:opacity-50"><Send size={14} /> {acting ? '批量发送中' : `一键回复 ${selectedComments.length} 条`}</button>
+                    </div>
+                  </div>
+                  {selected.status !== 'pending' && <div role="status" className="mt-4 flex items-center gap-2 border-l-2 border-accent bg-accent-glow px-3 py-2 text-xs font-bold text-accent"><CheckCircle2 size={14} /> 当前状态：{statusLabel[selected.status]}</div>}
+                </div>
+              </div>
+              </motion.aside>
+            )}
+          </AnimatePresence>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

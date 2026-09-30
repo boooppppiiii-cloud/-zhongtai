@@ -1,0 +1,9556 @@
+import { prepareReferenceNarration } from '../lib/referenceNarration.js';
+import { AnalysisAlreadyRunningError, AnalysisLeaseRegistry } from '../lib/analysisLease.js';
+import { DownloadBudget, RecordWorkRegistry, terminalDownloadFailure } from '../lib/downloadExecution.js';
+import { Router, type Request, type Response } from 'express';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { createHash, randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import ffmpegStatic from 'ffmpeg-static';
+import { requireAuth, type AuthLocals } from '../middleware/auth.js';
+import { store } from '../storage/index.js';
+import { attachFile, fetchFile } from '../storage/files.js';
+import { objectStorageEnabled, objectStorageDownload, objectStorageGetObject, objectStorageHead, objectStorageUpload } from '../storage/objectStorage.js';
+import { analyzeImagePostEvidenceWithGemini, analyzeVideo, analyzeYouTubeUrl } from '../agents/gemini.js';
+import { analyzeImagePostEvidenceWithQwen, analyzeVideoFramesWithQwen, analyzeVideoTimelineDetailsWithQwen, inspectVideoOpeningFrameWithQwen, transcribeAudioWithQwen, type ImagePostEvidenceAnalysis, type QwenTimelinePlan } from '../agents/qwen.js';
+import { inspectOpeningHookMotionWithGemini } from '../agents/geminiHookMotion.js';
+import type { Platform, VideoAiAnalysis, VideoStatus } from '../types/index.js';
+import type { SocialDiscoveryMode } from '../../shared/contracts/socialContentWorkflow.js';
+import { isDemoMode } from '../lib/demo.js';
+import { buildSocialReferenceReviewHandoff } from '../starter198/socialReferenceReviewHandoff.js';
+import { assertSalesPresenterQwenConfigured, reviewSalesPresenterFramesWithQwen } from '../agents/qwen.js';
+import { salesReviewKey, validateSalesReview, SALES_REVIEW_VERSION, type SalesShot } from '../lib/salesPresenterReview.js';
+import { resolveReferenceSalesPresenter } from './referencePresenterLock.js';
+import { buildReferenceSpeechTimeline, type ReferenceStructureInput } from './referenceSpeechTimeline.js';
+import { approximateSpeechLines } from './referenceApproxSpeech.js';
+import { attachReviewShotMaterials, loadReferenceShotReview, reviewShotMaterialFingerprint, updateReferenceShotReview } from './referenceShotReview.js';
+import { currentVerifiedSpeech, validateVerifiedSpeechLines, verifiedSpeechStatus, type VerifiedReferenceSpeech } from './verifiedReferenceSpeech.js';
+import { QwenAsrService, qwenAsrCues } from '../lib/qwenAsr.js';
+import { recordVideoAdminAlert, updateVideoAdminAlertByRecordId } from '../lib/videoAdminAlerts.js';
+import { requireAdminUser } from '../lib/demoAccounts.js';
+import { ASSET_SESSION_COOKIE, cookieValue, signAssetUrl, tenantAssetDir, tenantAssetRelativePath } from '../lib/assetAccess.js';
+import { buildDownloadedReferenceMaterial } from '../lib/downloadedReferenceMaterial.js';
+import { resolvePublicVideoSource, validatePublicVideoSourceUrl, type ValidatedPublicVideoSource } from '../lib/publicVideoSourceSecurity.js';
+import { fetchCloudMaterial, getCloudMaterialRecord } from '../lib/cloudMaterials.js';
+import { localFallbacksEnabled } from '../lib/localFallbackPolicy.js';
+import { currentDataAuthority, runWithDataAuthority } from '../storage/dataAuthority.js';
+import { analysisTimelineQualityError, canPromoteExistingAnalysisToExact, exactVideoReviewReasons, hasCompleteVideoGeminiAnalysis, hasCompletedExactVideoEvidence, isAutoSeededVideo, isVideoLevelAnalysis, parseAnalysisTimeRange, serializeImagePostAnalysis, videoAnalysisOf } from './videoAnalysisCodec.js';
+import { applyOpeningHookMotionEvidence, firstSubstantiveOpeningShot } from './hookMotionEvidence.js';
+
+export const videosRouter = Router();
+videosRouter.use(requireAuth);
+
+const COL = 'trend_videos';
+const execFileAsync = promisify(execFile);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const MEDIA_DIR = path.join(__dirname, '../../data/media');
+const ANALYSIS_DIR = path.join(__dirname, '../../data/analysis-temp');
+const MATERIALS_FILE = path.join(__dirname, '../../data/materials.json');
+const CRAWLER_OPS_FILE = path.join(__dirname, '../../data/crawler-ops-queue.json');
+const APIFY_USAGE_FILE = path.join(__dirname, '../../data/apify-video-usage.json');
+const ffmpegBin = ffmpegStatic as unknown as string | null;
+const MANUAL_UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
+const REFERENCE_UPLOAD_MAX_BYTES = 32 * 1024 * 1024;
+const referenceImportRegistry = new RecordWorkRegistry();
+const referenceAsrService = new QwenAsrService(path.join(process.cwd(), 'data', 'qwen-asr'));
+let legacyFakePurgePromise: Promise<void> | null = null;
+let activeDownloadJobs = 0;
+const MAX_DOWNLOAD_JOBS = Number(process.env.VIDEO_DOWNLOAD_CONCURRENCY || 3);
+const pendingVisibleBackfillJobs = new Set<string>();
+const pocketBaseBackfillFailures = new Map<string, number>();
+
+function crawlerCosKey(record: Record<string, unknown>, role: string, extension: string): string {
+  const tenantId = String(record.tenantId || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_');
+  const recordId = String(record.id || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_');
+  const safeRole = role.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const safeExtension = extension.replace(/[^a-zA-Z0-9]/g, '') || 'bin';
+  return `crawlers/tenants/${tenantId}/trend-videos/${recordId}/${safeRole}.${safeExtension}`;
+}
+
+/** Persist independently playable shot clips and exact first frames. The
+ * URLs are served through tenant-checked routes below, never as public COS
+ * links. A failed extraction stays explicitly unavailable in the analysis. */
+async function persistExactShotEvidence(recordId: string, filePath: string, analysis: VideoAiAnalysis): Promise<VideoAiAnalysis> {
+  if (!ffmpegBin || !Array.isArray(analysis.scriptDetails15s)) return analysis;
+  const record = await store.getById<Record<string, unknown>>(COL, recordId);
+  if (!record) return analysis;
+  const details = [...analysis.scriptDetails15s];
+  let openingFrameInspection: ReturnType<typeof inspectVideoOpeningFrameWithQwen> | null = null;
+  for (let index = 0; index < details.length; index += 1) {
+    const detail = details[index]!;
+    const range = parseAnalysisTimeRange(String(detail.time || detail.timestamp || ''));
+    if (!range || range.end - range.start < 0.2) continue;
+    const prefix = path.join(ANALYSIS_DIR, `shot-${recordId}-${index}-${randomUUID()}`);
+    const clipPath = `${prefix}.mp4`;
+    const framePath = `${prefix}.jpg`;
+    const firstFrameSeconds = Math.max(0, range.start + Math.min(0.04, (range.end - range.start) / 4));
+    try {
+      fs.mkdirSync(ANALYSIS_DIR, { recursive: true });
+      await execFileAsync(ffmpegBin, [
+        '-hide_banner', '-loglevel', 'error', '-ss', String(range.start), '-i', filePath,
+        '-t', String(range.end - range.start), '-map', '0:v:0', '-map', '0:a?',
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '24', '-c:a', 'aac', '-movflags', '+faststart', '-y', clipPath,
+      ], { timeout: 90_000 });
+      await execFileAsync(ffmpegBin, [
+        '-hide_banner', '-loglevel', 'error', '-ss', String(firstFrameSeconds), '-i', filePath,
+        '-frames:v', '1', '-q:v', '3', '-y', framePath,
+      ], { timeout: 30_000 });
+      if (index === 0 && isQwenConfigured()) {
+        openingFrameInspection = inspectVideoOpeningFrameWithQwen({
+          base64: fs.readFileSync(framePath).toString('base64'), mimeType: 'image/jpeg',
+        }).catch(error => {
+          console.warn('[videos] independent opening-frame check unavailable:', error instanceof Error ? error.message : error);
+          return { scene: 'unknown' as const, hasPerson: null, hasProduct: null, confidence: 0 };
+        });
+      }
+      let clipKey = '';
+      let frameKey = '';
+      if (objectStorageEnabled()) {
+        clipKey = await uploadCrawlerCosObject(recordId, `shot-${index + 1}-clip`, fs.readFileSync(clipPath), 'video/mp4');
+        frameKey = await uploadCrawlerCosObject(recordId, `shot-${index + 1}-first-frame`, fs.readFileSync(framePath), 'image/jpeg');
+      } else {
+        const destination = path.join(tenantAssetDir(MEDIA_DIR, String(record.tenantId || '')), 'trend-shots', recordId);
+        fs.mkdirSync(destination, { recursive: true });
+        fs.copyFileSync(clipPath, path.join(destination, `shot-${index + 1}.mp4`));
+        fs.copyFileSync(framePath, path.join(destination, `shot-${index + 1}.jpg`));
+      }
+      details[index] = {
+        ...detail,
+        materialEvidence: {
+          sourceVideoRef: `/api/overseas/videos/${recordId}/media`,
+          clipRef: `/api/overseas/videos/${recordId}/shot/${index + 1}/clip`,
+          firstFrameRef: `/api/overseas/videos/${recordId}/shot/${index + 1}/first-frame`,
+          firstFrameSeconds,
+          extractionStatus: 'ready',
+          clipObjectKey: clipKey,
+          firstFrameObjectKey: frameKey,
+        },
+      } as typeof detail;
+    } catch (error) {
+      console.warn(`[videos] shot evidence ${recordId}/${index + 1} unavailable:`, error instanceof Error ? error.message : error);
+      details[index] = { ...detail, materialEvidence: {
+        sourceVideoRef: `/api/overseas/videos/${recordId}/media`, clipRef: null, firstFrameRef: null,
+        firstFrameSeconds, extractionStatus: 'unavailable',
+      } } as typeof detail;
+    } finally {
+      for (const file of [clipPath, framePath]) { try { fs.unlinkSync(file); } catch { /* best effort */ } }
+    }
+  }
+  const detectedSceneCuts = (analysis as VideoAiAnalysis & { detectedSceneCuts?: number[] }).detectedSceneCuts
+    ?? await detectVideoSceneCuts(filePath);
+  const openingFrameObservation = openingFrameInspection ? await openingFrameInspection : null;
+  return { ...analysis, scriptDetails15s: details, detectedSceneCuts, openingFrameObservation } as VideoAiAnalysis;
+}
+
+async function uploadCrawlerCosObject(
+  recordId: string,
+  role: string,
+  body: Buffer,
+  contentType: string,
+): Promise<string> {
+  if (!objectStorageEnabled()) throw new Error('COS object storage is not configured for crawler media');
+  const record = await store.getById<Record<string, unknown>>(COL, recordId);
+  if (!record) throw new Error(`Crawler record not found before COS upload: ${recordId}`);
+  const extension = contentType.includes('webp') ? 'webp'
+    : contentType.includes('png') ? 'png'
+      : contentType.includes('jpeg') || contentType.includes('jpg') ? 'jpg'
+        : contentType.includes('mp4') ? 'mp4' : 'bin';
+  const key = crawlerCosKey(record, role, extension);
+  await objectStorageUpload({ key, body, contentType });
+  const verified = await objectStorageHead(key);
+  if (!verified || verified.size !== body.length) throw new Error(`COS crawler upload verification failed: ${key}`);
+  return key;
+}
+
+async function streamCrawlerCosObject(res: Response, key: string, range?: string): Promise<boolean> {
+  const object = await objectStorageGetObject(key, range);
+  if (!object) return false;
+  res.status(object.contentRange ? 206 : 200);
+  res.setHeader('Content-Type', object.contentType || 'application/octet-stream');
+  res.setHeader('Accept-Ranges', object.acceptRanges || 'bytes');
+  res.setHeader('Cache-Control', 'private, max-age=3600');
+  if (object.contentLength !== undefined) res.setHeader('Content-Length', object.contentLength);
+  if (object.contentRange) res.setHeader('Content-Range', object.contentRange);
+  for await (const chunk of object.body) res.write(chunk);
+  res.end();
+  return true;
+}
+
+interface CrawledVideo {
+  platform: Platform;
+  title: string;
+  sourceUrl: string;
+  thumbnailUrl: string;
+  duration: number;
+  views: string;
+  tags: string[];
+  uploadedAt?: string;
+  dateEvidence?: string;
+  author?: string;
+  likes?: string;
+  comments?: string;
+  shares?: string;
+  plays?: string;
+  followers?: number;
+  isAd?: boolean;
+  isPaidPartnership?: boolean;
+  source?: string;
+}
+
+type ContentFormat = 'video' | 'image';
+
+interface CrawledImagePost {
+  platform: Platform;
+  title: string;
+  sourceUrl: string;
+  thumbnailUrl: string;
+  caption?: string;
+  imageUrls?: string[];
+  views: string;
+  tags: string[];
+  uploadedAt?: string;
+  author?: string;
+  likes?: string;
+  comments?: string;
+  shares?: string;
+  plays?: string;
+  followers?: number;
+  isAd?: boolean;
+  isPaidPartnership?: boolean;
+  source?: string;
+}
+
+interface Material {
+  id: string;
+  name: string;
+  folder: string;
+  type: 'video' | 'image' | 'audio';
+  duration: number;
+  size: string;
+  file: string;
+  url: string;
+  poster?: string;
+  objectKey?: string;
+  tenantId?: string;
+  scope: 'shared' | 'own';
+  usage?: 'editable' | 'reference_only';
+  sourceType?: string;
+  sourceUrl?: string;
+  rightsReviewStatus?: string;
+  commercialUseApproved?: boolean;
+  derivativesApproved?: boolean;
+  rawLibraryUseApproved?: boolean;
+  mayAnalyze?: boolean;
+  mayUseInProduction?: boolean;
+  pinned?: boolean;
+  contentSha256?: string;
+  provenance?: Record<string, unknown>;
+  createdAt: string;
+}
+
+function isVisibleVideoPipelineRecord(record: Record<string, unknown>): boolean {
+  const analysis = videoAnalysisOf(record);
+  if (analysis.usage === 'reference_only' && typeof analysis.contentSha256 === 'string') return true;
+  return Boolean(analysis.requestedAnalysisMode)
+    || Boolean(analysis.materialId && (
+      analysis.analysisError
+      || analysis.videoLevelFailureStatus
+      || ['queued', 'analyzing', 'waiting_for_video', 'analysis_retryable', 'video_failed'].includes(String(analysis.geminiStatus || ''))
+    ));
+}
+
+interface CrawlerOpsTask {
+  id: string;
+  recordId: string;
+  tenantId?: string;
+  platform: Platform;
+  sourceUrl: string;
+  title: string;
+  status: 'queued' | 'pushed' | 'processing' | 'resolved' | 'failed';
+  reason: string;
+  attempts: number;
+  createdAt: string;
+  updatedAt: string;
+  lastError?: string;
+  lastStrategy?: string;
+  apifyFallbackAt?: string;
+  recoveryCount?: number;
+  recoveredAt?: string;
+  retryResetCount?: number;
+  retryResetAt?: string;
+  retryResetBy?: string;
+}
+
+function isTestTenantRecord(tenant: Record<string, unknown> | null): boolean {
+  if (isDemoMode()) return true;
+  const plan = String(tenant?.subscriptionPlan || '').toLowerCase();
+  const status = String(tenant?.subscriptionStatus || '').toLowerCase();
+  return plan === 'trial' || plan === 'admin' || status === 'trialing';
+}
+
+async function isTestTenantId(tenantId: string): Promise<boolean> {
+  if (!tenantId) return false;
+  if (localFallbacksEnabled() && currentDataAuthority() !== 'pocketbase' && tenantId.startsWith('local_tenant_')) return true;
+  const tenant = await store.getById<Record<string, unknown>>('tenants', tenantId);
+  return isTestTenantRecord(tenant);
+}
+
+
+function isPublicTestTenantVideo(record: Record<string, unknown>): boolean {
+  const analysis = videoAnalysisOf(record);
+  if (analysis.userVisible === false) return false;
+  return isVideoLevelAnalysis(analysis);
+}
+
+function isDisplayableTestTenantVideo(record: Record<string, unknown>): boolean {
+  const analysis = videoAnalysisOf(record);
+  if (analysis.usage === 'reference_only' && typeof analysis.contentSha256 === 'string') return true;
+  if (analysis.contentFormat === 'image' || String(record.status || '') === 'failed') return false;
+  if (analysis.adminOnlyVideoFailure || analysis.userVisible === true) {
+    return analysis.userVisible === true && isPublicTestTenantVideo(record);
+  }
+  const downloadStatus = String(analysis.downloadStatus || '');
+  const videoFetchStatus = String(analysis.videoFetchStatus || '');
+  const geminiStatus = String(analysis.geminiStatus || '');
+  const terminalFailures = new Set([
+    'failed', 'download_failed', 'manual_required', 'metadata_only',
+    'unavailable', 'url_failed', 'ops_failed', 'video_failed', 'metadata_fallback',
+  ]);
+  if ([downloadStatus, videoFetchStatus, geminiStatus].some(status => terminalFailures.has(status))) return false;
+  const sourceUrl = String(record.sourceUrl || '').trim();
+  const platform = (record.platform || inferPlatformFromUrl(sourceUrl)) as Platform;
+  const thumbnailUrl = String(record.thumbnailUrl || '').trim();
+  const pendingStatuses = new Set([
+    'queued', 'downloading', 'download_retrying', 'ops_queued',
+    'ops_processing', 'analyzing', 'waiting_for_video',
+  ]);
+  return isPlatformUrl(sourceUrl, platform)
+    && Boolean(String(record.title || '').trim())
+    && hasRealThumbnail({ thumbnailUrl } as CrawledVideo)
+    && [downloadStatus, videoFetchStatus, geminiStatus].some(status => pendingStatuses.has(status));
+}
+
+function compareCrawledAtDesc(a: Record<string, unknown>, b: Record<string, unknown>): number {
+  const aTime = Date.parse(String(a.crawledAt || ''));
+  const bTime = Date.parse(String(b.crawledAt || ''));
+  return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
+}
+
+function recordContentFormat(record: Record<string, unknown>): ContentFormat {
+  if (record.contentFormat === 'image' || record.contentFormat === 'video') return record.contentFormat;
+  const analysis = videoAnalysisOf(record);
+  return analysis.contentFormat === 'image' ? 'image' : 'video';
+}
+
+function isPublicImageRecord(record: Record<string, unknown>): boolean {
+  const analysis = videoAnalysisOf(record);
+  return analysis.contentFormat === 'image'
+    && analysis.userVisible !== false
+    && isValidImagePostRecord(record);
+}
+
+function isValidImagePostRecord(record: Record<string, unknown>): boolean {
+  const sourceUrl = String(record.sourceUrl || '').trim();
+  const thumbnailUrl = String(record.thumbnailUrl || '').trim();
+  if (!sourceUrl || !thumbnailUrl) return false;
+  if (/\/(?:search|explore\/tags)\b/i.test(sourceUrl)) return false;
+  const platform = (record.platform || inferPlatformFromUrl(sourceUrl)) as Platform;
+  if (platform === 'instagram') return /\/p\//i.test(sourceUrl);
+  if (platform === 'facebook') return !/\/(?:watch|reel|videos)\b/i.test(sourceUrl);
+  return true;
+}
+
+function videoSuccessVisibilityPatch(): Record<string, unknown> {
+  return {
+    userVisible: true,
+    adminOnlyVideoFailure: undefined,
+    videoLevelFailureStatus: undefined,
+    manualRequiredReason: undefined,
+  };
+}
+
+function assertCompleteVideoGeminiAnalysis(gemini: VideoAiAnalysis, sourceLabel: string): void {
+  if (hasCompleteVideoGeminiAnalysis(gemini)) return;
+  throw new Error(`${sourceLabel}_incomplete_gemini_video_analysis`);
+}
+
+function videoLevelSuccessPatch(input: {
+  analysis: VideoAiAnalysis;
+  source: string;
+  videoFetchStatus: string;
+  extra?: Record<string, unknown>;
+}): Record<string, unknown> {
+  assertCompleteVideoGeminiAnalysis(input.analysis, input.source);
+  const exact = input.extra?.analysisMode === 'exact';
+  const sceneCuts = (input.analysis as VideoAiAnalysis & { detectedSceneCuts?: number[] }).detectedSceneCuts || [];
+  const openingFrame = (input.analysis as VideoAiAnalysis & { openingFrameObservation?: { scene: string; confidence: number } | null }).openingFrameObservation;
+  const hookReviewReasons = (input.analysis as VideoAiAnalysis & { hookReviewReasons?: string[] }).hookReviewReasons || [];
+  const reviewReasons = exact ? [...exactVideoReviewReasons(input.analysis, 0, sceneCuts, openingFrame), ...hookReviewReasons] : [];
+  return {
+    gemini: input.analysis,
+    analysisSource: input.source,
+    analysisQuality: reviewReasons.length ? 'video_review_required' : 'video',
+    analysisReviewReasons: reviewReasons,
+    analysisMode: 'strategy',
+    downloadStatus: 'analyzed',
+    videoFetchStatus: input.videoFetchStatus,
+    geminiStatus: reviewReasons.length ? 'needs_review' : 'analyzed',
+    // A successful retry is terminal. Do not leave a stale timeout from an
+    // earlier run on an otherwise healthy, user-visible record.
+    analysisError: undefined,
+    downloadError: undefined,
+    ...videoSuccessVisibilityPatch(),
+    analyzedAt: new Date().toISOString(),
+    ...(input.extra ?? {}),
+  };
+}
+
+function publicVideoRecord<T extends Record<string, unknown>>(record: T): T {
+  const stableYouTubeThumbnail = record.platform === 'youtube'
+    ? youtubeThumbnailFromUrl(String(record.sourceUrl || ''))
+    : '';
+  const publicRecord = stableYouTubeThumbnail
+    ? { ...record, thumbnailUrl: stableYouTubeThumbnail } as T
+    : record;
+  const analysis = videoAnalysisOf(record);
+  if (!Object.keys(analysis).length) return publicRecord;
+  const scrubbed = { ...analysis };
+  const gemini = parseJsonRecord<Record<string, unknown>>(analysis.gemini, {});
+  if (Array.isArray(gemini.scriptDetails15s)) {
+    scrubbed.gemini = {
+      ...gemini,
+      scriptDetails15s: gemini.scriptDetails15s.map(raw => {
+        const detail = parseJsonRecord<Record<string, unknown>>(raw, {});
+        const evidence = parseJsonRecord<Record<string, unknown>>(detail.materialEvidence, {});
+        if (!Object.keys(evidence).length) return detail;
+        const { clipObjectKey: _clipObjectKey, firstFrameObjectKey: _firstFrameObjectKey, ...publicEvidence } = evidence;
+        return { ...detail, materialEvidence: publicEvidence };
+      }),
+    };
+  }
+  for (const key of [
+    'adminOnlyVideoFailure',
+    'userVisible',
+    'videoLevelFailureStatus',
+    'manualRequiredReason',
+    'replacementForRecordId',
+    'backfillReason',
+    'downloadError',
+    'analysisError',
+    'crawlerOpsLastError',
+    'youtubeDirectError',
+  ]) {
+    delete scrubbed[key];
+  }
+  return { ...publicRecord, aiAnalysis: JSON.stringify(scrubbed) };
+}
+
+function withSignedThumbnail<T extends Record<string, unknown>>(record: T, tenantId: string): T {
+  const thumbnailUrl = String(record.thumbnailUrl || '');
+  if (!thumbnailUrl.startsWith('/media/')) return record;
+  return { ...record, thumbnailUrl: signAssetUrl(thumbnailUrl, tenantId) } as T;
+}
+
+function compactVideoPipelineError(message: unknown, max = 900): string {
+  return String(message || '')
+    .replace(/(token=)[^&\s]+/gi, '$1***')
+    .replace(/(api[_-]?key=)[^&\s]+/gi, '$1***')
+    .replace(/Bearer\s+[A-Za-z0-9._~+/-]+/g, 'Bearer ***')
+    .replace(/\/\/([^:\s/@]+):([^@\s]+)@/g, '//***:***@')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, max);
+}
+
+function publicVideoPipelineError(message: unknown): string {
+  const text = compactVideoPipelineError(message, 500);
+  if (!text) return '视频分析失败，请稍后重试。';
+  if (/GEMINI_API_KEY\s+is\s+not\s+set|gemini[^\n]*(?:not configured|missing api)/i.test(text)) return 'Gemini 未配置，请联系管理员配置后重新分析，或切换到已配置的 Qwen。';
+  if (/video_analysis_hard_timeout|exact_chunk_timeout|qwen[^\n]*(?:timeout|timed out|超时)/i.test(text)) return 'Qwen 分析超时，可点击重新分析；连续超时时请改用策略分析或缩短视频。';
+  if (/404|not found|unable to download|download webpage|unsupported url/i.test(text)) return '源视频暂时无法获取，请确认链接有效后重新分析。';
+  if (/429|quota|resource_exhausted|额度|余额/i.test(text)) return 'AI 分析额度暂时不足，请稍后重试或联系管理员。';
+  if (/timeout|timed out|超时/i.test(text)) return '视频分析超时，请稍后重新分析。';
+  if (/gemini|model|api/i.test(text)) return 'AI 分析服务暂时不可用，请稍后重试。';
+  return '视频分析失败，请稍后重试。';
+}
+
+export type VideoAnalysisRecovery = {
+  code: 'gemini_missing' | 'qwen_timeout' | 'candidate_hidden' | 'source_unavailable' | 'analysis_failed' | 'none';
+  reason: string;
+  recoveryAction: string;
+  provider: 'Gemini' | 'Qwen' | 'AI';
+  hidden: boolean;
+};
+
+/** Keeps operational failures actionable without returning provider secrets. */
+export function describeVideoAnalysisRecovery(
+  analysis: Record<string, unknown>,
+  recordStatus = '',
+): VideoAnalysisRecovery {
+  const source = String(analysis.analysisSource || '').toLowerCase();
+  const rawError = compactVideoPipelineError([
+    analysis.analysisError,
+    analysis.videoLevelFailureStatus,
+    analysis.manualRequiredReason,
+    analysis.downloadError,
+    analysis.youtubeDirectError,
+  ].filter(Boolean).join(' '), 900);
+  const hidden = analysis.userVisible === false;
+  const provider: VideoAnalysisRecovery['provider'] = /qwen|dashscope/.test(`${source} ${rawError}`)
+    ? 'Qwen'
+    : /gemini/.test(`${source} ${rawError}`) ? 'Gemini' : 'AI';
+
+  if (/GEMINI_API_KEY\s+is\s+not\s+set|gemini[^\n]*(?:not configured|missing api)/i.test(rawError)) {
+    return {
+      code: 'gemini_missing', provider: 'Gemini', hidden,
+      reason: 'Gemini 未配置，当前候选无法完成视频级分析。',
+      recoveryAction: '请管理员配置 GEMINI_API_KEY，或切换到已配置的 Qwen 后点击“重新分析”。',
+    };
+  }
+  if (/video_analysis_hard_timeout|exact_chunk_timeout|qwen[^\n]*(?:timeout|timed out|超时)/i.test(rawError)) {
+    return {
+      code: 'qwen_timeout', provider: 'Qwen', hidden,
+      reason: 'Qwen 视频分析超时，本次没有生成可用的全片结果。',
+      recoveryAction: '可点击“重新分析”；连续超时时改用策略分析、缩短视频，或交给人工补充源文件。',
+    };
+  }
+  if (/404|not found|unable to download|download webpage|unsupported url|manual_required|url_failed/i.test(rawError)) {
+    return {
+      code: 'source_unavailable', provider, hidden,
+      reason: '源视频暂时无法获取，候选不会被当作已分析结果展示。',
+      recoveryAction: '请确认公开链接或人工上传原视频，然后点击“重新分析”。',
+    };
+  }
+  if (hidden) {
+    return {
+      code: 'candidate_hidden', provider, hidden: true,
+      reason: '候选暂未展示：只有完成真实视频级分析后才会进入灵感大屏。',
+      recoveryAction: rawError
+        ? '查看失败原因后点击“重新分析”，或人工补充可读的原视频。'
+        : '等待当前分析完成；长时间无进展时可暂停后重新分析。',
+    };
+  }
+  if (rawError || recordStatus === 'failed') {
+    return {
+      code: 'analysis_failed', provider, hidden,
+      reason: publicVideoPipelineError(rawError),
+      recoveryAction: '点击“重新分析”；如果仍失败，请人工检查源视频和模型配置。',
+    };
+  }
+  return { code: 'none', provider, hidden, reason: '', recoveryAction: '', };
+}
+
+function recordKeywordText(record: Record<string, unknown>): string {
+  const analysis = videoAnalysisOf(record);
+  const tags = parseJsonRecord<string[]>(record.tags, []);
+  const gemini = typeof analysis.gemini === 'object' && analysis.gemini
+    ? analysis.gemini as Record<string, unknown>
+    : {};
+  return [
+    record.title,
+    tags.join(' '),
+    analysis.keyword,
+    gemini.theme,
+    Array.isArray(gemini.hooks) ? gemini.hooks.join(' ') : '',
+    Array.isArray(gemini.sellingPoints) ? gemini.sellingPoints.join(' ') : '',
+  ].join(' ').toLowerCase();
+}
+
+function recordMatchesKeyword(record: Record<string, unknown>, keyword: string): boolean {
+  const normalized = keyword.trim().toLowerCase();
+  if (!normalized || /^https?:\/\//i.test(normalized)) return true;
+  const tokens = normalized
+    .split(/[\s,;，；、]+/)
+    .map(token => token.replace(/[^\p{L}\p{N}]+/gu, ''))
+    .filter(token => token.length >= 2);
+  if (tokens.length === 0) return true;
+  const text = recordKeywordText(record);
+  return tokens.some(token => text.includes(token));
+}
+
+async function listVisibleTestTenantVideos(input: {
+  tenantId: string;
+  platform?: Platform;
+  keyword?: string;
+  limit: number;
+}): Promise<Record<string, unknown>[]> {
+  const out: Record<string, unknown>[] = [];
+  const seenSourceUrls = new Set<string>();
+  let page = 1;
+  let totalPages = 1;
+  do {
+    const result = await store.list<Record<string, unknown>>(COL, {
+      where: input.platform ? { tenantId: input.tenantId, platform: input.platform } : { tenantId: input.tenantId },
+      sort: '-crawledAt',
+      page,
+      perPage: 100,
+    });
+    for (const record of result.items) {
+      if (!isPublicTestTenantVideo(record)) continue;
+      if (input.keyword && !recordMatchesKeyword(record, input.keyword)) continue;
+      const sourceUrl = String(record.sourceUrl || '').trim();
+      if (sourceUrl && seenSourceUrls.has(sourceUrl)) continue;
+      if (sourceUrl) seenSourceUrls.add(sourceUrl);
+      out.push(publicVideoRecord(record));
+      if (out.length >= input.limit) return out;
+    }
+    totalPages = result.totalPages || 1;
+    page += 1;
+  } while (page <= totalPages && page <= 50);
+  return out;
+}
+
+async function existingTenantSourceUrls(tenantId: string): Promise<Set<string>> {
+  const urls = new Set<string>();
+  let page = 1;
+  let totalPages = 1;
+  do {
+    const result = await store.list<Record<string, unknown>>(COL, {
+      where: { tenantId },
+      page,
+      perPage: 100,
+    });
+    for (const record of result.items) {
+      const sourceUrl = String(record.sourceUrl || '').trim();
+      if (sourceUrl) urls.add(sourceUrl);
+    }
+    totalPages = result.totalPages || 1;
+    page += 1;
+  } while (page <= totalPages && page <= 50);
+  return urls;
+}
+
+interface TestTenantVideoBackfillInput {
+  tenantId: string;
+  platform: Platform;
+  keyword?: string;
+  target: number;
+  replacementForRecordId?: string;
+  reason?: string;
+  forceCreate?: boolean;
+  dateFrom?: string;
+  dateTo?: string;
+}
+
+function scheduleTestTenantVideoBackfill(input: TestTenantVideoBackfillInput): void {
+  const key = [
+    input.tenantId,
+    input.platform,
+    input.keyword || '',
+    input.dateFrom || '',
+    input.dateTo || '',
+    input.replacementForRecordId || '',
+  ].join('|');
+  if (pendingVisibleBackfillJobs.has(key)) return;
+
+  pendingVisibleBackfillJobs.add(key);
+  void ensureTestTenantVideoBackfill(input)
+    .catch((e) => {
+      const error = compactVideoPipelineError(e instanceof Error ? e.message : e);
+      console.warn('[videos] test tenant video backfill failed:', error);
+      recordVideoAdminAlert({
+        recordId: input.replacementForRecordId || '',
+        tenantId: input.tenantId,
+        platform: input.platform,
+        title: `${input.platform} ${input.keyword || ''}`.trim(),
+        sourceUrl: '',
+        reason: input.reason || 'fresh_video_level_backfill_failed',
+        error,
+      });
+    })
+    .finally(() => {
+      pendingVisibleBackfillJobs.delete(key);
+    });
+}
+
+async function ensureTestTenantVideoBackfill(input: TestTenantVideoBackfillInput): Promise<Record<string, unknown>[]> {
+  if (!await isTestTenantId(input.tenantId)) return [];
+
+  const keyword = input.keyword || '';
+  const target = Math.max(1, Math.min(10, input.target));
+  const existingVisible = await listVisibleTestTenantVideos({
+    tenantId: input.tenantId,
+    platform: input.platform,
+    keyword,
+    limit: target,
+  });
+  if (!input.forceCreate && existingVisible.length >= target) return existingVisible;
+
+  const sourceUrls = await existingTenantSourceUrls(input.tenantId);
+  const created: Record<string, unknown>[] = [];
+  const needed = input.forceCreate ? target : Math.max(0, target - existingVisible.length);
+  const candidates = await discoverFreshBackfillCandidates({
+    platform: input.platform,
+    keyword,
+    limit: Math.max(needed * 40, 80),
+    excludedSourceUrls: sourceUrls,
+    dateFrom: input.dateFrom || '',
+    dateTo: input.dateTo || '',
+  });
+
+  const maxAnalysisAttempts = Math.max(1, Math.min(10, Number(process.env.VIDEO_BACKFILL_MAX_ANALYSIS_ATTEMPTS || 3)));
+  let attempted = 0;
+  for (const item of candidates) {
+    if (created.length >= needed) break;
+    if (attempted >= maxAnalysisAttempts) break;
+    attempted += 1;
+    const record = await createAndAnalyzeFreshBackfillVideo({
+      tenantId: input.tenantId,
+      item,
+      keyword,
+      replacementForRecordId: input.replacementForRecordId,
+      reason: input.reason || 'fresh_video_level_backfill',
+      dateFrom: input.dateFrom || '',
+      dateTo: input.dateTo || '',
+    });
+    if (!record) continue;
+    sourceUrls.add(String(record.sourceUrl || ''));
+    created.push(record);
+  }
+
+  return [...created, ...existingVisible].slice(0, target);
+}
+
+async function discoverFreshBackfillCandidates(input: {
+  platform: Platform;
+  keyword: string;
+  limit: number;
+  excludedSourceUrls: Set<string>;
+  dateFrom: string;
+  dateTo: string;
+}): Promise<CrawledVideo[]> {
+  const limit = Math.max(1, Math.min(120, input.limit));
+  const keyword = input.keyword || DEFAULT_CRAWL_KEYWORDS;
+  const candidates: CrawledVideo[] = [];
+
+  try {
+    if (input.platform === 'youtube') {
+      candidates.push(...await crawlYouTubeSearch(keyword, limit, input.dateFrom, input.dateTo));
+    } else if (input.platform === 'tiktok') {
+      candidates.push(...await crawlTikTokWithApifyFallback(keyword, limit, input.dateFrom, input.dateTo));
+    } else if (input.platform === 'instagram') {
+      candidates.push(...await crawlInstagramWithApifyFallback(keyword, limit, input.dateFrom, input.dateTo));
+    } else if (input.platform === 'facebook') {
+      candidates.push(...await crawlSocialUrlOrFallback(input.platform, keyword, limit, input.dateFrom, input.dateTo));
+    }
+  } catch (e) {
+    console.warn(`[videos] fresh ${input.platform} backfill search failed:`, e instanceof Error ? e.message : e);
+  }
+
+  const seen = new Set<string>();
+  return sortByHeat(candidates.map(normalizeCrawledVideo))
+    .filter(item => item.platform === input.platform && isPlatformUrl(item.sourceUrl, input.platform))
+    .filter(item => !input.excludedSourceUrls.has(item.sourceUrl))
+    .filter(item => !seen.has(item.sourceUrl) && seen.add(item.sourceUrl))
+    .filter(item => isKeywordRelevant(item, keyword))
+    .filter(item => item.dateEvidence === 'youtube-upload-filter' || isWithinDateRange(item.uploadedAt, input.dateFrom, input.dateTo))
+    .filter(hasRealThumbnail)
+    .slice(0, limit);
+}
+
+async function createAndAnalyzeFreshBackfillVideo(input: {
+  tenantId: string;
+  item: CrawledVideo;
+  keyword: string;
+  replacementForRecordId?: string;
+  reason: string;
+  dateFrom?: string;
+  dateTo?: string;
+}): Promise<Record<string, unknown> | null> {
+  const existing = await store.list(COL, {
+    where: { tenantId: input.tenantId, sourceUrl: input.item.sourceUrl },
+    page: 1,
+    perPage: 1,
+  });
+  if (existing.items[0]) return null;
+
+  const record = await store.create<Record<string, unknown>>(COL, {
+    tenantId: input.tenantId,
+    platform: input.item.platform,
+    title: input.item.title,
+    thumbnailUrl: input.item.thumbnailUrl,
+    videoFileId: '',
+    duration: input.item.duration,
+    sourceUrl: input.item.sourceUrl,
+    tags: JSON.stringify(input.item.tags),
+    aiAnalysis: JSON.stringify({
+      source: input.item.source || `${input.item.platform}-search`,
+      views: input.item.views,
+      uploadedAt: input.item.uploadedAt,
+      dateEvidence: input.item.dateEvidence,
+      gemini: metadataFallbackAnalysis(input.item),
+      analysisSource: 'metadata-fallback',
+      analysisQuality: 'metadata',
+      keyword: input.keyword,
+      crawlRule: '关键词检索',
+      dateFrom: input.dateFrom,
+      dateTo: input.dateTo,
+      replacementForRecordId: input.replacementForRecordId,
+      backfillReason: input.reason,
+      importedAt: new Date().toISOString(),
+      userVisible: false,
+    }),
+    status: 'analyzed' as VideoStatus,
+    crawledAt: new Date().toISOString(),
+  });
+  if (!record) return null;
+
+  try {
+    await analyzeSourceVideoJob({
+      record,
+      sourceUrl: input.item.sourceUrl,
+      title: input.item.title,
+      platform: input.item.platform,
+      suppressVisibleBackfill: true,
+    });
+  } catch {
+    // The record itself is marked for admin review by the analysis path.
+  }
+
+  const recordId = String((record as Record<string, unknown>).id || '');
+  if (!recordId) return null;
+  const latest = await store.getById<Record<string, unknown>>(COL, recordId);
+  if (!latest || !isPublicTestTenantVideo(latest)) return null;
+  return publicVideoRecord(latest);
+}
+
+const DEFAULT_CRAWL_KEYWORDS = 'amazon gadgets product review';
+let crawlerOpsWorkerTimer: NodeJS.Timeout | null = null;
+let crawlerOpsWorkerActive = false;
+let stalledExactSweepTimer: NodeJS.Timeout | null = null;
+let runtimeCrawlerProxy = '';
+
+export interface CrawlVideosInput {
+  tenantId: string;
+  platform?: Platform;
+  keyword?: string;
+  limit?: number;
+  dateFrom?: string;
+  dateTo?: string;
+  // 对标账号主页采集：mode='account' 时 accountUrl 为账号主页 URL，
+  // 采集该账号最新视频而非按关键词检索。
+  mode?: 'keyword' | 'account';
+  accountUrl?: string;
+  accountName?: string;
+  cloudFallback?: boolean;
+  /** One-shot diagnostics must never fan out into automatic replacement crawls. */
+  disableBackfill?: boolean;
+  /** Scheduled collection finishes after persistence; analysis owns its own queue. */
+  deferAnalysis?: boolean;
+  /** Immutable discovery provenance attached to every imported or deduplicated candidate. */
+  discoveryContext?: {
+    runId: string;
+    scopeId: string;
+    scopeVersion: number;
+    mode: SocialDiscoveryMode;
+    queryRef: string;
+  };
+}
+
+function discoveryOrigins(
+  existing: unknown,
+  context: CrawlVideosInput['discoveryContext'],
+): Array<Record<string, unknown>> | undefined {
+  if (!context) return Array.isArray(existing) ? existing as Array<Record<string, unknown>> : undefined;
+  const previous = Array.isArray(existing) ? existing.filter(item => item && typeof item === 'object') as Array<Record<string, unknown>> : [];
+  const origin = { ...context, observedAt: new Date().toISOString() };
+  return [...previous.filter(item => item.runId !== context.runId || item.mode !== context.mode || item.queryRef !== context.queryRef), origin].slice(-20);
+}
+
+class NoCrawlResultsError extends Error {}
+
+export interface CrawlVideosResult {
+  outcome?: 'collected' | 'no_data';
+  candidateIds?: string[];
+  analysisPending?: boolean;
+  platform: Platform;
+  keyword: string;
+  imported: number;
+  refreshed: number;
+  skipped: number;
+  skippedExisting: number;
+  returnedExisting: number;
+  requested: number;
+  total: number;
+  source: string;
+  message: string;
+  items: unknown[];
+}
+
+// ─── POST /videos/crawl ──────────────────────────────────────────────────────
+// Body: { platform?: 'youtube' | 'tiktok' | 'facebook' | 'instagram', keyword?: string, limit?: number, dateFrom?: string, dateTo?: string }
+videosRouter.post('/crawl', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const {
+    platform = 'youtube',
+    keyword = DEFAULT_CRAWL_KEYWORDS,
+    limit = 5,
+    dateFrom = '',
+    dateTo = '',
+    mode,
+    accountUrl = '',
+    accountName = '',
+  } = req.body as {
+    platform?: Platform;
+    keyword?: string;
+    limit?: number;
+    dateFrom?: string;
+    dateTo?: string;
+    mode?: 'keyword' | 'account';
+    accountUrl?: string;
+    accountName?: string;
+  };
+
+  if (!['youtube', 'tiktok', 'facebook', 'instagram'].includes(platform)) {
+    res.status(400).json({ error: 'Only youtube, tiktok, facebook and instagram are supported by this crawler task' });
+    return;
+  }
+
+  try {
+    const result = await crawlVideosForTenant({ tenantId, platform, keyword, limit, dateFrom, dateTo, mode, accountUrl, accountName });
+    res.json(result);
+  } catch (e) {
+    console.error('[videos] crawl failed:', e);
+    res.status(502).json({ error: e instanceof Error ? e.message : 'Crawl failed' });
+  }
+});
+
+// ─── POST /videos/crawl-image-posts ──────────────────────────────────────────
+// Body: { platform?: 'youtube' | 'tiktok' | 'facebook' | 'instagram', keyword?: string, limit?: number }
+videosRouter.post('/crawl-image-posts', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const { platform = 'instagram', keyword = DEFAULT_CRAWL_KEYWORDS, limit = 5 } = req.body as {
+    platform?: Platform;
+    keyword?: string;
+    limit?: number;
+  };
+
+  if (!['youtube', 'tiktok', 'facebook', 'instagram'].includes(platform)) {
+    res.status(400).json({ error: 'Only youtube, tiktok, facebook and instagram are supported by this crawler task' });
+    return;
+  }
+
+  try {
+    const result = await crawlImagePostsForTenant({
+      tenantId,
+      platform,
+      keyword,
+      limit,
+    });
+    res.json(result);
+  } catch (e) {
+    console.error('[videos] image post crawl failed:', e);
+    res.status(502).json({ error: e instanceof Error ? e.message : 'Image post crawl failed' });
+  }
+});
+
+export async function crawlImagePostsForTenant(input: {
+  tenantId: string;
+  platform: Platform;
+  keyword: string;
+  limit: number;
+}): Promise<CrawlVideosResult> {
+  const target = Math.min(30, Math.max(1, Number(input.limit) || 5));
+  const keyword = String(input.keyword || DEFAULT_CRAWL_KEYWORDS).trim();
+  let items: CrawledImagePost[] = [];
+  let crawlerMessage = '';
+  const crawlerSource = `${input.platform}-image-search`;
+
+  try {
+    const safeLimit = Math.max(target * 4, target, 12);
+    if (input.platform === 'instagram') {
+      items = await crawlInstagramImagePostsApify(keyword, safeLimit);
+    } else if (input.platform === 'tiktok') {
+      items = await crawlTikTokImagePostsApify(keyword, safeLimit);
+    } else if (input.platform === 'facebook') {
+      items = await crawlFacebookImagePostsApify(keyword, safeLimit);
+    } else if (input.platform === 'youtube') {
+      items = await crawlYouTubeCommunityPostsPublicSearch(keyword, safeLimit);
+    }
+    items = items
+      .filter(item => item.platform === input.platform && isPlatformUrl(item.sourceUrl, input.platform))
+      .filter(item => imagePostRelevant(item, keyword));
+  } catch (e) {
+    crawlerMessage = e instanceof Error
+      ? `${input.platform} 图文采集未找到可入库内容：${e.message}`
+      : `${input.platform} 图文采集未找到可入库内容`;
+    console.warn(`[videos] ${input.platform} image post crawl degraded:`, e);
+    items = [];
+  }
+
+  const seen = new Set<string>();
+  const orderedItems = items
+    .filter(item => {
+      if (seen.has(item.sourceUrl)) return false;
+      seen.add(item.sourceUrl);
+      return true;
+    })
+    .slice(0, target);
+
+  let imported = 0;
+  let skipped = 0;
+  let skippedExisting = 0;
+  const records: unknown[] = [];
+  const existingRecords: unknown[] = [];
+
+  for (const item of orderedItems) {
+    const existingByUrl = await store.list(COL, {
+      where: { tenantId: input.tenantId, sourceUrl: item.sourceUrl },
+      page: 1,
+      perPage: 1,
+    });
+    const existingRecord = existingByUrl.items[0] as Record<string, unknown> | undefined;
+    if (existingRecord) {
+      skipped += 1;
+      skippedExisting += 1;
+      const existingAnalysis = videoAnalysisOf(existingRecord);
+      const imageAnalysis = await analyzeImagePostBestEffort(item, keyword, existingAnalysis.gemini as VideoAiAnalysis | undefined);
+      const recordId = String(existingRecord.id);
+      const remoteThumbnail = item.thumbnailUrl || String(existingRecord.thumbnailUrl || '');
+      const thumbnailUrl = await persistImagePostThumbnail(recordId, remoteThumbnail);
+      const storedImageUrls = await persistImagePostImages(recordId, item.imageUrls?.length ? item.imageUrls : [remoteThumbnail]);
+      const storedRecord = await store.getById<Record<string, unknown>>(COL, recordId);
+      const storedAnalysis = videoAnalysisOf(storedRecord || existingRecord);
+      await store.update(COL, recordId, {
+        contentFormat: 'image',
+        thumbnailUrl,
+        status: (imageAnalysis.status === 'analyzed' ? 'analyzed' : 'failed') as VideoStatus,
+        aiAnalysis: serializeImagePostAnalysis({
+          ...existingAnalysis,
+          imageStorage: storedAnalysis.imageStorage,
+          imageObjectKeys: storedAnalysis.imageObjectKeys,
+          thumbnailStorage: storedAnalysis.thumbnailStorage,
+          thumbnailObjectKey: storedAnalysis.thumbnailObjectKey,
+          contentFormat: 'image',
+          caption: item.caption || existingAnalysis.caption || item.title,
+          imageUrls: storedImageUrls.length ? storedImageUrls : (item.imageUrls?.length ? item.imageUrls : existingAnalysis.imageUrls),
+          imageCount: storedImageUrls.length || item.imageUrls?.length || existingAnalysis.imageCount || 1,
+          views: item.views || existingAnalysis.views,
+          publicMetrics: {
+            likes: item.likes,
+            comments: item.comments,
+            shares: item.shares,
+            plays: item.plays,
+            followers: item.followers,
+            observedAt: new Date().toISOString(),
+          },
+          author: item.author || existingAnalysis.author,
+          publicAdSignals: { isAd: item.isAd, isPaidPartnership: item.isPaidPartnership },
+          uploadedAt: item.uploadedAt || existingAnalysis.uploadedAt,
+          keyword,
+          crawlRule: '图文检索',
+          imageEvidence: imageAnalysis.analysis || existingAnalysis.imageEvidence,
+          imageAnalysisStatus: imageAnalysis.status === 'analyzed' ? 'analyzed' : (existingAnalysis.imageAnalysisStatus || 'failed'),
+          imageAnalysisError: imageAnalysis.status === 'analyzed' ? undefined : imageAnalysis.error,
+          analysisSource: imageAnalysis.status === 'analyzed' ? `${imageAnalysis.provider || 'qwen'}-image-evidence-v2` : (existingAnalysis.analysisSource || 'image-metadata'),
+          analysisQuality: imageAnalysis.status === 'analyzed' ? 'image' : (existingAnalysis.analysisQuality || 'metadata'),
+          importedAt: existingAnalysis.importedAt || new Date().toISOString(),
+        }),
+      });
+      existingRecords.push({ ...existingRecord, thumbnailUrl });
+      continue;
+    }
+
+    const imageAnalysis = await analyzeImagePostBestEffort(item, keyword);
+    const record = await store.create(COL, {
+      tenantId: input.tenantId,
+      contentFormat: 'image',
+      platform: item.platform,
+      title: item.title,
+      thumbnailUrl: item.thumbnailUrl,
+      videoFileId: '',
+      duration: 0,
+      sourceUrl: item.sourceUrl,
+      tags: JSON.stringify(item.tags),
+      aiAnalysis: serializeImagePostAnalysis({
+        contentFormat: 'image',
+        source: item.source || crawlerSource,
+        caption: item.caption || item.title,
+        imageUrls: item.imageUrls?.length ? item.imageUrls : [item.thumbnailUrl].filter(Boolean),
+        imageCount: item.imageUrls?.length || 1,
+        views: item.views,
+        publicMetrics: {
+          likes: item.likes,
+          comments: item.comments,
+          shares: item.shares,
+          plays: item.plays,
+          followers: item.followers,
+          observedAt: new Date().toISOString(),
+        },
+        publicAdSignals: { isAd: item.isAd, isPaidPartnership: item.isPaidPartnership },
+        uploadedAt: item.uploadedAt,
+        author: item.author,
+        likes: item.likes,
+        comments: item.comments,
+        imageEvidence: imageAnalysis.analysis,
+        imageAnalysisStatus: imageAnalysis.status,
+        imageAnalysisError: imageAnalysis.error,
+        analysisSource: imageAnalysis.status === 'analyzed' ? `${imageAnalysis.provider || 'qwen'}-image-evidence-v2` : 'image-metadata',
+        analysisQuality: imageAnalysis.status === 'analyzed' ? 'image' : 'metadata',
+        keyword,
+        crawlRule: '图文检索',
+        importedAt: new Date().toISOString(),
+      }),
+      status: (imageAnalysis.status === 'analyzed' ? 'analyzed' : 'failed') as VideoStatus,
+      crawledAt: new Date().toISOString(),
+    });
+    if (record) {
+      imported += 1;
+      const recordId = String((record as Record<string, unknown>).id);
+      const thumbnailUrl = await persistImagePostThumbnail(recordId, item.thumbnailUrl);
+      const storedImageUrls = await persistImagePostImages(recordId, item.imageUrls?.length ? item.imageUrls : [item.thumbnailUrl]);
+      const currentAnalysis = videoAnalysisOf(record as Record<string, unknown>);
+      await store.update(COL, recordId, {
+        thumbnailUrl,
+        aiAnalysis: serializeImagePostAnalysis({
+          ...currentAnalysis,
+          imageUrls: storedImageUrls.length ? storedImageUrls : currentAnalysis.imageUrls,
+          imageCount: storedImageUrls.length || currentAnalysis.imageCount || 1,
+        }),
+      });
+      records.push({ ...(record as Record<string, unknown>), thumbnailUrl });
+    }
+    if (imported >= target) break;
+  }
+
+  const resultRecords = [...records, ...existingRecords].slice(0, target);
+  return {
+    platform: input.platform,
+    keyword,
+    imported,
+    refreshed: 0,
+    skipped,
+    skippedExisting,
+    returnedExisting: Math.max(0, resultRecords.length - records.length),
+    requested: target,
+    total: items.length,
+    source: crawlerSource,
+    message: crawlerMessage || (resultRecords.length
+      ? `图文采集完成：返回 ${resultRecords.length} 条（新增 ${imported} 条，库内已有 ${Math.max(0, resultRecords.length - records.length)} 条）`
+      : `图文采集完成：未找到可入库图文，请换关键词或平台账号主页`),
+    items: resultRecords.map(record => publicVideoRecord(record as Record<string, unknown>)),
+  };
+}
+
+export async function crawlVideosForTenant(input: CrawlVideosInput): Promise<CrawlVideosResult> {
+  const tenantId = input.tenantId;
+  const platform = input.platform ?? 'youtube';
+  const accountMode = input.mode === 'account' && looksLikeAccountUrl(input.accountUrl ?? '', platform);
+  const accountUrl = accountMode ? String(input.accountUrl).trim() : '';
+  const accountName = accountMode ? String(input.accountName || accountLabelFromUrl(accountUrl)) : '';
+  // 对标账号采集时用账号名/URL 作为关键词占位，便于溯源与去重信息展示。
+  const keyword = accountMode ? (accountName || accountUrl) : (input.keyword ?? DEFAULT_CRAWL_KEYWORDS);
+  const limit = input.limit ?? 5;
+  const dateFrom = input.dateFrom ?? '';
+  const dateTo = input.dateTo ?? '';
+  const crawlRule = accountMode ? '对标账号主页' : '关键词检索';
+
+  await purgeLegacyFakeVideos();
+  const testTenant = await isTestTenantId(tenantId);
+  const target = Math.min(30, Math.max(1, Number(limit) || 5));
+  let crawlerSource = accountMode ? `${platform}-account` : `${platform}-search`;
+  let crawlerMessage = '';
+  let crawlerTopUpMessage = '';
+  let items: CrawledVideo[];
+  // 账号主页采集与直链一样跳过关键词/封面/补齐等以搜索为前提的过滤。
+  const directUrlInput = accountMode || isPlatformUrl(keyword, platform);
+  try {
+    const safeLimit = Math.min(120, Math.max(target * 5, target));
+    if (accountMode) {
+      items = await crawlAccountHomepage(platform, accountUrl, Math.max(target, Math.min(safeLimit, 30)), dateFrom, dateTo, input.cloudFallback === true);
+      if (hasDateRange(dateFrom, dateTo)) items = filterDateRangeItems(items, dateFrom, dateTo);
+      if (items.some(item => item.source === 'apify')) crawlerSource = `apify-${platform}-account`;
+    } else if (platform === 'youtube') {
+      items = await crawlYouTubeSearch(keyword, safeLimit, dateFrom, dateTo);
+    } else if (platform === 'facebook') {
+      crawlerSource = /^https?:\/\/(?:www\.|m\.|mbasic\.)?facebook\.com\//i.test(keyword.trim()) ? 'facebook-url' : 'facebook-search';
+      items = await crawlFacebook(keyword, safeLimit, dateFrom, dateTo);
+    } else if (platform === 'tiktok') {
+      crawlerSource = isPlatformUrl(keyword, 'tiktok') ? 'tiktok-url' : 'tiktok-search';
+      items = await crawlTikTokWithApifyFallback(keyword, safeLimit, dateFrom, dateTo);
+      if (items.some(item => item.source === 'apify')) crawlerSource = 'apify-tiktok';
+    } else if (platform === 'instagram') {
+      crawlerSource = isPlatformUrl(keyword, 'instagram') ? 'instagram-url' : 'instagram-search';
+      items = await crawlInstagramWithApifyFallback(keyword, safeLimit, dateFrom, dateTo);
+      if (items.some(item => item.source === 'apify')) crawlerSource = 'apify-instagram';
+    } else {
+      throw new Error(`${platform} adapter pending`);
+    }
+    if (!directUrlInput) {
+      const beforeDateFilter = items.length;
+      items = filterDateRangeItems(items, dateFrom, dateTo);
+      if (items.length === 0 && hasDateRange(dateFrom, dateTo)) {
+        throw new NoCrawlResultsError(`没有找到发布时间在 ${dateFrom || '不限'} 至 ${dateTo || '不限'} 内的公开视频（候选 ${beforeDateFilter} 条已过滤）`);
+      }
+    }
+    if (!directUrlInput) {
+      const beforeRealMediaFilter = items.length;
+      items = filterRealMediaItems(items);
+      if (items.length === 0) {
+        throw new NoCrawlResultsError(`没有拿到带真实封面的公开视频（候选 ${beforeRealMediaFilter} 条已过滤）`);
+      }
+    }
+    if (!directUrlInput) {
+      const beforeFilter = items.length;
+      items = filterKeywordRelevantItems(items, keyword);
+      if (items.length === 0) {
+        throw new NoCrawlResultsError(`没有找到与关键词「${keyword}」相关的公开视频（候选 ${beforeFilter} 条已过滤）`);
+      }
+    }
+    if (!directUrlInput && items.length < target) {
+      const beforeTopUp = items.length;
+      items = await topUpCrawledItems({ platform, keyword, target, items, dateFrom, dateTo });
+      const topUpCount = Math.max(0, items.length - beforeTopUp);
+      if (topUpCount > 0) {
+        crawlerTopUpMessage = `；过滤后补齐 ${topUpCount} 条`;
+      }
+    }
+  } catch (e) {
+    if (!(e instanceof NoCrawlResultsError)) throw e;
+    crawlerMessage = e instanceof Error
+      ? `${platform} 公开采集未找到可入库的真实视频：${e.message}`
+      : `${platform} 公开采集未找到可入库的真实视频`;
+    console.warn(`[videos] ${platform} crawl degraded:`, e);
+    items = [];
+  }
+
+  let imported = 0;
+  const refreshed = 0;
+  let skipped = 0;
+  let skippedExisting = 0;
+  const records: unknown[] = [];
+  const existingRecords: unknown[] = [];
+  const seenKeys = new Set<string>();
+  const orderedItems = sortByHeat(items.map(normalizeCrawledVideo))
+    .filter(item => item.platform === platform && isPlatformUrl(item.sourceUrl, platform))
+    .filter(item => {
+    const key = videoDedupeKey(item);
+    if (seenKeys.has(key)) {
+      skipped += 1;
+      return false;
+    }
+    seenKeys.add(key);
+    return true;
+  });
+  if (platform === 'youtube' && items.length > 0 && orderedItems.length === 0) {
+    console.warn('[videos] YouTube candidates rejected before import', {
+      candidates: items.length,
+      sampleSourceUrl: items[0]?.sourceUrl || '',
+      samplePlatform: items[0]?.platform || '',
+    });
+  }
+
+  for (const item of orderedItems) {
+    const existingByUrl = await store.list(COL, {
+      where: { tenantId, sourceUrl: item.sourceUrl },
+      page: 1,
+      perPage: 1,
+    });
+    const existingRecord = existingByUrl?.items[0];
+    if (existingRecord) {
+      skipped += 1;
+      skippedExisting += 1;
+      const existingAnalysis = parseJsonRecord<Record<string, unknown>>(existingRecord.aiAnalysis, {});
+      const refreshedRecord = {
+        ...existingRecord,
+        platform: item.platform,
+        title: item.title,
+        thumbnailUrl: item.thumbnailUrl,
+        duration: item.duration,
+        sourceUrl: item.sourceUrl,
+        tags: JSON.stringify(item.tags.length > 0 ? item.tags : parseJsonRecord<string[]>(existingRecord.tags, [])),
+        aiAnalysis: JSON.stringify({
+          ...existingAnalysis,
+          views: item.views || existingAnalysis.views,
+          uploadedAt: item.uploadedAt || existingAnalysis.uploadedAt,
+          dateEvidence: item.dateEvidence || existingAnalysis.dateEvidence,
+          author: item.author || existingAnalysis.author || (accountMode ? accountName : undefined),
+          keyword,
+          crawlRule,
+          sourceAccount: accountMode ? accountUrl : existingAnalysis.sourceAccount,
+          sourceAccountName: accountMode ? accountName : existingAnalysis.sourceAccountName,
+          dateFrom,
+          dateTo,
+          discoveryOrigins: discoveryOrigins(existingAnalysis.discoveryOrigins, input.discoveryContext),
+        }),
+      };
+      // 已有本地落盘缩略图时不要用新的临时签名链接覆盖
+      const keepLocalThumb = String(existingRecord.thumbnailUrl || '').startsWith('/media/') && isSignedExpiringThumbnail(item.thumbnailUrl);
+      await store.update(COL, String(existingRecord.id), {
+        contentFormat: 'video',
+        thumbnailUrl: keepLocalThumb ? String(existingRecord.thumbnailUrl) : (item.thumbnailUrl || String(existingRecord.thumbnailUrl || '')),
+        sourceUrl: item.sourceUrl || String(existingRecord.sourceUrl || ''),
+        aiAnalysis: refreshedRecord.aiAnalysis,
+      });
+      if (!keepLocalThumb) {
+        void persistThumbnailIfExpiring(String(existingRecord.id), item.thumbnailUrl).catch(() => {});
+      }
+      existingRecords.push(refreshedRecord);
+      continue;
+    }
+
+    const record = await store.create(COL, {
+      tenantId,
+      contentFormat: 'video',
+      platform: item.platform,
+      title: item.title,
+      thumbnailUrl: item.thumbnailUrl,
+      videoFileId: '',
+      duration: item.duration,
+      sourceUrl: item.sourceUrl,
+      tags: JSON.stringify(item.tags),
+      aiAnalysis: JSON.stringify({
+        source: crawlerSource,
+        views: item.views,
+        uploadedAt: item.uploadedAt,
+        dateEvidence: item.dateEvidence,
+        author: item.author || (accountMode ? accountName : undefined),
+        gemini: metadataFallbackAnalysis(item),
+        analysisSource: 'metadata-fallback',
+        analysisQuality: 'metadata',
+        keyword,
+        crawlRule,
+        sourceAccount: accountMode ? accountUrl : undefined,
+        sourceAccountName: accountMode ? accountName : undefined,
+        dateFrom,
+        dateTo,
+        importedAt: new Date().toISOString(),
+        userVisible: testTenant ? false : undefined,
+        discoveryOrigins: discoveryOrigins(undefined, input.discoveryContext),
+      }),
+      status: 'analyzed' as VideoStatus,
+      crawledAt: new Date().toISOString(),
+    });
+    if (record) {
+      imported += 1;
+      records.push(record);
+      void persistThumbnailIfExpiring(String((record as Record<string, unknown>).id), item.thumbnailUrl).catch(() => {});
+    }
+    if (imported >= target) break;
+  }
+
+  let resultRecords = [...records, ...existingRecords].slice(0, target);
+  const returnedNew = Math.min(records.length, resultRecords.length);
+  let returnedExisting = Math.max(0, resultRecords.length - returnedNew);
+  let visibleNewCount = 0;
+  const candidateIds = resultRecords.map(record => String((record as Record<string, unknown>).id));
+  if (testTenant && input.deferAnalysis) {
+    for (const record of resultRecords) {
+      await queueTestTenantVideoLevelAnalysis(record as Record<string, unknown>);
+    }
+    // Do not expose metadata-only records as analysis-ready results.
+    resultRecords = [];
+    returnedExisting = 0;
+  } else if (testTenant) {
+    // A repeated keyword commonly finds URLs that were inserted by an earlier
+    // run but whose video-level analysis did not finish.  They are still real
+    // crawl candidates and must be resumed instead of being silently skipped.
+    // analyzeFreshCrawledRecordsForTestTenant only returns records that pass the
+    // strict video-level evidence gate, so failed/metadata-only rows stay hidden.
+    resultRecords = await analyzeFreshCrawledRecordsForTestTenant(
+      [...records, ...existingRecords].slice(0, target),
+      target,
+    );
+    visibleNewCount = resultRecords.length;
+    returnedExisting = 0;
+    if (visibleNewCount < target && !input.disableBackfill) {
+      scheduleTestTenantVideoBackfill({
+        tenantId,
+        platform,
+        keyword,
+        target: target - visibleNewCount,
+        reason: 'crawl_result_visible_backfill',
+        dateFrom,
+        dateTo,
+        forceCreate: true,
+      });
+    }
+  } else if (resultRecords.length > 0) {
+    await enqueueCrawledRecordsForAnalysis(resultRecords);
+  }
+
+  const message = input.deferAnalysis && candidateIds.length > 0
+    ? `已采集 ${candidateIds.length} 条真实候选（新增 ${imported} 条）；视频分析在后台继续，分析通过后才可作为参考。`
+    : testTenant
+    ? (crawlerMessage || (resultRecords.length === 0
+      ? `采集完成：本次新增 ${imported} 条候选，跳过已入库 ${skippedExisting} 条；暂无新增视频级可用结果，后台继续按同关键词补位，失败/不可分析结果已隐藏并进入人工处理。`
+      : resultRecords.length < target
+        ? `采集完成：本次返回 ${resultRecords.length} 条新增视频级结果（新增候选 ${imported} 条，跳过已入库 ${skippedExisting} 条），未达到用户输入数量 ${target}；后台继续按同关键词补位。`
+        : `采集完成：本次返回 ${resultRecords.length} 条新增视频级结果（新增候选 ${imported} 条，跳过已入库 ${skippedExisting} 条）${crawlerTopUpMessage}`))
+    : crawlerMessage
+      || (resultRecords.length === 0
+        ? `有效去重后没有新增视频，返回库内已有匹配 ${returnedExisting} 条；请换关键词、放宽日期范围或降低数量。`
+        : resultRecords.length < target
+          ? `采集完成：返回 ${resultRecords.length} 条（新增 ${imported} 条，库内已有 ${returnedExisting} 条），未达到用户输入数量 ${target}；可换关键词或放宽日期范围。`
+          : `采集完成：返回 ${resultRecords.length} 条（新增 ${imported} 条，库内已有 ${returnedExisting} 条）${crawlerTopUpMessage}${visibleNewCount > 0 ? `；已返回 ${visibleNewCount} 条视频级可用结果` : ''}`);
+
+  return {
+    outcome: candidateIds.length > 0 ? 'collected' : 'no_data',
+    candidateIds,
+    analysisPending: candidateIds.length > 0 && (input.deferAnalysis === true || (testTenant && resultRecords.length < candidateIds.length)),
+    platform,
+    keyword,
+    imported,
+    refreshed,
+    skipped,
+    skippedExisting,
+    returnedExisting,
+    requested: target,
+    total: items.length,
+    source: crawlerSource,
+    message,
+    items: resultRecords,
+  };
+}
+
+async function analyzeFreshCrawledRecordsForTestTenant(records: unknown[], target: number): Promise<Record<string, unknown>[]> {
+  const out: Record<string, unknown>[] = [];
+  const seenSourceUrls = new Set<string>();
+  const configuredSyncAttempts = process.env.VIDEO_CRAWL_SYNC_URL_ANALYSIS_ATTEMPTS;
+  const syncYouTubeAttempts = Math.max(0, Math.min(
+    10,
+    configuredSyncAttempts === undefined ? Math.min(target, 3) : Number(configuredSyncAttempts),
+  ));
+  let attemptedYouTube = 0;
+
+  // Publish the whole real candidate batch as "analysis queued" before doing
+  // synchronous work.  Otherwise candidate 2/3 stay as metadata-only rows
+  // while candidate 1 downloads, so the user sees only one result even though
+  // all three were retrieved and are scheduled for automatic analysis.
+  for (const raw of records.slice(0, target)) {
+    const record = raw as Record<string, unknown>;
+    const id = String(record.id || '');
+    const sourceUrl = String(record.sourceUrl || '').trim();
+    const platform = (record.platform || inferPlatformFromUrl(sourceUrl)) as Platform;
+    if (!id || !isPlatformUrl(sourceUrl, platform) || !hasRealThumbnail({ thumbnailUrl: String(record.thumbnailUrl || '') } as CrawledVideo)) continue;
+    const latest = await store.getById<Record<string, unknown>>(COL, id);
+    if (!latest || isPublicTestTenantVideo(latest) || !shouldQueueVideoAnalysis(latest)) continue;
+    const analysis = videoAnalysisOf(latest);
+    await store.update(COL, id, {
+      status: 'pending' as VideoStatus,
+      aiAnalysis: JSON.stringify({
+        ...analysis,
+        userVisible: false,
+        downloadStatus: 'queued',
+        videoFetchStatus: 'queued',
+        geminiStatus: 'waiting_for_video',
+        crawlerOpsStatus: 'queued',
+        analysisQueuedAt: new Date().toISOString(),
+      }),
+    });
+  }
+
+  for (const raw of records) {
+    const record = raw as Record<string, unknown>;
+    const id = String(record.id || '');
+    const sourceUrl = String(record.sourceUrl || '').trim();
+    if (!id || !sourceUrl) continue;
+
+    const platform = (record.platform || inferPlatformFromUrl(sourceUrl)) as Platform;
+    if (platform === 'youtube' && attemptedYouTube < syncYouTubeAttempts) {
+      attemptedYouTube += 1;
+      try {
+        await analyzeSourceVideoJob({
+          record,
+          sourceUrl,
+          title: String(record.title || 'youtube-video'),
+          platform,
+          suppressVisibleBackfill: true,
+        });
+      } catch (e) {
+        console.warn('[videos] test tenant crawl URL analysis failed:', e instanceof Error ? e.message : e);
+      }
+    } else {
+      await queueTestTenantVideoLevelAnalysis(record);
+    }
+
+    const latest = await store.getById<Record<string, unknown>>(COL, id);
+    if (!latest || !isPublicTestTenantVideo(latest)) continue;
+    const latestSourceUrl = String(latest.sourceUrl || '').trim();
+    if (latestSourceUrl && seenSourceUrls.has(latestSourceUrl)) continue;
+    if (latestSourceUrl) seenSourceUrls.add(latestSourceUrl);
+    out.push(publicVideoRecord(latest));
+    if (out.length >= target) break;
+  }
+
+  return out;
+}
+
+async function queueTestTenantVideoLevelAnalysis(record: Record<string, unknown>): Promise<void> {
+  const id = String(record.id || '');
+  if (!id) return;
+  const latest = await store.getById<Record<string, unknown>>(COL, id);
+  if (!latest || isPublicTestTenantVideo(latest) || !shouldQueueVideoAnalysis(latest)) return;
+
+  const sourceUrl = String(latest.sourceUrl || '').trim();
+  if (!sourceUrl) return;
+  const platform = (latest.platform || inferPlatformFromUrl(sourceUrl)) as Platform;
+  const analysis = parseJsonRecord<Record<string, unknown>>(latest.aiAnalysis, {});
+  await store.update(COL, id, {
+    status: 'pending' as VideoStatus,
+    aiAnalysis: JSON.stringify({
+      ...analysis,
+      userVisible: false,
+      downloadStatus: 'queued',
+      videoFetchStatus: 'queued',
+      geminiStatus: 'waiting_for_video',
+      analysisQueuedAt: new Date().toISOString(),
+    }),
+  });
+
+  void analyzeSourceVideoJob({
+    record: latest,
+    sourceUrl,
+    title: String(latest.title || `${platform}-video`),
+    platform,
+    suppressVisibleBackfill: true,
+  }).catch((e) => {
+    console.warn('[videos] test tenant async video-level analysis failed:', e instanceof Error ? e.message : e);
+  });
+}
+
+// ─── POST /videos/download-material ─────────────────────────────────────────
+// Body: { id?, sourceUrl?, title?, platform?, async? } → download remote video and add it to Studio materials.
+videosRouter.post('/download-material', async (req, res) => {
+  const { id, sourceUrl, title, platform, async } = req.body as {
+    id?: string;
+    sourceUrl?: string;
+    title?: string;
+    platform?: Platform;
+    async?: boolean;
+  };
+  await handleDownloadMaterial(req, res, { id, sourceUrl, title, platform, async });
+});
+
+videosRouter.post('/:id/download-material', async (req, res) => {
+  const { sourceUrl, title, platform, async } = req.body as { sourceUrl?: string; title?: string; platform?: Platform; async?: boolean };
+  await handleDownloadMaterial(req, res, { id: req.params.id, sourceUrl, title, platform, async });
+});
+
+// ─── POST /videos/analyze-source ─────────────────────────────────────────────
+// Body: { id?, sourceUrl?, title?, platform?, async? } → fetch a temporary low-res video, analyze with Gemini, then delete it.
+videosRouter.post('/analyze-source', async (req, res) => {
+  const { id, sourceUrl, title, platform, async } = req.body as {
+    id?: string;
+    sourceUrl?: string;
+    title?: string;
+    platform?: Platform;
+    async?: boolean;
+  };
+  const scoped = (res.locals as AuthLocals).starter198SocialContext;
+  await handleAnalyzeSource(req, res, scoped ? { id, async } : { id, sourceUrl, title, platform, async });
+});
+
+videosRouter.post('/:id/analyze-source', async (req, res) => {
+  const { sourceUrl, title, platform, async } = req.body as { sourceUrl?: string; title?: string; platform?: Platform; async?: boolean };
+  await handleAnalyzeSource(req, res, { id: req.params.id, sourceUrl, title, platform, async });
+});
+
+// ─── Internal crawler ops queue ──────────────────────────────────────────────
+videosRouter.get('/ops/queue', async (_req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const visibleRecordIds = await crawlerOpsRecordIdsForTenant(tenantId);
+  res.json({ items: filterCrawlerOpsTasksForRecordIds(loadCrawlerOpsTasks(), visibleRecordIds).filter(task => task.status === 'queued' || task.status === 'pushed' || task.status === 'processing') });
+});
+
+videosRouter.get('/ops/stats', async (_req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const visibleRecordIds = await crawlerOpsRecordIdsForTenant(tenantId);
+  res.json(crawlerOpsStats(tenantId, visibleRecordIds));
+});
+
+videosRouter.post('/ops/run-once', async (_req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const result = await runCrawlerOpsWorkerOnce({ tenantId });
+  res.json(result);
+});
+
+videosRouter.post('/ops/:taskId/resolve', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const { taskId } = req.params;
+  const { videoBase64, mimeType = 'video/mp4', error } = req.body as {
+    videoBase64?: string;
+    mimeType?: string;
+    error?: string;
+  };
+  const tasks = loadCrawlerOpsTasks();
+  const task = tasks.find(item => item.id === taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Crawler ops task not found' });
+    return;
+  }
+  const record = await store.getById<Record<string, unknown>>(COL, task.recordId);
+  if (!record || String(record.tenantId || '') !== tenantId || (task.tenantId && task.tenantId !== tenantId)) {
+    // Deliberately use 404 so task IDs cannot be used to probe another tenant.
+    res.status(404).json({ error: 'Crawler ops task not found' });
+    return;
+  }
+  if (error) {
+    persistCrawlerOpsTasks(tasks.map(item => item.id === taskId ? { ...item, status: 'failed', reason: error, updatedAt: new Date().toISOString() } : item));
+    res.json({ ok: true, status: 'failed' });
+    return;
+  }
+  if (!videoBase64) {
+    res.status(400).json({ error: 'videoBase64 is required to resolve this task' });
+    return;
+  }
+  try {
+    await analyzeOpsVideo(task, videoBase64, mimeType);
+    persistCrawlerOpsTasks(tasks.map(item => item.id === taskId ? { ...item, status: 'resolved', updatedAt: new Date().toISOString() } : item));
+    res.json({ ok: true, status: 'resolved' });
+  } catch (e) {
+    res.status(502).json({ error: e instanceof Error ? e.message : 'Crawler ops resolve failed' });
+  }
+});
+
+// ─── POST /videos/ingest ──────────────────────────────────────────────────────
+/** A user supplied benchmark is reference evidence only. The request body is
+ * streamed MP4 bytes, avoiding the smaller JSON and legacy base64 limits. */
+videosRouter.post('/import-reference-file', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  if (!/^video\/mp4(?:\s*;|$)/i.test(String(req.headers['content-type'] || ''))) {
+    res.status(415).json({ error: 'Only video/mp4 is supported' }); return;
+  }
+  const declaredSize = Number(req.headers['content-length'] || 0);
+  if (declaredSize > REFERENCE_UPLOAD_MAX_BYTES) {
+    res.status(413).json({ error: 'Video exceeds 32 MiB limit' }); return;
+  }
+  fs.mkdirSync(ANALYSIS_DIR, { recursive: true });
+  const incomingPath = path.join(ANALYSIS_DIR, `reference-import-${randomUUID()}.mp4`);
+  const hash = createHash('sha256');
+  let size = 0;
+  try {
+    const fd = fs.openSync(incomingPath, 'wx');
+    try {
+      for await (const chunk of req) {
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        size += bytes.length;
+        if (size > REFERENCE_UPLOAD_MAX_BYTES) throw new Error('reference_upload_too_large');
+        hash.update(bytes);
+        fs.writeSync(fd, bytes);
+      }
+    } finally { fs.closeSync(fd); }
+    if (size < 1024) throw new Error('reference_upload_empty');
+    const header = Buffer.alloc(12);
+    const headerFd = fs.openSync(incomingPath, 'r');
+    try { fs.readSync(headerFd, header, 0, header.length, 0); } finally { fs.closeSync(headerFd); }
+    if (header.toString('ascii', 4, 8) !== 'ftyp') throw new Error('reference_upload_invalid_mp4');
+    const duration = await referenceVideoDuration(incomingPath);
+    const sha256 = hash.digest('hex');
+    const result = await referenceImportRegistry.run(`${tenantId}:${sha256}`, async () => {
+      const existing = await findTenantReferenceByHash(tenantId, sha256);
+      if (existing) {
+        const recovered = await recoverExistingReferenceImport({
+          record: existing,
+          tenantId,
+          incomingPath,
+          duration,
+          size,
+        });
+        return { ...recovered, deduplicated: true };
+      }
+      const title = String(req.query.title || '本地参考视频').trim().slice(0, 160) || '本地参考视频';
+      const platform = req.query.platform === 'instagram' || req.query.platform === 'facebook' || req.query.platform === 'youtube'
+        ? req.query.platform : 'tiktok';
+      const sourceUrl = String(req.query.sourceUrl || '').trim().slice(0, 1000);
+      const now = new Date().toISOString();
+      const initialAnalysis = {
+        usage: 'reference_only', mayAnalyze: true, mayUseInProduction: false,
+        contentSha256: sha256, originalBytes: size, requestedAnalysisMode: 'exact',
+        analysisMode: 'exact', analysisRunId: randomUUID(), analysisRunMode: 'exact',
+        geminiStatus: 'queued', downloadStatus: 'uploaded', videoFetchStatus: 'manual_upload',
+        analysisQuality: 'pending', userVisible: true, importedAt: now,
+      };
+      const record = await store.create(COL, {
+        tenantId, contentFormat: 'video', platform, title, sourceUrl,
+        thumbnailUrl: '', videoFileId: '', duration, views: '', tags: '[]',
+        status: 'pending' as VideoStatus, crawledAt: now,
+        aiAnalysis: JSON.stringify(initialAnalysis),
+      });
+      if (!record) throw new Error('reference_record_create_failed');
+      const destination = path.join(tenantAssetDir(MEDIA_DIR, tenantId), 'reference-videos', `${record.id}.mp4`);
+      try {
+        fs.mkdirSync(path.dirname(destination), { recursive: true });
+        fs.copyFileSync(incomingPath, destination);
+        const videoFileId = path.posix.join('tenants', tenantId, 'reference-videos', `${record.id}.mp4`);
+        await store.update(COL, record.id, {
+          videoFileId,
+          thumbnailUrl: `/api/overseas/videos/${record.id}/thumbnail`,
+        });
+        testTenantVisibleListCache.clear();
+        const material: Material = {
+          id: record.id, name: title, folder: 'hot', type: 'video', duration,
+          size: humanSize(size), file: videoFileId,
+          url: `/api/overseas/videos/${record.id}/media`,
+          tenantId, scope: 'own', usage: 'reference_only', mayAnalyze: true,
+          mayUseInProduction: false, contentSha256: sha256, createdAt: now,
+        };
+        void analyzeDownloadedMaterial(record.id, destination, material, 'exact', initialAnalysis.analysisRunId)
+          .catch(error => console.error('[videos] reference analysis failed:', error));
+        return { id: record.id, deduplicated: false, analysisQueued: true };
+      } catch (error) {
+        await store.update(COL, record.id, { status: 'failed', aiAnalysis: JSON.stringify({ ...initialAnalysis, geminiStatus: 'analysis_retryable', analysisQuality: 'pending', analysisError: compactVideoPipelineError(error) }) });
+        throw error;
+      }
+    }) as { id: string; deduplicated: boolean; analysisQueued: boolean };
+    res.status(result.deduplicated ? 200 : 202).json({ ...result, status: result.analysisQueued ? 'pending' : 'existing', analysisUrl: `/api/overseas/videos/${result.id}`, sourceVideoRef: `/api/overseas/videos/${result.id}/media` });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'reference_upload_failed';
+    res.status(message === 'reference_upload_too_large' ? 413
+      : ['reference_upload_empty', 'reference_upload_invalid_mp4', 'reference_upload_invalid_video'].includes(message) ? 400 : 500)
+      .json({ error: message });
+  } finally {
+    try { fs.unlinkSync(incomingPath); } catch { /* already removed */ }
+  }
+});
+
+async function referenceVideoDuration(filePath: string): Promise<number> {
+  if (!ffmpegBin) throw new Error('ffmpeg_unavailable');
+  let output = '';
+  try {
+    const result = await execFileAsync(ffmpegBin, ['-hide_banner', '-i', filePath, '-frames:v', '1', '-f', 'null', '-'], { timeout: 30_000 });
+    output = result.stderr;
+  } catch (error) {
+    output = String((error as { stderr?: string }).stderr || '');
+  }
+  const match = output.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+  if (!match || !/Video:\s/.test(output)) throw new Error('reference_upload_invalid_video');
+  const duration = Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+  if (!Number.isFinite(duration) || duration <= 0) throw new Error('reference_upload_invalid_video');
+  return duration;
+}
+
+async function findTenantReferenceByHash(tenantId: string, sha256: string): Promise<Record<string, unknown> | null> {
+  let page = 1;
+  let totalPages = 1;
+  do {
+    const result = await store.list<Record<string, unknown>>(COL, { where: { tenantId }, page, perPage: 200 });
+    const found = result.items.find(record => {
+      const analysis = videoAnalysisOf(record);
+      return analysis.contentSha256 === sha256 && analysis.usage === 'reference_only' && Boolean(record.videoFileId);
+    });
+    if (found) return found;
+    totalPages = result.totalPages;
+    page += 1;
+  } while (page <= totalPages);
+  return null;
+}
+
+export function shouldResumeReferenceAnalysis(analysis: Record<string, unknown>, duration = 0): boolean {
+  if (hasCompletedExactVideoEvidence(analysis)) {
+    if (duration <= 0) return false;
+    const gemini = parseJsonRecord<VideoAiAnalysis>(analysis.gemini, {} as VideoAiAnalysis);
+    return Boolean(analysisTimelineQualityError(gemini, duration, 'exact'));
+  }
+  const status = String(analysis.geminiStatus || '');
+  const activelyRunning = analysis.requestedAnalysisMode === 'exact'
+    && ['queued', 'waiting_for_video', 'analyzing'].includes(status)
+    && !analysis.analysisError;
+  return !activelyRunning;
+}
+
+async function recoverExistingReferenceImport(input: {
+  record: Record<string, unknown>;
+  tenantId: string;
+  incomingPath: string;
+  duration: number;
+  size: number;
+}): Promise<{ id: string; analysisQueued: boolean }> {
+  const recordId = String(input.record.id || '');
+  if (!recordId) throw new Error('reference_record_invalid');
+  const now = new Date().toISOString();
+  const previous = videoAnalysisOf(input.record);
+  const canonicalFileId = path.posix.join('tenants', input.tenantId, 'reference-videos', `${recordId}.mp4`);
+  const canonicalPath = path.join(tenantAssetDir(MEDIA_DIR, input.tenantId), 'reference-videos', `${recordId}.mp4`);
+  const savedPath = localReferenceVideoPath(String(input.record.videoFileId || ''), input.tenantId);
+  if (!fs.existsSync(canonicalPath)) {
+    fs.mkdirSync(path.dirname(canonicalPath), { recursive: true });
+    fs.copyFileSync(savedPath && fs.existsSync(savedPath) ? savedPath : input.incomingPath, canonicalPath);
+  }
+
+  const commonAnalysis = {
+    ...previous,
+    usage: 'reference_only',
+    mayAnalyze: true,
+    mayUseInProduction: false,
+    userVisible: true,
+    downloadStatus: previous.downloadStatus || 'uploaded',
+    videoFetchStatus: previous.videoFetchStatus || 'manual_upload',
+  };
+  const shouldResume = shouldResumeReferenceAnalysis(commonAnalysis, Number(input.record.duration || input.duration));
+  const analysisRunId = shouldResume ? randomUUID() : String(previous.analysisRunId || randomUUID());
+  const nextAnalysis = shouldResume ? {
+    ...commonAnalysis,
+    requestedAnalysisMode: 'exact',
+    analysisMode: 'exact',
+    analysisRunId,
+    analysisRunMode: 'exact',
+    geminiStatus: 'queued',
+    downloadStatus: 'uploaded',
+    videoFetchStatus: 'manual_upload',
+    analysisQuality: 'pending',
+    analysisError: undefined,
+    downloadError: undefined,
+    videoLevelFailureStatus: undefined,
+    analysisRetryable: undefined,
+    analysisFailureKind: undefined,
+    analysisQueuedAt: now,
+    reanalyzeQueuedAt: now,
+  } : commonAnalysis;
+  await store.update(COL, recordId, {
+    tenantId: input.tenantId,
+    contentFormat: 'video',
+    videoFileId: canonicalFileId,
+    thumbnailUrl: `/api/overseas/videos/${recordId}/thumbnail`,
+    duration: Number(input.record.duration || input.duration),
+    status: shouldResume ? 'pending' as VideoStatus : input.record.status,
+    aiAnalysis: JSON.stringify(nextAnalysis),
+  });
+  testTenantVisibleListCache.clear();
+
+  if (shouldResume) {
+    const material: Material = {
+      id: recordId,
+      name: String(input.record.title || '本地参考视频'),
+      folder: 'hot',
+      type: 'video',
+      duration: Number(input.record.duration || input.duration),
+      size: humanSize(input.size),
+      file: canonicalFileId,
+      url: `/api/overseas/videos/${recordId}/media`,
+      tenantId: input.tenantId,
+      scope: 'own',
+      usage: 'reference_only',
+      mayAnalyze: true,
+      mayUseInProduction: false,
+      contentSha256: String(previous.contentSha256 || ''),
+      createdAt: String(input.record.created || now),
+    };
+    void analyzeDownloadedMaterial(recordId, canonicalPath, material, 'exact', analysisRunId)
+      .catch(error => console.error('[videos] recovered reference analysis failed:', error));
+  }
+  return { id: recordId, analysisQueued: shouldResume };
+}
+
+// ─── POST /videos/ingest ──────────────────────────────────────────────────────
+// Body: { platform, title?, tags?, sourceUrl?, videoBase64?, mimeType? }
+videosRouter.post('/ingest', async (req, res) => {
+  const { userId, tenantId } = res.locals as AuthLocals;
+  const { platform, title, tags, sourceUrl, videoBase64, mimeType } = req.body as {
+    platform?: Platform;
+    title?: string;
+    tags?: string[];
+    sourceUrl?: string;
+    videoBase64?: string;
+    mimeType?: string;
+  };
+
+  if (!platform) {
+    res.status(400).json({ error: 'platform is required' });
+    return;
+  }
+
+  // Create the record first; the video blob (if any) attaches to it.
+  const record = await store.create(COL, {
+    tenantId,
+    contentFormat: 'video',
+    platform: platform ?? 'tiktok',
+    title: title ?? '',
+    thumbnailUrl: '',
+    videoFileId: '',
+    duration: 0,
+    sourceUrl: sourceUrl ?? '',
+    tags: JSON.stringify(tags ?? []),
+    aiAnalysis: JSON.stringify({}),
+    status: 'pending' as VideoStatus,
+    crawledAt: new Date().toISOString(),
+  });
+
+  if (!record) {
+    res.status(500).json({ error: 'Failed to create video record' });
+    return;
+  }
+
+  // Attach the video to the PB record's file field (PB disk storage, no S3).
+  let filename = '';
+  if (videoBase64) {
+    const buf = Buffer.from(videoBase64.replace(/^data:[^,]+,/, ''), 'base64');
+    const ext = (mimeType ?? 'video/mp4').split('/')[1] ?? 'mp4';
+    const previewBuf = await compressVideoBufferForPocketBase(buf, ext);
+    filename = await uploadCrawlerCosObject(record.id, 'video', previewBuf, 'video/mp4');
+    if (!filename) {
+      await store.update(COL, record.id, { status: 'failed' });
+      res.status(500).json({ error: 'Video upload failed' });
+      return;
+    }
+    await store.update(COL, record.id, { videoFileId: filename, aiAnalysis: JSON.stringify({ videoStorage: 'cos', videoObjectKey: filename }) });
+  }
+
+  // Trigger analysis async (fire and forget)
+  void triggerVideoAnalysis(record.id, filename || undefined, filename ? 'video/mp4' : mimeType, userId);
+
+  res.status(201).json({ id: record.id, status: 'pending' });
+});
+
+function videoListWhere(tenantId: string, platform?: string, status?: string): Record<string, string> {
+  const where: Record<string, string> = { tenantId };
+  if (platform) where.platform = platform;
+  if (status) where.status = status;
+  return where;
+}
+
+const testTenantVisibleListCache = new Map<string, {
+  expiresAt: number;
+  items: Record<string, unknown>[];
+}>();
+
+async function listPublicVideosForTenant(input: {
+  tenantId: string;
+  page: number;
+  perPage: number;
+  platform?: string;
+  status?: string;
+  contentFormat?: ContentFormat;
+  search?: string;
+  crawlRange?: string;
+}): Promise<{
+  items: Record<string, unknown>[];
+  totalItems: number;
+  totalPages: number;
+  page: number;
+  perPage: number;
+}> {
+  const where = videoListWhere(input.tenantId, input.platform, input.status);
+  const contentFormat = input.contentFormat || 'video';
+  const testTenant = await isTestTenantId(input.tenantId);
+  if (contentFormat === 'image') {
+    if (input.search?.trim() || (input.crawlRange && input.crawlRange !== 'all')) {
+      const scanned = await scanRecordsByContentFormat(where, 'image');
+      const matched = scanned
+        .filter(isPublicImageRecord)
+        .filter(record => matchesCrawlRange(record, input.crawlRange))
+        .filter(record => !input.search?.trim() || matchesVideoSearch(record, input.search));
+      const start = (input.page - 1) * input.perPage;
+      return { items: matched.slice(start, start + input.perPage).map(publicVideoRecord), totalItems: matched.length, totalPages: Math.max(1, Math.ceil(matched.length / input.perPage)), page: input.page, perPage: input.perPage };
+    }
+    const result = await store.list<Record<string, unknown>>(COL, {
+      where: { ...where, contentFormat: 'image' },
+      sort: '-crawledAt',
+      page: input.page,
+      perPage: input.perPage,
+    });
+    const seenSourceUrls = new Set<string>();
+    const items = result.items
+      .filter(record => !isAutoSeededVideo(record) && isPublicImageRecord(record))
+      .filter(record => {
+        const sourceUrl = String(record.sourceUrl || '').trim();
+        if (sourceUrl && seenSourceUrls.has(sourceUrl)) return false;
+        if (sourceUrl) seenSourceUrls.add(sourceUrl);
+        return true;
+      })
+      .map(publicVideoRecord);
+    return { ...result, items };
+  }
+  if (!testTenant) {
+    // 存储层的 where 只支持等值匹配，做不了标题子串检索；有搜索词时全量扫描后再分页。
+    if (input.search?.trim() || (input.crawlRange && input.crawlRange !== 'all')) {
+      const scanned = await scanRecordsByContentFormat({ ...where, contentFormat: 'video' }, 'video');
+      const matched = scanned
+        .filter(record => matchesCrawlRange(record, input.crawlRange))
+        .filter(record => !input.search?.trim() || matchesVideoSearch(record, input.search));
+      const start = (input.page - 1) * input.perPage;
+      return {
+        items: matched.slice(start, start + input.perPage).map(publicVideoRecord),
+        totalItems: matched.length,
+        totalPages: Math.max(1, Math.ceil(matched.length / input.perPage)),
+        page: input.page,
+        perPage: input.perPage,
+      };
+    }
+    const result = await store.list<Record<string, unknown>>(COL, {
+      where: { ...where, contentFormat: 'video' },
+      sort: '-crawledAt',
+      page: input.page,
+      perPage: input.perPage,
+    });
+    const items = result.items.filter(record => !isAutoSeededVideo(record));
+    return { ...result, items: items.map(publicVideoRecord) };
+  }
+
+  const visible: Record<string, unknown>[] = [];
+  const seenSourceUrls = new Set<string>();
+  const cacheKey = JSON.stringify([input.tenantId, input.platform || '', input.status || '', 'video']);
+  const scanTenantVideos = async () => {
+    visible.length = 0;
+    seenSourceUrls.clear();
+    const cached = testTenantVisibleListCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      visible.push(...cached.items);
+      return;
+    }
+    let scanPage = 1;
+    let totalPages = 1;
+    do {
+      const result = await store.list<Record<string, unknown>>(COL, {
+        where: { ...where, contentFormat: 'video' },
+        sort: '-crawledAt',
+        page: scanPage,
+        perPage: 100,
+      });
+      for (const record of result.items) {
+        if (isAutoSeededVideo(record)) continue;
+        if (!isDisplayableTestTenantVideo(record)) continue;
+        const sourceUrl = String(record.sourceUrl || '').trim();
+        if (sourceUrl && seenSourceUrls.has(sourceUrl)) continue;
+        if (sourceUrl) seenSourceUrls.add(sourceUrl);
+        visible.push(publicVideoRecord(record));
+      }
+      totalPages = result.totalPages || 1;
+      scanPage += 1;
+    } while (scanPage <= totalPages && scanPage <= 50);
+    testTenantVisibleListCache.set(cacheKey, {
+      expiresAt: Date.now() + 12_000,
+      items: [...visible],
+    });
+  };
+
+  await scanTenantVideos();
+  // PocketBase and the local fallback do not always return identical ordering.
+  // Sort after the full scan so today's crawl results consistently land first.
+  visible.sort(compareCrawledAtDesc);
+  const ranged = visible.filter(record => matchesCrawlRange(record, input.crawlRange));
+  const searched = input.search?.trim() ? ranged.filter(record => matchesVideoSearch(record, input.search!)) : ranged;
+  const totalItems = searched.length;
+  const totalVisiblePages = Math.max(1, Math.ceil(totalItems / input.perPage));
+  const start = (input.page - 1) * input.perPage;
+  return {
+    items: searched.slice(start, start + input.perPage),
+    totalItems,
+    totalPages: totalVisiblePages,
+    page: input.page,
+    perPage: input.perPage,
+  };
+}
+
+/**
+ * 列表搜索的统一匹配规则（标题 + 标签，大小写不敏感）。
+ *
+ * 搜索此前只在前端对已加载的那一页做过滤，用户以为是全局搜索，实际翻页之外的记录
+ * 一律搜不到。改为服务端匹配后，两个列表接口共用同一套规则。
+ */
+export function matchesVideoSearch(record: Record<string, unknown>, query: string): boolean {
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  if (String(record.title || '').toLowerCase().includes(q)) return true;
+  const rawTags = record.tags;
+  const tags = Array.isArray(rawTags) ? rawTags : String(rawTags || '').split(/[,，\s]+/);
+  return tags.some(tag => String(tag).toLowerCase().includes(q));
+}
+
+export function matchesCrawlRange(record: Record<string, unknown>, range?: string): boolean {
+  if (!range || range === 'all') return true;
+  const crawledAt = Date.parse(String(record.crawledAt || ''));
+  if (!Number.isFinite(crawledAt)) return false;
+  if (range === 'today') {
+    const beijingNow = new Date(Date.now() + 8 * 60 * 60 * 1000);
+    const startUtc = Date.UTC(beijingNow.getUTCFullYear(), beijingNow.getUTCMonth(), beijingNow.getUTCDate()) - 8 * 60 * 60 * 1000;
+    return crawledAt >= startUtc;
+  }
+  const days = range === '7d' ? 7 : range === '30d' ? 30 : 0;
+  return days > 0 ? crawledAt >= Date.now() - days * 24 * 60 * 60 * 1000 : true;
+}
+
+async function scanRecordsByContentFormat(where: Record<string, string> | undefined, contentFormat: ContentFormat): Promise<Record<string, unknown>[]> {
+  const out: Record<string, unknown>[] = [];
+  const seenSourceUrls = new Set<string>();
+  let page = 1;
+  let totalPages = 1;
+  do {
+    const result = await store.list<Record<string, unknown>>(COL, {
+      where,
+      sort: '-crawledAt',
+      page,
+      perPage: 100,
+    });
+    for (const record of result.items) {
+      if (isAutoSeededVideo(record)) continue;
+      if (recordContentFormat(record) !== contentFormat) continue;
+      if (contentFormat === 'image' && !isValidImagePostRecord(record)) continue;
+      const sourceUrl = String(record.sourceUrl || '').trim();
+      if (sourceUrl && seenSourceUrls.has(sourceUrl)) continue;
+      if (sourceUrl) seenSourceUrls.add(sourceUrl);
+      out.push(record);
+    }
+    totalPages = result.totalPages || 1;
+    page += 1;
+  } while (page <= totalPages && page <= 50);
+  return out;
+}
+
+function publicMetricNumber(value: unknown): number {
+  const text = String(value ?? '').trim().toLowerCase().replace(/,/g, '');
+  const match = text.match(/([\d.]+)\s*([kmb万亿]?)/);
+  if (!match) return 0;
+  const scale = match[2] === 'k' ? 1_000 : match[2] === 'm' ? 1_000_000 : match[2] === 'b' ? 1_000_000_000 : match[2] === '万' ? 10_000 : match[2] === '亿' ? 100_000_000 : 1;
+  return Number(match[1] || 0) * scale;
+}
+
+function withImagePublicBaselines(items: Record<string, unknown>[], baselineUniverse: Record<string, unknown>[] = items): Record<string, unknown>[] {
+  const toRow = (record: Record<string, unknown>) => {
+    const analysis = videoAnalysisOf(record);
+    const metrics = (analysis.publicMetrics && typeof analysis.publicMetrics === 'object' ? analysis.publicMetrics : {}) as Record<string, unknown>;
+    const engagement = publicMetricNumber(metrics.likes) + publicMetricNumber(metrics.comments) + publicMetricNumber(metrics.shares);
+    return { record, analysis, author: String(analysis.author || '').trim().toLowerCase(), engagement };
+  };
+  const rows = items.map(toRow);
+  const universeRows = baselineUniverse.map(toRow);
+  const groups = new Map<string, number[]>();
+  for (const row of universeRows) {
+    if (!row.author || row.engagement <= 0) continue;
+    const recent = groups.get(row.author) || [];
+    if (recent.length < 20) groups.set(row.author, [...recent, row.engagement]);
+  }
+  return rows.map(row => {
+    const values = (groups.get(row.author) || []).sort((a, b) => a - b);
+    const middle = values.length ? values[Math.floor(values.length / 2)]! : 0;
+    const relative = middle > 0 ? Number((row.engagement / middle).toFixed(2)) : null;
+    return publicVideoRecord({
+      ...row.record,
+      aiAnalysis: JSON.stringify({
+        ...row.analysis,
+        publicBaseline: {
+          sampleSize: values.length,
+          medianWeightedEngagement: middle || null,
+          currentWeightedEngagement: row.engagement || null,
+          relativeMultiple: relative,
+          status: values.length >= 5 ? 'usable' : 'insufficient_sample',
+          method: '同账号最近最多 20 条的公开互动总和（点赞+评论+分享）中位数',
+        },
+      }),
+    });
+  });
+}
+
+// ─── GET /videos ──────────────────────────────────────────────────────────────
+// Query: page, perPage, platform, status, contentFormat(video|image)
+async function tenantInventoryTotal(tenantId: string, contentFormat: ContentFormat): Promise<number> {
+  const imageInventory = await store.list<Record<string, unknown>>(COL, {
+    where: { tenantId, contentFormat: 'image' },
+    page: 1,
+    perPage: 1,
+  });
+  if (contentFormat === 'image') return imageInventory.totalItems;
+  // Legacy crawled videos predate the contentFormat column. Count them as
+  // video by subtracting the explicit image inventory from all tenant records.
+  const allInventory = await store.list<Record<string, unknown>>(COL, {
+    where: { tenantId },
+    page: 1,
+    perPage: 1,
+  });
+  return Math.max(0, allInventory.totalItems - imageInventory.totalItems);
+}
+
+videosRouter.get('/inventory-summary', async (_req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const rawContentFormat = String(_req.query.contentFormat || 'video');
+  const contentFormat: ContentFormat = rawContentFormat === 'image' ? 'image' : 'video';
+  res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+  res.json({ contentFormat, totalItems: await tenantInventoryTotal(tenantId, contentFormat) });
+});
+
+videosRouter.get('/', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const { page = '1', perPage = '20', platform, status, search, crawlRange = 'all', contentFormat: rawContentFormat = 'video' } = req.query as Record<string, string>;
+  const pageNumber = Math.max(1, Number(page) || 1);
+  const perPageNumber = Math.min(100, Math.max(1, Number(perPage) || 20));
+  const contentFormat: ContentFormat = rawContentFormat === 'image' ? 'image' : 'video';
+
+  // Inventory KPI: every crawled record owned by this tenant. This deliberately
+  // ignores page/search/status/admin aggregation; the inspiration list below may
+  // hide failed or processing records, but they still belong to the crawl total.
+  const [inventoryTotalItems, result] = await Promise.all([
+    tenantInventoryTotal(tenantId, contentFormat),
+    listPublicVideosForTenant({
+      tenantId,
+      platform,
+      status,
+      contentFormat,
+      search,
+      crawlRange,
+      page: pageNumber,
+      perPage: perPageNumber,
+    }),
+  ]);
+
+  // Keep list requests read-only and fast. Repair/download/analysis work belongs
+  // to crawl jobs or explicit user actions; launching it from GET made every page
+  // refresh multiply expensive background work.
+
+  if (contentFormat === 'image') {
+    // listPublicVideosForTenant has already scanned and filtered the image records.
+    // A second full collection scan here doubled list latency as the inspiration
+    // library grew. The first page contains the latest requested page of records, which is also the
+    // product definition of the public recent-account baseline.
+    res.json({ ...result, inventoryTotalItems, items: withImagePublicBaselines(result.items).map(item => withSignedThumbnail({ ...item, canManage: String(item.tenantId || '') === tenantId }, tenantId)) });
+    return;
+  }
+  res.json({ ...result, inventoryTotalItems, items: result.items.map(item => withSignedThumbnail({ ...item, canManage: String(item.tenantId || '') === tenantId }, tenantId)) });
+});
+
+videosRouter.post('/:id/reanalyze-image', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const record = await store.getById<Record<string, unknown>>(COL, req.params.id);
+  if (!record || recordContentFormat(record) !== 'image') { res.status(404).json({ error: 'Image post not found' }); return; }
+  if (record.tenantId !== tenantId && !await requireAdminUser(req)) { res.status(404).json({ error: 'Image post not found' }); return; }
+  const current = videoAnalysisOf(record);
+  const tags = parseJsonRecord<string[]>(record.tags, []);
+  const item: CrawledImagePost = {
+    platform: String(record.platform || 'instagram') as Platform,
+    title: String(record.title || ''),
+    sourceUrl: String(record.sourceUrl || ''),
+    thumbnailUrl: String(record.thumbnailUrl || ''),
+    caption: String(current.caption || record.title || ''),
+    imageUrls: Array.isArray(current.imageUrls) ? current.imageUrls.map(String) : [String(record.thumbnailUrl || '')],
+    views: String(current.views || ''),
+    tags,
+    uploadedAt: String(current.uploadedAt || ''),
+    author: String(current.author || ''),
+  };
+  const output = await analyzeImagePostBestEffort(item, String(current.keyword || ''));
+  const next = {
+    ...current,
+    imageEvidence: output.analysis,
+    imageAnalysisStatus: output.status,
+    imageAnalysisError: output.error,
+    analysisSource: output.status === 'analyzed' ? `${output.provider || 'qwen'}-image-evidence-v2` : 'image-metadata',
+    analysisQuality: output.status === 'analyzed' ? 'image' : 'metadata',
+    analyzedAt: new Date().toISOString(),
+  };
+  await store.update(COL, req.params.id, { aiAnalysis: serializeImagePostAnalysis(next), status: output.status === 'analyzed' ? 'analyzed' : 'failed' });
+  res.status(output.status === 'analyzed' ? 200 : 502).json({ ok: output.status === 'analyzed', analysis: output.analysis, error: output.error });
+});
+
+// ─── GET /videos/:id ──────────────────────────────────────────────────────────
+
+// PATCH /videos/:id - tenant-owned crawl metadata only
+videosRouter.patch('/:id', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const record = await store.getById<Record<string, unknown>>(COL, req.params.id);
+  if (!record || String(record.tenantId || '') !== tenantId) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  const title = String(req.body?.title ?? '').trim().slice(0, 160);
+  if (!title) { res.status(400).json({ error: 'Title is required' }); return; }
+  const tags = Array.isArray(req.body?.tags)
+    ? req.body.tags.map((tag: unknown) => String(tag).trim()).filter(Boolean).slice(0, 20)
+    : [];
+  await store.update(COL, req.params.id, {
+    title,
+    tags: JSON.stringify(tags.map((tag: string) => tag.slice(0, 40))),
+    updatedAt: new Date().toISOString(),
+  });
+  const updated = await store.getById<Record<string, unknown>>(COL, req.params.id);
+  res.json({ ...publicVideoRecord(updated || record), canManage: true });
+});
+
+// DELETE /videos/:id - tenant-owned crawl records only
+videosRouter.delete('/:id', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const record = await store.getById<Record<string, unknown>>(COL, req.params.id);
+  if (!record || String(record.tenantId || '') !== tenantId) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  await store.delete(COL, req.params.id);
+  res.json({ ok: true });
+});
+
+/** Editor review is versioned separately from model output. Editing it never
+ * promotes the source video analysis or authorizes production execution. */
+videosRouter.get('/:id/shot-review', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const record = await store.getById<Record<string, unknown>>(COL, req.params.id);
+  if (!record || String(record.tenantId || '') !== tenantId) { res.status(404).json({ error: 'Not found' }); return; }
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.json(loadReferenceShotReview(record));
+});
+
+videosRouter.put('/:id/shot-review', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const record = await store.getById<Record<string, unknown>>(COL, req.params.id);
+  if (!record || String(record.tenantId || '') !== tenantId) { res.status(404).json({ error: 'Not found' }); return; }
+  try {
+    const updated = updateReferenceShotReview(record, req.body || {});
+    await store.update(COL, req.params.id, { referenceShotReview: JSON.stringify(updated), updatedAt: new Date().toISOString() });
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json(updated);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'invalid_review';
+    res.status(message === 'review_version_conflict' ? 409 : 400).json({ error: message });
+  }
+});
+
+/** Re-extract a reviewed physical shot from the original video. The derived
+ * clip and frame are tied to source hash, analysis run, shot ID and range. */
+videosRouter.post('/:id/shot-review/:shotId/materialize', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const record = await store.getById<Record<string, unknown>>(COL, req.params.id);
+  if (!record || String(record.tenantId || '') !== tenantId) { res.status(404).json({ error: 'Not found' }); return; }
+  if (!ffmpegBin) { res.status(503).json({ error: 'ffmpeg_unavailable' }); return; }
+  const review = loadReferenceShotReview(record);
+  const shot = review.shots.find(item => item.shotId === req.params.shotId && item.reviewStatus !== 'discarded');
+  if (!shot || !/^[A-Za-z0-9_-]{1,80}$/.test(shot.shotId)) { res.status(404).json({ error: 'review_shot_not_found' }); return; }
+  if (String(req.body?.expectedVersion || '') !== review.version) { res.status(409).json({ error: 'review_version_conflict' }); return; }
+  const key = reviewShotMaterialFingerprint(record, shot);
+  const temporary = path.join(ANALYSIS_DIR, `review-${randomUUID()}`);
+  const inputPath = `${temporary}-input.mp4`;
+  const clipPath = `${temporary}-clip.mp4`;
+  const framePath = `${temporary}-first-frame.jpg`;
+  try {
+    fs.mkdirSync(ANALYSIS_DIR, { recursive: true });
+    const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+    const local = localReferenceVideoPath(String(record.videoFileId || ''), tenantId);
+    let source = local && fs.existsSync(local) ? local : '';
+    if (!source) {
+      const media = analysis.videoObjectKey ? await objectStorageDownload(String(analysis.videoObjectKey))
+        : record.videoFileId ? await fetchFile(COL, req.params.id, String(record.videoFileId)) : null;
+      if (!media || media.buf.length > 100 * 1024 * 1024) { res.status(404).json({ error: 'source_video_unavailable' }); return; }
+      fs.writeFileSync(inputPath, media.buf); source = inputPath;
+    }
+    await execFileAsync(ffmpegBin, ['-hide_banner','-loglevel','error','-ss',String(shot.start),'-i',source,
+      '-t',String(shot.end-shot.start),'-map','0:v:0','-map','0:a?','-c:v','libx264','-preset','veryfast','-crf','24','-c:a','aac','-movflags','+faststart','-y',clipPath],{timeout:90_000});
+    await execFileAsync(ffmpegBin, ['-hide_banner','-loglevel','error','-ss',String(shot.start+Math.min(.04,(shot.end-shot.start)/4)),'-i',source,
+      '-frames:v','1','-q:v','3','-y',framePath],{timeout:30_000});
+    if (objectStorageEnabled()) {
+      await uploadCrawlerCosObject(req.params.id, `review-${key}-clip`, fs.readFileSync(clipPath), 'video/mp4');
+      await uploadCrawlerCosObject(req.params.id, `review-${key}-first-frame`, fs.readFileSync(framePath), 'image/jpeg');
+    } else {
+      const dir = path.join(tenantAssetDir(MEDIA_DIR, tenantId), 'review-shots', req.params.id);
+      fs.mkdirSync(dir,{recursive:true});
+      fs.copyFileSync(clipPath,path.join(dir,`${key}.mp4`));
+      fs.copyFileSync(framePath,path.join(dir,`${key}.jpg`));
+    }
+    const updated = attachReviewShotMaterials(record,shot.shotId,review.version);
+    await store.update(COL,req.params.id,{referenceShotReview:JSON.stringify(updated),updatedAt:new Date().toISOString()});
+    res.json(updated);
+  } catch (error) {
+    console.warn('[videos] review shot extraction failed:',error instanceof Error ? error.message : error);
+    res.status(500).json({error:'review_shot_extraction_failed'});
+  } finally {
+    for (const file of [inputPath,clipPath,framePath]) try { fs.unlinkSync(file); } catch {}
+  }
+});
+
+videosRouter.get('/:id/shot-review/:shotId/:kind', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const record = await store.getById<Record<string, unknown>>(COL, req.params.id);
+  if (!record || String(record.tenantId || '') !== tenantId) { res.status(404).json({ error: 'Not found' }); return; }
+  const review = loadReferenceShotReview(record);
+  const shot = review.shots.find(item => item.shotId === req.params.shotId && item.reviewStatus !== 'discarded');
+  const kind = req.params.kind;
+  if (!shot || !['clip','first-frame'].includes(kind)) { res.status(404).json({ error: 'review_material_not_found' }); return; }
+  const key = reviewShotMaterialFingerprint(record,shot);
+  const expected = `/api/overseas/videos/${encodeURIComponent(req.params.id)}/shot-review/${encodeURIComponent(shot.shotId)}/${kind}?key=${key}`;
+  if (req.query.key !== key || !shot.evidenceRefs.includes(expected)) { res.status(404).json({ error: 'review_material_not_found' }); return; }
+  if (objectStorageEnabled()) {
+    const objectKey = crawlerCosKey(record,`review-${key}-${kind}`,kind === 'clip' ? 'mp4' : 'jpg');
+    if (!await streamCrawlerCosObject(res,objectKey,kind === 'clip' ? req.headers.range : undefined)) res.status(404).json({error:'review_material_not_found'});
+    return;
+  }
+  const file = path.join(tenantAssetDir(MEDIA_DIR,tenantId),'review-shots',req.params.id,`${key}.${kind === 'clip' ? 'mp4' : 'jpg'}`);
+  if (!fs.existsSync(file)) { res.status(404).json({error:'review_material_not_found'}); return; }
+  res.setHeader('Cache-Control','private, max-age=3600'); res.sendFile(file);
+});
+
+/** Read-only Director -> Content review packet. A failed exact analysis remains
+ * available for planning, while its productionExecutionAllowed gate stays false. */
+videosRouter.get('/:id/review-handoff', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const record = await store.getById<Record<string, unknown>>(COL, req.params.id);
+  if (!record || String(record.tenantId || '') !== tenantId) {
+    res.status(404).json({ error: 'Not found' }); return;
+  }
+  if (await isTestTenantId(tenantId) && !isPublicTestTenantVideo(record) && !isVisibleVideoPipelineRecord(record)) {
+    res.status(404).json({ error: 'Not found' }); return;
+  }
+  const defaults = await store.list<{ payload?: { presenters?: Array<Record<string, unknown>> } }>('studio_production_defaults',
+    { where: { tenant_id: tenantId }, perPage: 2 });
+  const presenter = defaults.totalItems === 1 ? resolveReferenceSalesPresenter(defaults.items) : null;
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.json(buildSocialReferenceReviewHandoff({ record, presenter }));
+});
+
+/** Exact transcript corrections are a reviewer's assertion about the original
+ * audio, version-bound to this upload. They do not change analysisQuality. */
+videosRouter.get('/:id/verified-speech', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const record = await store.getById<Record<string, unknown>>(COL, req.params.id);
+  if (!record || String(record.tenantId || '') !== tenantId) { res.status(404).json({ error: 'Not found' }); return; }
+  const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+  const analysisRunId = String(analysis.analysisRunId || '');
+  const sourceSha256 = String(analysis.contentSha256 || '');
+  const saved = currentVerifiedSpeech(parseJsonRecord(record.referenceVerifiedSpeech, null), analysisRunId, sourceSha256);
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.json({ analysisRunId, sourceSha256, duration: Number(record.duration || 0),
+    status: verifiedSpeechStatus(saved),
+    coverageConfirmed: saved?.coverageConfirmed || false, lines: saved?.lines || [], reviewerId: saved?.reviewerId || null,
+    verifiedAt: saved?.verifiedAt || null });
+});
+
+videosRouter.put('/:id/verified-speech', async (req, res) => {
+  const { tenantId, userId } = res.locals as AuthLocals;
+  const record = await store.getById<Record<string, unknown>>(COL, req.params.id);
+  if (!record || String(record.tenantId || '') !== tenantId) { res.status(404).json({ error: 'Not found' }); return; }
+  const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+  const analysisRunId = String(analysis.analysisRunId || '');
+  const sourceSha256 = String(analysis.contentSha256 || '');
+  if (!analysisRunId || !sourceSha256 || req.body?.analysisRunId !== analysisRunId || req.body?.sourceSha256 !== sourceSha256) {
+    res.status(409).json({ error: '视频或分析版本已变化，请重新加载后校时' }); return;
+  }
+  let lines;
+  try { lines = validateVerifiedSpeechLines(req.body?.lines, Number(record.duration || 0)); }
+  catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : '逐句口播无效' }); return; }
+  const verifiedAt = new Date().toISOString();
+  const coverageConfirmed = req.body?.coverageConfirmed === true;
+  const saved: VerifiedReferenceSpeech = { schemaVersion: 1, analysisRunId, sourceSha256, lines, coverageConfirmed, reviewerId: userId, verifiedAt };
+  await store.update(COL, req.params.id, { referenceVerifiedSpeech: JSON.stringify(saved) });
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.json({ analysisRunId, sourceSha256, duration: Number(record.duration || 0),
+    status: verifiedSpeechStatus(saved), coverageConfirmed, lines, reviewerId: userId, verifiedAt });
+});
+
+/** Poll an existing Qwen task with confirmed=false. A new paid submission
+ * requires confirmed=true and still passes service feature flag and budget. */
+const salesReviewRunning = new Map<string, Promise<unknown>>();
+videosRouter.post('/:id/sales-presenter-review', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const record = await store.getById<Record<string, unknown>>(COL, req.params.id);
+  if (!record || String(record.tenantId || '') !== tenantId) { res.status(404).json({ error: 'Not found' }); return; }
+  const analysis = parseJsonRecord<Record<string, any>>(record.aiAnalysis, {});
+  const shots = (analysis.gemini?.scriptDetails15s || analysis.scriptDetails15s) as SalesShot[];
+  if (!Array.isArray(shots) || !shots.length || shots.length > 60 || !analysis.contentSha256) { res.status(422).json({ error: '销售识别需要完整原片分镜及视频指纹，最多支持60个分镜' }); return; }
+  const key = createHash('sha256').update(salesReviewKey(String(analysis.contentSha256), shots)).digest('hex');
+  const previous = analysis.salesPresenterReview;
+  if (previous?.key === key && previous.submitted !== false) {
+    if (previous.state === 'completed') { res.json({ ok: true, cached: true, ...previous, rows: previous.rows.map((row: any) => ({ ...row, sourceVisual: shots[row.index]?.visual || '' })) }); return; }
+    res.status(409).json({ error: previous.error || '该销售识别请求未完成，请核对原任务，未再次提交付费识别' }); return;
+  }
+  try { assertSalesPresenterQwenConfigured(); } catch { res.status(503).json({ error: '销售识别服务未配置千问凭证，未提交模型请求' }); return; }
+  const filename = String(record.videoFileId || '');
+  const videoPath = localReferenceVideoPath(filename, tenantId);
+  if (!videoPath || !fs.existsSync(videoPath) || !ffmpegBin) { res.status(422).json({ error: '原片文件不可用，未提交销售识别' }); return; }
+  const lock = `${tenantId}:${record.id}:${key}`;
+  let pending = salesReviewRunning.get(lock);
+  if (!pending) {
+    pending = durableAnalysisRecords.run(`sales:${lock}`, async () => {
+      const freshRecord = await store.getById<Record<string, unknown>>(COL, req.params.id);
+      const freshAnalysis = parseJsonRecord<Record<string, any>>(freshRecord?.aiAnalysis, {});
+      if (freshAnalysis.salesPresenterReview?.key === key && freshAnalysis.salesPresenterReview.submitted !== false) {
+        if (freshAnalysis.salesPresenterReview.state === 'completed') return freshAnalysis.salesPresenterReview;
+        throw new Error('销售识别尚未确认完成，未重复提交付费请求');
+      }
+      fs.mkdirSync(ANALYSIS_DIR, { recursive: true });
+      const dir = fs.mkdtempSync(path.join(ANALYSIS_DIR, 'sales-review-'));
+      try {
+        const probedDuration = await probeDuration(videoPath!);
+        const videoDuration = Math.min(probedDuration, Number(record.duration) > 0 ? Number(record.duration) : probedDuration - .5);
+        if (!Number.isFinite(videoDuration) || videoDuration <= 0) throw new Error('原片时长不可读取');
+        const frames = [];
+        for (let index = 0; index < shots.length; index++) {
+          const range = parseAnalysisTimeRange(shots[index].time);
+          if (!range || range.end <= range.start || range.start >= videoDuration) throw new Error('原片分镜时间无效');
+          const clipEnd = Math.min(range.end, videoDuration - .05);
+          const images: string[] = [];
+          for (const fraction of [.55, .85]) {
+            const target = path.join(dir, `${index}-${fraction}.jpg`);
+            await execFileAsync(ffmpegBin!, ['-hide_banner', '-loglevel', 'error', '-ss', String(range.start + (clipEnd-range.start)*fraction), '-i', videoPath!, '-frames:v', '1', '-vf', 'scale=384:-2', '-q:v', '5', '-y', target], { timeout: 15000 });
+            images.push(fs.readFileSync(target).toString('base64'));
+          }
+          frames.push({ index, images, dialogue: shots[index].dialogue || '', visual: shots[index].visual || '' });
+        }
+        // Persist before paid submission. Unknown/failure never silently retries.
+        const latest = await store.getById<Record<string, unknown>>(COL, req.params.id);
+        const before = parseJsonRecord<Record<string, any>>(latest?.aiAnalysis, {});
+        if (createHash('sha256').update(salesReviewKey(String(before.contentSha256), before.gemini?.scriptDetails15s || before.scriptDetails15s || [])).digest('hex') !== key) throw new Error('原片分析已变化，请重新打开草稿');
+        await store.update(COL, req.params.id, { aiAnalysis: JSON.stringify({ ...before, salesPresenterReview: { key, version: SALES_REVIEW_VERSION, state: 'running', provider: 'qwen', submitted: true, startedAt: new Date().toISOString() } }) });
+        const recognition = await reviewSalesPresenterFramesWithQwen({ frames });
+        const rows = validateSalesReview(recognition, shots.length);
+        const current = await store.getById<Record<string, unknown>>(COL, req.params.id);
+        const saved = parseJsonRecord<Record<string, any>>(current?.aiAnalysis, {});
+        if (saved.salesPresenterReview?.key !== key || createHash('sha256').update(salesReviewKey(String(saved.contentSha256), saved.gemini?.scriptDetails15s || saved.scriptDetails15s || [])).digest('hex') !== key) throw new Error('原片分析已变化，识别结果未覆盖新分析');
+        const review = { key, version: SALES_REVIEW_VERSION, provider: 'qwen', model: recognition.model, usage: recognition.usage, state: 'completed', rows: rows.map(row => ({ ...row, time: shots[row.index].time, sourceVisual: shots[row.index].visual || '' })), digitalHumanShotIndexes: rows.filter(row => row.observedPresenterRole === 'sales_presenter' && !row.needsReview).map(row => row.index), presenterGroups: [...new Set(rows.filter(row => row.observedPresenterRole === 'sales_presenter' && !row.needsReview).map(row => row.personContinuityId))].map(personId => ({ personId, shotIndexes: rows.filter(row => row.observedPresenterRole === 'sales_presenter' && !row.needsReview && row.personContinuityId === personId).map(row => row.index) })), frameCount: frames.length * 2, completedAt: new Date().toISOString() };
+        const reviewedShots = (saved.gemini?.scriptDetails15s || saved.scriptDetails15s).map((shot: any, index: number) => ({ ...shot,
+          observedPresenterRole: rows[index].observedPresenterRole, personContinuityId: rows[index].personContinuityId,
+          salesPresenterConfirmed: rows[index].observedPresenterRole === 'sales_presenter' && !rows[index].needsReview,
+          presenterRecognition: rows[index] }));
+        await store.update(COL, req.params.id, { aiAnalysis: JSON.stringify({ ...saved, salesPresenterReview: review,
+          ...(saved.gemini?.scriptDetails15s ? { gemini: { ...saved.gemini, scriptDetails15s: reviewedShots } } : { scriptDetails15s: reviewedShots }) }) });
+        return review;
+      } catch (error) {
+        const failedRecord = await store.getById<Record<string, unknown>>(COL, req.params.id);
+        const failedAnalysis = parseJsonRecord<Record<string, any>>(failedRecord?.aiAnalysis, {});
+        if (failedAnalysis.salesPresenterReview?.key === key && failedAnalysis.salesPresenterReview.state === 'running') {
+          await store.update(COL, req.params.id, { aiAnalysis: JSON.stringify({ ...failedAnalysis,
+            salesPresenterReview: { ...failedAnalysis.salesPresenterReview, state: 'failed', failedAt: new Date().toISOString(), error: error instanceof Error ? error.message : '销售识别失败' } }) });
+        }
+        throw error;
+      } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    });
+    salesReviewRunning.set(lock, pending);
+    pending.finally(() => salesReviewRunning.delete(lock)).catch(() => {});
+  }
+  try { res.json({ ok: true, cached: false, ...(await pending as object) }); }
+  catch (error) { res.status(422).json({ error: error instanceof Error ? error.message : '销售识别失败' }); }
+});
+
+videosRouter.post('/:id/phrase-asr', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const record = await store.getById<Record<string, unknown>>(COL, req.params.id);
+  if (!record || String(record.tenantId || '') !== tenantId) { res.status(404).json({ error: 'Not found' }); return; }
+  const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+  if (analysis.usage !== 'reference_only' || !analysis.contentSha256 || !analysis.analysisRunId) {
+    res.status(422).json({ ok: false, error: '仅支持已导入的本企业参考视频' }); return;
+  }
+  const duration = Number(record.duration || 0);
+  if (!Number.isFinite(duration) || duration <= 0 || duration > 180) {
+    res.status(422).json({ ok: false, error: '逐句转写仅支持 180 秒以内视频' }); return;
+  }
+  const filename = String(record.videoFileId || '');
+  const videoPath = localReferenceVideoPath(filename, tenantId);
+  if (!videoPath || !fs.existsSync(videoPath) || !ffmpegBin) {
+    res.status(422).json({ ok: false, error: '本地参考视频或音频提取工具不可用' }); return;
+  }
+  const confirmed = req.body?.confirmed === true;
+  const audioPath = path.join(ANALYSIS_DIR, `reference-asr-${randomUUID()}.mp3`);
+  try {
+    fs.mkdirSync(ANALYSIS_DIR, { recursive: true });
+    await execFileAsync(ffmpegBin, ['-hide_banner', '-loglevel', 'error', '-i', videoPath,
+      '-vn', '-ac', '1', '-ar', '16000', '-codec:a', 'libmp3lame', '-b:a', '64k', '-y', audioPath], { timeout: 60_000 });
+    const audio = fs.readFileSync(audioPath);
+    const task = await referenceAsrService.run(tenantId, audio, 'audio/mpeg', confirmed);
+    const common = { ok: true, status: task.status, taskId: task.taskId || null,
+      enabled: process.env.QWEN_ASR_GENERATION_ENABLED === 'true', error: task.error || null,
+      analysisRunId: analysis.analysisRunId, sourceSha256: analysis.contentSha256 };
+    if (task.status !== 'SUCCEEDED') { res.setHeader('Cache-Control', 'private, no-store'); res.json({ ...common, candidateLines: [] }); return; }
+    const result = qwenAsrCues(task.raw, duration);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json({ ...common, transcript: result.text, candidateLines: result.cues.map(cue => ({
+      text: cue.text, start: cue.start, end: cue.end, precision: 'phrase',
+      provenance: `qwen_asr:${task.taskId}`, visibility: 'unknown',
+    })) });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '逐句转写失败';
+    res.status(message.includes('付费转写尚未启用') ? 409 : 400).json({
+      ok: false, enabled: process.env.QWEN_ASR_GENERATION_ENABLED === 'true', error: message,
+    });
+  } finally { try { fs.unlinkSync(audioPath); } catch {} }
+});
+
+/** Align observed ASR to an editor-confirmed narrative structure. This is a
+ * review artifact; caller flags cannot promote an unverified source analysis. */
+videosRouter.post('/:id/speech-timeline', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const record = await store.getById<Record<string, unknown>>(COL, req.params.id);
+  if (!record || String(record.tenantId || '') !== tenantId) {
+    res.status(404).json({ error: 'Not found' }); return;
+  }
+  const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+  const shotReview = parseJsonRecord<Record<string, unknown>>(record.referenceShotReview, {});
+  const currentShotReview = String(shotReview.sourceAnalysisRunId || '') === String(analysis.analysisRunId || '')
+    && Boolean(shotReview.sourceAnalysisRunId);
+  const rawSections = currentShotReview && Array.isArray(shotReview.sections)
+    ? shotReview.sections : req.body?.sections;
+  if (!Array.isArray(rawSections) || rawSections.length !== 6 || rawSections.some(item =>
+    !item || typeof item.sectionId !== 'string' || typeof item.title !== 'string'
+    || !Number.isFinite(item.start) || !Number.isFinite(item.end) || item.start < 0 || item.end <= item.start)) {
+    res.status(400).json({ error: 'Six valid narrative sections are required' }); return;
+  }
+  const sections = rawSections as ReferenceStructureInput[];
+  const gemini = analysis.gemini && typeof analysis.gemini === 'object'
+    ? analysis.gemini as Record<string, unknown> : parseJsonRecord<Record<string, unknown>>(analysis.gemini, {});
+  const transcript = gemini.audioTranscript && typeof gemini.audioTranscript === 'object'
+    ? gemini.audioTranscript as Record<string, unknown>
+    : parseJsonRecord<Record<string, unknown>>(gemini.audioTranscript, {});
+  const savedSpeech = currentVerifiedSpeech(parseJsonRecord(record.referenceVerifiedSpeech, null),
+    String(analysis.analysisRunId || ''), String(analysis.contentSha256 || ''));
+  const speech = savedSpeech ? savedSpeech.lines.map(line => ({ ...line, timingPrecision: 'phrase' as const,
+    provenance: `manual_verified:${savedSpeech.reviewerId}:${savedSpeech.verifiedAt}` }))
+    : approximateSpeechLines(transcript.segments);
+  const details = Array.isArray(gemini.scriptDetails15s) ? gemini.scriptDetails15s : [];
+  const candidateShots = details.flatMap((raw, index) => {
+    const detail = raw && typeof raw === 'object' ? raw as Record<string, unknown>
+      : parseJsonRecord<Record<string, unknown>>(raw, {});
+    const range = parseAnalysisTimeRange(String(detail.time || detail.timestamp || ''));
+    return range ? [{ shotId: `shot-${index + 1}`, start: range.start, end: range.end,
+      content: String(detail.visual || ''), purpose: String(detail.purpose || '') }] : [];
+  });
+  const shots = currentShotReview && Array.isArray(shotReview.shots)
+    ? (shotReview.shots as Array<Record<string, unknown>>).filter(shot => shot.reviewStatus !== 'discarded').map(shot => ({
+      shotId: String(shot.shotId || ''), start: Number(shot.start), end: Number(shot.end),
+      content: String(shot.content || ''), purpose: String(shot.purpose || ''),
+    })) : candidateShots;
+  const timeline = buildReferenceSpeechTimeline({
+    speech: Array.isArray(speech) ? speech as any : [], shots, sections,
+    speechCoverageVerified: savedSpeech?.coverageConfirmed === true,
+    shotCutsVerified: currentShotReview && shotReview.reviewComplete === true && req.body?.shotCutsVerified === true,
+  });
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.json({ referenceRecordId: req.params.id, analysisRunId: analysis.analysisRunId || null, ...timeline });
+});
+
+videosRouter.get('/:id', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const record = await store.getById(COL, req.params.id);
+
+  if (!record || record.tenantId !== tenantId) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+
+  if (await isTestTenantId(tenantId) && !isPublicTestTenantVideo(record) && !isVisibleVideoPipelineRecord(record)) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+
+  res.json(publicVideoRecord(record));
+});
+
+videosRouter.get('/:id/media', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const record = await store.getById(COL, req.params.id);
+  if (!record) { res.status(404).json({ error: 'Not found' }); return; }
+  if (record.tenantId !== tenantId && !await requireAdminUser(req)) { res.status(404).json({ error: 'Not found' }); return; }
+  const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+  const filename = String(record.videoFileId || '');
+  const localReference = localReferenceVideoPath(filename, String(record.tenantId || ''));
+  // Imports are mirrored locally before object-storage upload. Prefer that durable
+  // local copy so a temporary COS outage cannot break preview or stop the server.
+  if (localReference && fs.existsSync(localReference)) {
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.type('mp4').sendFile(localReference);
+    return;
+  }
+  const cosKey = String(analysis.videoObjectKey || '');
+  if (cosKey) {
+    try {
+      if (!await streamCrawlerCosObject(res, cosKey, req.headers.range)) res.status(404).json({ error: 'COS video not found' });
+    } catch (error) {
+      console.warn('[videos] object storage preview unavailable:', error instanceof Error ? error.message : error);
+      if (!res.headersSent) res.status(502).json({ error: 'video_storage_temporarily_unavailable' });
+      else res.end();
+    }
+    return;
+  }
+  if (!filename) { res.status(404).json({ error: 'Video not stored' }); return; }
+  if (localReference) {
+    if (!fs.existsSync(localReference)) { res.status(404).json({ error: 'Video not stored' }); return; }
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.type('mp4').sendFile(localReference);
+    return;
+  }
+  const file = await fetchFile(COL, req.params.id, filename);
+  if (!file) { res.status(404).json({ error: 'PocketBase video not found' }); return; }
+  const range = req.headers.range;
+  res.setHeader('Accept-Ranges', 'bytes'); res.setHeader('Content-Type', file.contentType || 'video/mp4'); res.setHeader('Cache-Control', 'private, max-age=3600');
+  if (range) {
+    const match = range.match(/bytes=(\d*)-(\d*)/); const start = Math.max(0, Number(match?.[1] || 0)); const end = Math.min(file.buf.length - 1, Number(match?.[2] || file.buf.length - 1));
+    if (start > end) { res.status(416).end(); return; }
+    res.status(206); res.setHeader('Content-Range', `bytes ${start}-${end}/${file.buf.length}`); res.setHeader('Content-Length', end - start + 1); res.end(file.buf.subarray(start, end + 1)); return;
+  }
+  res.setHeader('Content-Length', file.buf.length); res.end(file.buf);
+});
+
+function localReferenceVideoPath(filename: string, tenantId: string): string | null {
+  const clean = filename.replace(/\\/g, '/');
+  const prefix = `tenants/${tenantId}/reference-videos/`;
+  if (!clean.startsWith(prefix) || !/^tenants\/[A-Za-z0-9_-]+\/reference-videos\/[A-Za-z0-9_-]+\.mp4$/.test(clean)) return null;
+  const fullPath = path.resolve(MEDIA_DIR, clean);
+  const tenantRoot = path.resolve(tenantAssetDir(MEDIA_DIR, tenantId));
+  return fullPath.startsWith(`${tenantRoot}${path.sep}`) ? fullPath : null;
+}
+
+videosRouter.get('/:id/shot/:number/:kind', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const record = await store.getById(COL, req.params.id);
+  if (!record || (record.tenantId !== tenantId && !await requireAdminUser(req))) {
+    res.status(404).json({ error: 'Not found' }); return;
+  }
+  const index = Number(req.params.number) - 1;
+  const kind = req.params.kind;
+  if (!Number.isSafeInteger(index) || index < 0 || (kind !== 'clip' && kind !== 'first-frame')) {
+    res.status(404).json({ error: 'Shot evidence not found' }); return;
+  }
+  const geminiValue = videoAnalysisOf(record).gemini;
+  const gemini = geminiValue && typeof geminiValue === 'object' && !Array.isArray(geminiValue)
+    ? geminiValue as Record<string, unknown>
+    : parseJsonRecord<Record<string, unknown>>(geminiValue, {});
+  const details = Array.isArray(gemini.scriptDetails15s) ? gemini.scriptDetails15s : [];
+  const detailValue = details[index];
+  const detail = detailValue && typeof detailValue === 'object' && !Array.isArray(detailValue)
+    ? detailValue as Record<string, unknown>
+    : parseJsonRecord<Record<string, unknown>>(detailValue, {});
+  const evidenceValue = detail.materialEvidence;
+  const evidence = evidenceValue && typeof evidenceValue === 'object' && !Array.isArray(evidenceValue)
+    ? evidenceValue as Record<string, unknown>
+    : parseJsonRecord<Record<string, unknown>>(evidenceValue, {});
+  const key = String(kind === 'clip' ? evidence.clipObjectKey || '' : evidence.firstFrameObjectKey || '');
+  if (evidence.extractionStatus !== 'ready' || !key) {
+    if (evidence.extractionStatus !== 'ready' || objectStorageEnabled()) {
+      res.status(404).json({ error: 'Shot evidence not found' }); return;
+    }
+    const file = path.join(tenantAssetDir(MEDIA_DIR, tenantId), 'trend-shots', String(record.id), `shot-${index + 1}.${kind === 'clip' ? 'mp4' : 'jpg'}`);
+    if (!fs.existsSync(file)) { res.status(404).json({ error: 'Shot evidence not found' }); return; }
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.sendFile(file);
+    return;
+  }
+  if (!await streamCrawlerCosObject(res, key, kind === 'clip' ? req.headers.range : undefined)) {
+    res.status(404).json({ error: 'Shot evidence not found' });
+  }
+});
+
+videosRouter.get('/:id/media-url', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const record = await store.getById(COL, req.params.id);
+  if (!record) { res.status(404).json({ error: 'Not found' }); return; }
+  if (record.tenantId !== tenantId && !await requireAdminUser(req)) { res.status(404).json({ error: 'Not found' }); return; }
+  const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+  const filename = String(record.videoFileId || '');
+  if (!filename && !analysis.videoObjectKey) { res.status(404).json({ error: 'Video not stored' }); return; }
+  res.setHeader('Cache-Control', 'private, no-store');
+  const normalizedLocalFile = filename.replace(/\\/g, '/').replace(/^\/+/, '');
+  const recordTenantId = String(record.tenantId || '');
+  const expectedPrefix = `tenants/${recordTenantId}/`;
+  const tenantRoot = path.resolve(MEDIA_DIR, 'tenants', recordTenantId);
+  const localPath = path.resolve(MEDIA_DIR, normalizedLocalFile);
+  if (normalizedLocalFile.startsWith(expectedPrefix)
+    && localPath.startsWith(`${tenantRoot}${path.sep}`)
+    && fs.existsSync(localPath)
+    && fs.statSync(localPath).isFile()) {
+    res.json({ url: signAssetUrl(`/media/${normalizedLocalFile}`, tenantId) });
+    return;
+  }
+  res.json({ url: signAssetUrl(`/api/overseas/videos/${encodeURIComponent(req.params.id)}/media`, tenantId) });
+});
+
+/**
+ * `<img>` 发不出 Authorization 头，只能带 asset session cookie，
+ * 而 requireAdminUser 只认头部。跨租户封面对管理员可见，这里补上 cookie 回落。
+ */
+async function isAdminForAssetRequest(req: Request): Promise<boolean> {
+  if (await requireAdminUser(req)) return true;
+  const cookieToken = cookieValue(req, ASSET_SESSION_COOKIE);
+  if (!cookieToken) return false;
+  const proxied = Object.create(req, {
+    headers: { value: { ...req.headers, authorization: `Bearer ${cookieToken}` } },
+  }) as Request;
+  return Boolean(await requireAdminUser(proxied));
+}
+
+function isSharedInspirationThumbnailReadable(record: Record<string, unknown>): boolean {
+  const sharedTenantId = String(process.env.SOCIAL_SHARED_INSPIRATION_TENANT_ID || 'demo-shared-video-pool').trim();
+  const analysis = videoAnalysisOf(record);
+  return Boolean(sharedTenantId)
+    && String(record.tenantId || '') === sharedTenantId
+    && analysis.userVisible === true
+    && isPublicTestTenantVideo(record);
+}
+
+async function generateThumbnailFromStoredVideo(record: Record<string, unknown>): Promise<{ buf: Buffer; contentType: string } | null> {
+  const recordId = String(record.id || '');
+  if (!recordId) return null;
+  const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+  const videoKey = String(analysis.videoObjectKey || '');
+  const filename = String(record.videoFileId || '');
+  const localReference = localReferenceVideoPath(filename, String(record.tenantId || ''));
+  let video: Awaited<ReturnType<typeof objectStorageDownload>> | null = null;
+  try {
+    video = videoKey ? await objectStorageDownload(videoKey)
+      : localReference && fs.existsSync(localReference) ? { buf: fs.readFileSync(localReference), contentType: 'video/mp4' }
+        : filename ? await fetchFile(COL, recordId, filename) : null;
+  } catch (error) {
+    // A stale object key must result in a missing thumbnail, not an unhandled
+    // rejection that takes down the local API while the queue is rendering.
+    console.warn('[videos] thumbnail source unavailable:', error instanceof Error ? error.message : error);
+    return null;
+  }
+  if (!video?.buf.length) return null;
+
+  if (!fs.existsSync(ANALYSIS_DIR)) fs.mkdirSync(ANALYSIS_DIR, { recursive: true });
+  const sourceName = videoKey || filename || 'video.mp4';
+  const ext = path.extname(sourceName).replace(/^\./, '').toLowerCase()
+    || (video.contentType.includes('webm') ? 'webm' : video.contentType.includes('quicktime') ? 'mov' : 'mp4');
+  const base = `thumb-${recordId}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const videoPath = path.join(ANALYSIS_DIR, `${base}.${ext}`);
+  const posterPath = path.join(ANALYSIS_DIR, `${base}.jpg`);
+  try {
+    fs.writeFileSync(videoPath, video.buf);
+    const ok = await extractPoster(videoPath, posterPath, Number(record.duration || 0) > 1 ? 1 : 0);
+    if (!ok || !fs.existsSync(posterPath)) return null;
+    const posterBuf = fs.readFileSync(posterPath);
+    const thumbnailUrl = `/api/overseas/videos/${encodeURIComponent(recordId)}/thumbnail`;
+    if (objectStorageEnabled()) {
+      const thumbnailObjectKey = await uploadCrawlerCosObject(recordId, 'thumbnail', posterBuf, 'image/jpeg');
+      await store.update(COL, recordId, {
+        thumbnailUrl,
+        aiAnalysis: JSON.stringify({
+          ...analysis,
+          thumbnailStorage: 'cos',
+          thumbnailObjectKey,
+        }),
+      });
+    } else {
+      const thumbnailFile = await attachFile(COL, recordId, 'thumbnailFile', {
+        name: `${recordId}-thumbnail.jpg`,
+        buf: posterBuf,
+        contentType: 'image/jpeg',
+      });
+      await store.update(COL, recordId, {
+        thumbnailUrl,
+        ...(thumbnailFile ? { thumbnailFile } : {}),
+      });
+    }
+    return { buf: posterBuf, contentType: 'image/jpeg' };
+  } catch (error) {
+    console.warn('[videos] thumbnail generation failed:', error instanceof Error ? error.message : error);
+    return null;
+  } finally {
+    for (const filePath of [videoPath, posterPath]) {
+      try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+    }
+  }
+}
+
+// 封面：直接从记录自己的 PocketBase 文件字段读。
+// <img> 带不了 Authorization 头，但 requireAuth 会回落到 asset session cookie。
+videosRouter.get('/:id/thumbnail', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const record = await store.getById<Record<string, unknown>>(COL, req.params.id);
+  if (!record) { res.status(404).end(); return; }
+  const ownsRecord = String(record.tenantId || '') === tenantId;
+  if (!ownsRecord && !isSharedInspirationThumbnailReadable(record) && !await isAdminForAssetRequest(req)) {
+    res.status(404).end();
+    return;
+  }
+
+  const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+  const cosKey = String(analysis.thumbnailObjectKey || '');
+  if (cosKey) {
+    if (!await streamCrawlerCosObject(res, cosKey, req.headers.range)) res.status(404).end();
+    return;
+  }
+  const filename = String(record.thumbnailFile || '');
+  let file = filename ? await fetchFile(COL, req.params.id, filename) : null;
+  if (!file) file = await generateThumbnailFromStoredVideo(record as Record<string, unknown>);
+  if (!file) { res.status(404).end(); return; }
+
+  res.setHeader('Content-Type', file.contentType.startsWith('image/') ? file.contentType : 'image/jpeg');
+  res.setHeader('Cache-Control', 'private, max-age=86400');
+  res.setHeader('Content-Length', file.buf.length);
+  res.end(file.buf);
+});
+
+videosRouter.get('/:id/image/:index', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const record = await store.getById(COL, req.params.id);
+  if (!record) { res.status(404).end(); return; }
+  if (record.tenantId !== tenantId && !await isAdminForAssetRequest(req)) { res.status(404).end(); return; }
+  const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+  const keys = Array.isArray(analysis.imageObjectKeys) ? analysis.imageObjectKeys.map(String) : [];
+  const index = Number(req.params.index);
+  const key = Number.isInteger(index) && index >= 0 ? keys[index] : '';
+  if (!key || !await streamCrawlerCosObject(res, key, req.headers.range)) res.status(404).end();
+});
+
+videosRouter.patch('/:id/analysis-corrections', async (req, res) => {
+  const { tenantId, userId } = res.locals as AuthLocals;
+  const record = await store.getById(COL, req.params.id);
+  if (!record) { res.status(404).json({ error: 'Not found' }); return; }
+  if (record.tenantId !== tenantId && !await requireAdminUser(req)) { res.status(404).json({ error: 'Not found' }); return; }
+  const details = Array.isArray(req.body?.scriptDetails15s) ? req.body.scriptDetails15s.slice(0, 500) : null;
+  const summary = req.body?.scriptSummary15s && typeof req.body.scriptSummary15s === 'object' ? req.body.scriptSummary15s : null;
+  if (!details) { res.status(400).json({ error: 'scriptDetails15s required' }); return; }
+  const previous = parseJsonRecord<Record<string, any>>(record.aiAnalysis, {});
+  const gemini = previous.gemini && typeof previous.gemini === 'object' ? previous.gemini : {};
+  const correctedAt = new Date().toISOString();
+  const next = {
+    ...previous,
+    originalGemini: previous.originalGemini || gemini,
+    gemini: { ...gemini, ...(summary ? { scriptSummary15s: summary } : {}), scriptDetails15s: details },
+    correction: { correctedAt, correctedBy: userId, confirmed: Boolean(req.body?.confirmed), version: Number(previous.correction?.version || 0) + 1 },
+  };
+  await store.update(COL, req.params.id, { aiAnalysis: JSON.stringify(next) });
+  res.json({ ok: true, correctedAt, version: next.correction.version, analysis: next.gemini });
+});
+
+// Record the handoff from Inspiration exact analysis into the refinement
+// workflow. ScheduledPage reads this marker from the same trend_videos record,
+// so the handoff is durable and tenant-scoped instead of being browser state.
+videosRouter.post('/:id/refinement-sync', async (req, res) => {
+  const { tenantId, userId } = res.locals as AuthLocals;
+  const record = await store.getById<Record<string, unknown>>(COL, req.params.id);
+  if (!record || (record.tenantId !== tenantId && !await requireAdminUser(req))) {
+    res.status(404).json({ error: 'Video record not found' });
+    return;
+  }
+  const previous = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+  if (previous.analysisMode !== 'exact' || previous.requestedAnalysisMode === 'exact' || previous.analysisError) {
+    res.status(409).json({ error: '请先完成合格的全片精确分析，再进入精修流程' });
+    return;
+  }
+  const syncedAt = new Date().toISOString();
+  await store.update(COL, req.params.id, {
+    aiAnalysis: JSON.stringify({
+      ...previous,
+      refinementStatus: 'ready',
+      refinementQueuedAt: syncedAt,
+      refinementQueuedBy: userId,
+      refinementSource: String(req.body?.source || 'inspiration_analysis'),
+    }),
+  });
+  res.json({ ok: true, id: req.params.id, status: 'ready', syncedAt });
+});
+
+videosRouter.post('/:id/analysis-pause', async (req, res) => {
+  const { tenantId, userId } = res.locals as AuthLocals;
+  const record = await store.getById<Record<string, unknown>>(COL, req.params.id);
+  if (!record || (record.tenantId !== tenantId && !await requireAdminUser(req))) {
+    res.status(404).json({ error: 'Video record not found' });
+    return;
+  }
+  const previous = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+  const geminiStatus = String(previous.geminiStatus || '');
+  const downloadStatus = String(previous.downloadStatus || '');
+  const videoFetchStatus = String(previous.videoFetchStatus || '');
+  const activeStatuses = new Set([
+    'queued', 'analyzing', 'waiting_for_video', 'downloading', 'download_retrying',
+    'analysis_retryable', 'ops_queued', 'ops_processing',
+  ]);
+  const isRunning = Boolean(previous.requestedAnalysisMode)
+    || activeStatuses.has(geminiStatus)
+    || activeStatuses.has(downloadStatus)
+    || activeStatuses.has(videoFetchStatus);
+  if (!isRunning) {
+    res.status(409).json({ error: '当前视频不在分析中' });
+    return;
+  }
+  const pausedAt = new Date().toISOString();
+  // Rotating the run id makes every in-flight completion stale. Expensive
+  // provider calls may finish remotely, but their result can no longer
+  // overwrite this durable paused state.
+  await store.update(COL, req.params.id, {
+    status: previous.gemini || previous.analysisQuality ? 'analyzed' as VideoStatus : 'failed' as VideoStatus,
+    aiAnalysis: JSON.stringify({
+      ...previous,
+      analysisRunId: randomUUID(),
+      requestedAnalysisMode: undefined,
+      geminiStatus: 'paused',
+      downloadStatus: activeStatuses.has(downloadStatus) ? 'paused' : previous.downloadStatus,
+      videoFetchStatus: activeStatuses.has(videoFetchStatus) ? 'paused' : previous.videoFetchStatus,
+      analysisPausedAt: pausedAt,
+      analysisPausedBy: userId,
+      analysisError: undefined,
+    }),
+  });
+  res.json({ ok: true, id: req.params.id, status: 'paused', pausedAt });
+});
+
+// Pinned studio materials are not trend_videos records, so the regular
+// /:id/reanalyze route cannot queue them. Create a tenant-scoped pipeline record
+// first, then analyze the original material while exposing every state through
+// the same scheduler stats used by crawled videos.
+videosRouter.post('/material-exact-analysis', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const materialId = String(req.body?.materialId || '').trim();
+  const rawMaterialId = materialId.replace(/^pb-/, '');
+  const title = String(req.body?.title || '置顶素材').trim().slice(0, 200);
+  const platform = (['tiktok', 'instagram', 'youtube', 'facebook'].includes(String(req.body?.platform))
+    ? req.body.platform : 'tiktok') as Platform;
+  const duration = Math.max(0, Number(req.body?.duration || 0));
+  if (!materialId) { res.status(400).json({ error: 'materialId is required' }); return; }
+
+  let material: Material | null = null;
+  let cloudRecord: Record<string, unknown> | null = null;
+  if (materialId.startsWith('pb-')) {
+    cloudRecord = await getCloudMaterialRecord(rawMaterialId, tenantId);
+    const scope = String(cloudRecord?.scope || 'own');
+    if (!cloudRecord) {
+      res.status(404).json({ error: 'Material not found' });
+      return;
+    }
+    material = {
+      id: materialId,
+      name: String(cloudRecord.title || cloudRecord.sourceName || title),
+      folder: String(cloudRecord.folder || 'upload'),
+      type: 'video',
+      duration: Number(cloudRecord.duration || duration),
+      size: humanSize(Number(cloudRecord.sizeBytes || 0)),
+      file: String(cloudRecord.videoFile || ''),
+      url: `/api/overseas/studio/materials/pb/${rawMaterialId}/media`,
+      poster: `/api/overseas/studio/materials/pb/${rawMaterialId}/poster`,
+      scope: scope === 'shared' ? 'shared' : 'own',
+      tenantId: String(cloudRecord.tenantId || cloudRecord.tenant_id || ''),
+      createdAt: String(cloudRecord.created || new Date().toISOString()),
+    };
+  } else {
+    material = loadMaterials().find(item => item.id === materialId
+      && (item.scope === 'shared' || item.tenantId === tenantId)) || null;
+    if (!material) { res.status(404).json({ error: 'Material not found' }); return; }
+  }
+  if (material.type !== 'video') { res.status(400).json({ error: 'Only video materials can be analyzed' }); return; }
+
+  const existingPage = await store.list<Record<string, unknown>>(COL, { where: { tenantId }, page: 1, perPage: 500 });
+  const existing = existingPage.items.find(item => {
+    const analysis = parseJsonRecord<Record<string, unknown>>(item.aiAnalysis, {});
+    return String(analysis.materialId || '') === materialId;
+  });
+  const analysisRunId = randomUUID();
+  const queuedAt = new Date().toISOString();
+  const queueAnalysis = {
+    ...(existing ? parseJsonRecord<Record<string, unknown>>(existing.aiAnalysis, {}) : {}),
+    materialId,
+    materialUrl: material.url,
+    materialPoster: material.poster,
+    analysisSource: 'studio-material-exact',
+    analysisRunId,
+    analysisRunMode: 'exact',
+    requestedAnalysisMode: 'exact',
+    analysisMode: 'strategy',
+    analysisQuality: 'segment_grounded',
+    geminiStatus: 'queued',
+    downloadStatus: 'analyzing',
+    videoFetchStatus: 'fetched',
+    analysisQueuedAt: queuedAt,
+    reanalyzeQueuedAt: queuedAt,
+    analysisError: undefined,
+    videoLevelFailureStatus: undefined,
+    userVisible: true,
+  };
+  let record: Record<string, unknown> | null = existing || null;
+  if (existing) {
+    await store.update(COL, String(existing.id), { status: 'pending' as VideoStatus, aiAnalysis: JSON.stringify(queueAnalysis) });
+  } else {
+    record = await store.create(COL, {
+      tenantId,
+      contentFormat: 'video',
+      platform,
+      title: title || material.name,
+      thumbnailUrl: material.poster || '',
+      videoFileId: '',
+      duration: material.duration || duration,
+      sourceUrl: '',
+      tags: JSON.stringify(['置顶素材', '全片精确分析']),
+      aiAnalysis: JSON.stringify(queueAnalysis),
+      status: 'pending' as VideoStatus,
+      crawledAt: queuedAt,
+    });
+  }
+  const recordId = String(record?.id || existing?.id || '');
+  if (!recordId) { res.status(500).json({ error: 'Failed to create analysis task' }); return; }
+
+  void (async () => {
+    fs.mkdirSync(ANALYSIS_DIR, { recursive: true });
+    const tempPath = path.join(ANALYSIS_DIR, `studio-material-${recordId}-${analysisRunId}.mp4`);
+    try {
+      if (materialId.startsWith('pb-')) {
+        const response = await fetchCloudMaterial(rawMaterialId, 'videoFile', undefined, tenantId);
+        if (!response?.ok) throw new Error('云端素材文件不可读');
+        fs.writeFileSync(tempPath, Buffer.from(await response.arrayBuffer()));
+      } else if (material!.objectKey) {
+        const downloaded = await objectStorageDownload(material!.objectKey);
+        if (!downloaded?.buf.length) throw new Error('COS 素材文件不可读');
+        fs.writeFileSync(tempPath, downloaded.buf);
+      } else {
+        const localPath = path.join(MEDIA_DIR, material!.file);
+        if (!fs.existsSync(localPath)) throw new Error('本地素材文件不存在');
+        fs.copyFileSync(localPath, tempPath);
+      }
+      await analyzeDownloadedMaterial(recordId, tempPath, material!, 'exact', analysisRunId);
+    } catch (error) {
+      const latest = await store.getById<Record<string, unknown>>(COL, recordId);
+      const previous = parseJsonRecord<Record<string, unknown>>(latest?.aiAnalysis, {});
+      if (String(previous.analysisRunId || '') === analysisRunId) {
+        await store.update(COL, recordId, {
+          status: 'failed' as VideoStatus,
+          aiAnalysis: JSON.stringify({
+            ...previous,
+            requestedAnalysisMode: undefined,
+            geminiStatus: 'video_failed',
+            analysisError: compactVideoPipelineError(error instanceof Error ? error.message : String(error)),
+            videoLevelFailureStatus: '全片精确分析失败，可重试',
+          }),
+        });
+      }
+    } finally {
+      try { fs.unlinkSync(tempPath); } catch { /* best effort */ }
+    }
+  })();
+
+  res.status(202).json({ status: 'pending', id: recordId, queuedAt });
+});
+
+// ─── PATCH /videos/:id/reanalyze ─────────────────────────────────────────────
+videosRouter.patch('/:id/reanalyze', async (req, res) => {
+  const { tenantId, userId } = res.locals as AuthLocals;
+  const record = await store.getById(COL, req.params.id);
+
+  if (!record) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  if (record.tenantId !== tenantId && !await requireAdminUser(req)) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+
+  const analysisMode = req.body?.analysisMode === 'exact' ? 'exact' : 'strategy';
+  const previous = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+  const analysisRunId = randomUUID();
+  const fileId = record.videoFileId as string | undefined;
+  const recordTenantId = String(record.tenantId || tenantId);
+  if (analysisMode === 'exact'
+    && req.body?.force !== true
+    && Boolean(fileId)
+    && previous.analysisQuality === 'video'
+    && canPromoteExistingAnalysisToExact(previous.gemini, Number(record.duration || 0))) {
+    resetCrawlerOpsTaskForExplicitRetry({ recordId: req.params.id, tenantId: recordTenantId, userId, usesSourceQueue: false });
+    await store.update(COL, req.params.id, {
+      status: 'analyzed',
+      aiAnalysis: JSON.stringify({
+        ...previous,
+        ...videoSuccessVisibilityPatch(),
+        analysisMode: 'exact',
+        analysisQuality: 'video',
+        requestedAnalysisMode: undefined,
+        geminiStatus: 'analyzed',
+        downloadStatus: 'analyzed',
+        videoFetchStatus: 'fetched',
+        videoStorage: previous.videoObjectKey ? 'cos' : (previous.videoStorage || 'pocketbase'),
+        videoLevelFailureStatus: undefined,
+        manualRequiredReason: undefined,
+        analysisError: undefined,
+        downloadError: undefined,
+        analysisPausedAt: undefined,
+        analysisPausedBy: undefined,
+        exactPromotedFromExisting: true,
+        exactAnalyzedAt: new Date().toISOString(),
+      }),
+    });
+    res.json({ status: 'analyzed', reused: true });
+    return;
+  }
+  if (!fileId) {
+    const sourceUrl = String(record.sourceUrl || '').trim();
+    if (!/^https?:\/\//i.test(sourceUrl)) {
+      res.status(400).json({ error: 'No video file or public sourceUrl attached to this record' });
+      return;
+    }
+    const retryResetAt = new Date().toISOString();
+    resetCrawlerOpsTaskForExplicitRetry({ recordId: req.params.id, tenantId: recordTenantId, userId, usesSourceQueue: true, now: retryResetAt });
+    const queuedRecord = { ...record, aiAnalysis: JSON.stringify({ ...previous, requestedAnalysisMode: analysisMode, analysisRunId, analysisRunMode: analysisMode, analysisPausedAt: undefined, analysisPausedBy: undefined, analysisError: undefined, downloadError: undefined, crawlerOpsLastError: undefined, crawlerOpsReason: 'explicit_reanalyze_started', crawlerOpsStatus: 'processing', crawlerOpsAttempt: 0, crawlerOpsRetryResetAt: retryResetAt, crawlerOpsRetryResetBy: userId }) };
+    await store.update(COL, req.params.id, { aiAnalysis: queuedRecord.aiAnalysis });
+    await queueAnalyzeSource(queuedRecord);
+    res.json({ status: 'pending', analysisRunId });
+    return;
+  }
+
+  const retryResetAt = new Date().toISOString();
+  resetCrawlerOpsTaskForExplicitRetry({ recordId: req.params.id, tenantId: recordTenantId, userId, usesSourceQueue: false, now: retryResetAt });
+  await store.update(COL, req.params.id, {
+    status: 'pending',
+    aiAnalysis: JSON.stringify({ ...previous, requestedAnalysisMode: analysisMode, analysisRunId, analysisRunMode: analysisMode, analysisError: undefined, downloadError: undefined, crawlerOpsLastError: undefined, crawlerOpsReason: 'explicit_reanalyze_uses_local_file', crawlerOpsStatus: 'resolved', crawlerOpsAttempt: 0, analysisPausedAt: undefined, analysisPausedBy: undefined, reanalyzeQueuedAt: retryResetAt, crawlerOpsRetryResetAt: retryResetAt, crawlerOpsRetryResetBy: userId }),
+  });
+  const localPath = localReferenceVideoPath(fileId, recordTenantId) || path.join(MEDIA_DIR, fileId);
+  if (fs.existsSync(localPath)) {
+    void analyzeDownloadedMaterial(req.params.id, localPath, {
+      id: String(previous.materialId || path.parse(fileId).name),
+      name: String(record.title || fileId),
+      folder: 'hot',
+      type: 'video',
+      duration: Number(record.duration || 0),
+      size: humanSize(fs.statSync(localPath).size),
+      file: fileId,
+      url: `/media/${fileId}`,
+      poster: String(previous.materialPoster || record.thumbnailUrl || '') || undefined,
+      scope: 'own',
+      createdAt: new Date().toISOString(),
+    }, analysisMode, analysisRunId);
+  } else {
+    void triggerVideoAnalysis(req.params.id, fileId, undefined, userId, analysisRunId);
+  }
+
+  res.json({ status: 'pending', analysisRunId });
+});
+
+// ─── Internal: async AI analysis ─────────────────────────────────────────────
+async function triggerVideoAnalysis(
+  recordId: string,
+  filename: string | undefined,
+  mimeType: string | undefined,
+  _userId: string,
+  expectedRunId?: string,
+): Promise<void> {
+  if (!filename) {
+    await store.update(COL, recordId, { status: 'failed' });
+    return;
+  }
+
+  let tempPath = '';
+  let runId = expectedRunId || '';
+  try {
+    const record = await store.getById<Record<string, unknown>>(COL, recordId);
+    const previousRecordAnalysis = parseJsonRecord<Record<string, unknown>>(record?.aiAnalysis, {});
+    const localReference = localReferenceVideoPath(filename, String(record?.tenantId || ''));
+    let dl = localReference && fs.existsSync(localReference)
+      ? { buf: fs.readFileSync(localReference), contentType: 'video/mp4' }
+      : previousRecordAnalysis.videoObjectKey
+      ? await objectStorageDownload(String(previousRecordAnalysis.videoObjectKey))
+      : await fetchFile(COL, recordId, filename);
+    // COS/S3-compatible storage can briefly return an empty/not-found response
+    // while HEAD succeeds (gateway propagation or a transient upstream miss).
+    // Retry the same immutable object key twice before surfacing a real failure.
+    if (!dl && previousRecordAnalysis.videoObjectKey) {
+      for (const delayMs of [500, 1500]) {
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+        dl = await objectStorageDownload(String(previousRecordAnalysis.videoObjectKey));
+        if (dl) break;
+      }
+    }
+    if (!dl) throw new Error('video file fetch failed');
+
+    if (!fs.existsSync(ANALYSIS_DIR)) fs.mkdirSync(ANALYSIS_DIR, { recursive: true });
+    tempPath = path.join(ANALYSIS_DIR, `upload-${recordId}-${Date.now()}.${mimeFromPath(filename).split('/').pop() || 'mp4'}`);
+    fs.writeFileSync(tempPath, dl.buf);
+    const previous = parseJsonRecord<Record<string, unknown>>(record?.aiAnalysis, {});
+    runId = runId || String(previous.analysisRunId || randomUUID());
+    await store.update(COL, recordId, {
+      status: 'pending' as VideoStatus,
+      aiAnalysis: JSON.stringify({
+        ...previous,
+        manualVideoUploadStatus: 'analyzing',
+        downloadStatus: 'uploaded',
+        videoFetchStatus: 'manual_upload',
+        geminiStatus: 'analyzing',
+        analysisSource: 'gemini-upload-video',
+        geminiStartedAt: new Date().toISOString(),
+        analysisRunId: runId,
+        analysisRunMode: previous.requestedAnalysisMode === 'strategy' ? 'strategy' : 'exact',
+      }),
+    });
+    updateVideoAdminAlertByRecordId(recordId, {
+      statusLabel: '已上传/分析中',
+      manualUploadStatus: 'analyzing',
+      error: '缺失视频已补充，Gemini 视频级分析处理中。',
+    });
+    const result = await analyzeDownloadedVideoWithFallback({
+      filePath: tempPath,
+      mimeType: mimeType ?? dl.contentType,
+      title: String(record?.title || ''),
+      platform: record?.platform as Platform | undefined,
+      duration: Number(record?.duration || 0),
+      tags: parseJsonRecord<string[]>(record?.tags, []),
+      sourceLabel: 'gemini-upload-video',
+      analysisMode: previous.requestedAnalysisMode === 'strategy' ? 'strategy' : 'exact',
+    });
+    if (previous.requestedAnalysisMode !== 'strategy') {
+      result.analysis = await persistExactShotEvidence(recordId, tempPath, result.analysis);
+    }
+    cleanupTempVideo(tempPath);
+    tempPath = '';
+    const latest = await store.getById<Record<string, unknown>>(COL, recordId);
+    const latestAnalysis = parseJsonRecord<Record<string, unknown>>(latest?.aiAnalysis ?? record?.aiAnalysis, {});
+    if (String(latestAnalysis.analysisRunId || '') !== runId) {
+      console.warn(`[videos] stale analysis success ignored for ${recordId}: ${runId}`);
+      return;
+    }
+
+    await store.update(COL, recordId, {
+      aiAnalysis: JSON.stringify({
+        ...latestAnalysis,
+        ...videoLevelSuccessPatch({
+          analysis: result.analysis,
+          source: result.source,
+          videoFetchStatus: 'manual_upload',
+          extra: { manualVideoUploadStatus: 'analyzed', analysisMode: previous.requestedAnalysisMode === 'strategy' ? 'strategy' : 'exact', requestedAnalysisMode: undefined },
+        }),
+      }),
+      status: 'analyzed',
+    });
+    updateVideoAdminAlertByRecordId(recordId, {
+      statusLabel: '已上传/分析完成',
+      manualUploadStatus: 'analyzed',
+      error: '补充视频已完成 Gemini 视频级分析，已可进入灵感大屏展示。',
+    });
+    console.log(`[videos] analyzed ${recordId}`);
+  } catch (e) {
+    console.error(`[videos] analysis failed for ${recordId}:`, e);
+    if (tempPath) cleanupTempVideo(tempPath);
+    const record = await store.getById<Record<string, unknown>>(COL, recordId);
+    const previous = parseJsonRecord<Record<string, unknown>>(record?.aiAnalysis, {});
+    if (runId && String(previous.analysisRunId || '') !== runId) {
+      console.warn(`[videos] stale analysis failure ignored for ${recordId}: ${runId}`);
+      return;
+    }
+    const compactError = compactVideoPipelineError(e instanceof Error ? e.message : e);
+    await store.update(COL, recordId, {
+      status: 'analyzed' as VideoStatus,
+      aiAnalysis: JSON.stringify({
+        ...previous,
+        manualVideoUploadStatus: 'failed',
+        downloadStatus: 'manual_upload_analyze_failed',
+        videoFetchStatus: 'manual_upload',
+        geminiStatus: 'video_failed',
+        requestedAnalysisMode: undefined,
+        analysisError: compactError,
+        videoLevelFailureStatus: '视频级失败/需人工处理',
+        manualRequiredReason: 'manual_upload_analysis_failed',
+        userVisible: false,
+      }),
+    });
+    updateVideoAdminAlertByRecordId(recordId, {
+      statusLabel: '上传后分析失败',
+      manualUploadStatus: 'failed',
+      error: compactError,
+    });
+  }
+}
+
+export async function attachManualVideoUploadAndQueue(input: {
+  recordId: string;
+  videoBase64: string;
+  mimeType?: string;
+  filename?: string;
+  uploadedBy?: string;
+}): Promise<{ recordId: string; filename: string; status: 'queued' }> {
+  const record = await store.getById<Record<string, unknown>>(COL, input.recordId);
+  if (!record) throw new Error('Video record not found');
+
+  const mimeType = input.mimeType?.trim() || mimeFromPath(input.filename || 'video.mp4');
+  if (!/^video\//i.test(mimeType)) throw new Error('Only video files can be uploaded');
+  const raw = input.videoBase64.replace(/^data:[^,]+,/, '');
+  const buf = Buffer.from(raw, 'base64');
+  if (!buf.length) throw new Error('Video file is empty');
+  if (buf.length > MANUAL_UPLOAD_MAX_BYTES) throw new Error('视频压缩后仍超过 10MB，请换更短的视频或降低清晰度后再上传。');
+
+  const ext = safeVideoExtension(input.filename, mimeType);
+  const previewBuf = await compressVideoBufferForPocketBase(buf, ext);
+  const storedFilename = await uploadCrawlerCosObject(input.recordId, 'video', previewBuf, 'video/mp4');
+  if (!storedFilename) throw new Error('Video upload failed');
+
+  const previous = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+  await store.update(COL, input.recordId, {
+    videoFileId: storedFilename,
+    status: 'pending' as VideoStatus,
+    aiAnalysis: JSON.stringify({
+      ...previous,
+      videoStorage: 'cos',
+      videoObjectKey: storedFilename,
+      manualVideoUploadedAt: new Date().toISOString(),
+      manualVideoUploadedBy: input.uploadedBy,
+      manualVideoUploadStatus: 'queued',
+      downloadStatus: 'uploaded',
+      videoFetchStatus: 'manual_upload',
+      geminiStatus: 'queued',
+      analysisSource: 'gemini-upload-video',
+      userVisible: false,
+      adminOnlyVideoFailure: undefined,
+      videoLevelFailureStatus: undefined,
+      manualRequiredReason: undefined,
+      downloadError: undefined,
+      analysisError: undefined,
+    }),
+  });
+
+  updateVideoAdminAlertByRecordId(input.recordId, {
+    statusLabel: '已上传/分析排队',
+    manualUploadStatus: 'queued',
+    manualUploadedAt: new Date().toISOString(),
+    manualUploadRecordId: input.recordId,
+    error: '缺失视频已补充，等待 Gemini 视频级分析。',
+  });
+
+  void triggerVideoAnalysis(input.recordId, storedFilename, mimeType, input.uploadedBy || 'admin').catch((e) => {
+    console.warn('[videos] manual upload analysis failed:', e instanceof Error ? e.message : e);
+  });
+
+  return { recordId: input.recordId, filename: storedFilename, status: 'queued' };
+}
+
+async function handleAnalyzeSource(
+  req: Request,
+  res: Response,
+  input: { id?: string; sourceUrl?: string; title?: string; platform?: Platform; async?: boolean },
+): Promise<void> {
+  const { tenantId } = res.locals as AuthLocals;
+  try {
+    let record: Record<string, unknown> | null = null;
+    if (input.id) {
+      record = await store.getById(COL, input.id);
+      if (!record || (record.tenantId !== tenantId && !await requireAdminUser(req))) {
+        res.status(404).json({ error: 'Video record not found' });
+        return;
+      }
+    }
+
+    const source = resolvedPublicVideoSource(record, input);
+    if (!source) {
+      res.status(400).json({ error: '只允许当前记录绑定的 YouTube、TikTok、Instagram 或 Facebook HTTPS 单条视频链接' });
+      return;
+    }
+    const job = {
+      record,
+      sourceUrl: source.sourceUrl,
+      title: String(input.title || record?.title || `${source.platform}-video`),
+      platform: source.platform,
+    };
+
+    if (input.async && record?.id) {
+      if (!shouldQueueVideoAnalysis(record)) {
+        res.status(202).json({ ok: true, status: 'already_queued', id: record.id });
+        return;
+      }
+      await queueAnalyzeSource(record, job);
+      res.status(202).json({ ok: true, status: 'queued', id: record.id });
+      return;
+    }
+
+    const analysis = await analyzeSourceVideoJob(job);
+    res.status(200).json({ ok: true, analysis });
+  } catch (e) {
+    console.error('[videos] analyze-source failed:', e);
+    res.status(502).json({ error: e instanceof Error ? e.message : 'Video analysis failed' });
+  }
+}
+
+async function queueAnalyzeSource(
+  record: Record<string, unknown>,
+  job?: { record: Record<string, unknown> | null; sourceUrl: string; title: string; platform: Platform },
+): Promise<void> {
+  const remoteUrl = String(job?.sourceUrl || record.sourceUrl || '').trim();
+  const platform = (job?.platform || record.platform || inferPlatformFromUrl(remoteUrl)) as Platform;
+  const analysis = parseJsonRecord(record.aiAnalysis, {});
+  await store.update(COL, String(record.id), {
+    status: 'pending' as VideoStatus,
+    aiAnalysis: JSON.stringify({
+      ...analysis,
+      downloadStatus: 'queued',
+      videoFetchStatus: 'queued',
+      geminiStatus: 'waiting_for_video',
+      analysisSource: 'gemini-temp-video',
+      analysisError: undefined,
+      downloadError: undefined,
+      analysisQueuedAt: new Date().toISOString(),
+    }),
+  });
+  void analyzeSourceVideoJob(job || {
+    record,
+    sourceUrl: remoteUrl,
+    title: String(record.title || `${platform}-video`),
+    platform,
+  }).catch((e) => {
+    console.warn('[videos] async analyze-source failed:', e instanceof Error ? e.message : e);
+  });
+}
+
+/** Internal service entry used by task-scoped viral replication. It upgrades
+ * an existing tenant-owned trend record to full-video exact analysis without
+ * exposing the admin reanalyze route or trusting a caller-supplied tenant. */
+export async function queueExactSourceAnalysisForTenant(input: {
+  tenantId: string;
+  recordId: string;
+}): Promise<'already_ready' | 'queued'> {
+  const record = await store.getById<Record<string, unknown>>(COL, input.recordId);
+  if (!record || String(record.tenantId || '') !== input.tenantId) throw new Error('Trend video not found');
+  const previous = videoAnalysisOf(record);
+  if (hasCompletedExactVideoEvidence(previous)) {
+    // An earlier queue attempt could mark a local:// upload as
+    // waiting_for_video before failing public-URL validation. Restore the
+    // completed exact evidence in place; keep its run id and source hash so
+    // existing Director review and verified speech remain version-bound.
+    if (String(record.sourceUrl || '').startsWith('local://')
+      && (previous.requestedAnalysisMode === 'exact'
+        || ['queued', 'waiting_for_video', 'analyzing'].includes(String(previous.geminiStatus || '')))) {
+      await store.update(COL, input.recordId, {
+        status: 'analyzed' as VideoStatus,
+        aiAnalysis: JSON.stringify({
+          ...previous,
+          requestedAnalysisMode: undefined,
+          geminiStatus: previous.analysisQuality === 'video_review_required' ? 'needs_review' : 'analyzed',
+          analysisError: undefined,
+          downloadError: undefined,
+        }),
+      });
+    }
+    return 'already_ready';
+  }
+  if (String(previous.requestedAnalysisMode) === 'exact'
+    && ['queued', 'waiting_for_video', 'analyzing'].includes(String(previous.geminiStatus || ''))
+    && !(previous.geminiStatus === 'waiting_for_video' && previous.analysisError)) {
+    return 'queued';
+  }
+  const analysisRunId = randomUUID();
+  const nextAnalysis = {
+    ...previous,
+    requestedAnalysisMode: 'exact',
+    analysisRunId,
+    analysisRunMode: 'exact',
+    geminiStatus: 'queued',
+    analysisQueuedAt: new Date().toISOString(),
+    analysisError: undefined,
+  };
+  await store.update(COL, input.recordId, {
+    status: 'pending' as VideoStatus,
+    aiAnalysis: JSON.stringify(nextAnalysis),
+  });
+  await queueAnalyzeSource({ ...record, aiAnalysis: JSON.stringify(nextAnalysis) });
+  return 'queued';
+}
+
+async function enqueueCrawledRecordsForAnalysis(records: unknown[]): Promise<void> {
+  for (const raw of records) {
+    const record = raw as Record<string, unknown>;
+    const id = String(record.id || '');
+    if (!id) continue;
+    const latest = await store.getById(COL, id);
+    if (!latest || !shouldQueueVideoAnalysis(latest)) continue;
+    await queueAnalyzeSource(latest);
+  }
+}
+
+// TikTok 等平台的缩略图是带签名的临时链接（x-expires），过期后 403，前端只能渲染兜底卡。
+// 抓到这类链接后要尽快下载落盘到 /media，把记录改成永久可用的本地地址。
+function signedThumbnailExpiry(url: string): number | null {
+  const x = /[?&]x-expires?=(\d+)/i.exec(url);
+  if (x) {
+    const ts = Number(x[1]);
+    return Number.isFinite(ts) ? ts * 1000 : null;
+  }
+  // Facebook/Instagram CDN 的过期时间放在十六进制 oe= 参数里
+  if (/\bfbcdn\.net\/|\bcdninstagram\.com\//i.test(url)) {
+    const oe = /[?&]oe=([0-9A-Fa-f]{6,12})(?:&|$)/.exec(url);
+    if (oe) {
+      const ts = parseInt(oe[1], 16);
+      return Number.isFinite(ts) ? ts * 1000 : null;
+    }
+  }
+  return null;
+}
+
+function isSignedExpiringThumbnail(url: string): boolean {
+  return /^https?:\/\//i.test(url) && signedThumbnailExpiry(url) !== null;
+}
+
+function isExpiredSignedThumbnail(url: string): boolean {
+  const exp = signedThumbnailExpiry(url);
+  return exp !== null && exp < Date.now() + 60_000;
+}
+
+function isMissingLocalThumbnail(url: string): boolean {
+  if (!url.startsWith('/media/')) return false;
+  return !fs.existsSync(path.join(MEDIA_DIR, path.basename(url)));
+}
+
+/** 封面在应用内的稳定地址：指向记录自己，不依赖任何本地目录。 */
+export function recordThumbnailUrl(recordId: string): string {
+  return `/api/overseas/videos/${recordId}/thumbnail`;
+}
+
+function isRecordThumbnailUrl(url: string): boolean {
+  return /^\/api\/overseas\/videos\/[^/]+\/thumbnail$/.test(url);
+}
+
+/**
+ * 抓取远端封面并存进记录自己的 PocketBase file 字段。
+ *
+ * 之前这里只写 data/media/<id>.thumb.jpg —— 那个目录属于单个代码副本，
+ * 而 PocketBase 是多个副本共用的，于是换目录跑 = 封面集体 404。
+ * 现在图片跟记录绑在一起；本地文件只作为写入失败时的兜底。
+ */
+async function cacheThumbnailLocally(recordId: string, url: string): Promise<string | null> {
+  try {
+    const resp = await fetch(url, {
+      signal: AbortSignal.timeout(20_000),
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/125 Safari/537.36',
+        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+      },
+    });
+    if (!resp.ok) return null;
+    const type = resp.headers.get('content-type') || '';
+    if (!type.startsWith('image/')) return null;
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (!buf.length || buf.length > 5 * 1024 * 1024) return null;
+    return await storeThumbnailBuffer(recordId, buf, type);
+  } catch {
+    return null;
+  }
+}
+
+/** 把封面字节写进 PB 文件字段；PB 不可用时退回本地目录，保证抓取链路不被卡死。 */
+async function storeThumbnailBuffer(recordId: string, buf: Buffer, contentType: string): Promise<string | null> {
+  const ext = contentType.includes('png') ? 'png' : contentType.includes('webp') ? 'webp' : 'jpg';
+  try {
+    const key = await uploadCrawlerCosObject(recordId, 'thumbnail', buf, contentType);
+    const record = await store.getById<Record<string, unknown>>(COL, recordId);
+    const analysis = parseJsonRecord<Record<string, unknown>>(record?.aiAnalysis, {});
+    await store.update(COL, recordId, {
+      aiAnalysis: JSON.stringify({ ...analysis, thumbnailStorage: 'cos', thumbnailObjectKey: key, thumbnailExtension: ext }),
+    });
+    return recordThumbnailUrl(recordId);
+  } catch (error) {
+    console.warn('[videos] COS thumbnail persistence failed:', error instanceof Error ? error.message : error);
+    return null;
+  }
+}
+
+async function persistThumbnailIfExpiring(recordId: string, url: string): Promise<void> {
+  if (!/^https?:\/\//i.test(url)) return;
+  const local = await cacheThumbnailLocally(recordId, url);
+  if (local) await store.update(COL, recordId, { thumbnailUrl: local });
+}
+
+// 图文 CDN 地址普遍会过期或限制浏览器热链。图文入库时始终把首图落到本地，
+// 不能只依赖少数已知的签名参数（不同 Apify actor 返回的 URL 结构并不一致）。
+async function persistImagePostThumbnail(recordId: string, url: string): Promise<string> {
+  if (!/^https?:\/\//i.test(url)) return url;
+  const local = await cacheThumbnailLocally(recordId, url);
+  if (!local) return url;
+  await store.update(COL, recordId, { thumbnailUrl: local });
+  return local;
+}
+
+async function persistImagePostImages(recordId: string, urls: string[]): Promise<string[]> {
+  const unique = [...new Set(urls.filter(Boolean))].slice(0, 10);
+  const stored: string[] = [];
+  const objectKeys: string[] = [];
+  for (let index = 0; index < unique.length; index += 1) {
+    const url = unique[index]!;
+    if (!/^https?:\/\//i.test(url)) { stored.push(url); continue; }
+    const image = await fetchImageForAnalysis(url);
+    if (!image) continue;
+    const key = await uploadCrawlerCosObject(recordId, `image-${index + 1}`, Buffer.from(image.base64, 'base64'), image.mimeType);
+    objectKeys.push(key);
+    stored.push(`/api/overseas/videos/${recordId}/image/${objectKeys.length - 1}`);
+  }
+  const record = await store.getById<Record<string, unknown>>(COL, recordId);
+  const analysis = parseJsonRecord<Record<string, unknown>>(record?.aiAnalysis, {});
+  await store.update(COL, recordId, {
+    aiAnalysis: JSON.stringify({ ...analysis, imageStorage: 'cos', imageObjectKeys: objectKeys }),
+  });
+  return stored;
+}
+
+async function recrawlImagePostThumbnail(record: Record<string, unknown>): Promise<string> {
+  const platform = String(record.platform || '') as Platform;
+  const sourceUrl = String(record.sourceUrl || '').trim();
+  if (!sourceUrl) return '';
+
+  // Instagram 的公开 media 端点会重定向到当前有效的 CDN 图片，不需要登录态，
+  // 可用于恢复数据库仍在但本地缓存文件已丢失的历史图文。
+  if (platform === 'instagram' && /instagram\.com\/p\/[^/?#]+\/?$/i.test(sourceUrl)) {
+    return `${sourceUrl.replace(/\/$/, '')}/media/?size=l`;
+  }
+  if (!process.env.APIFY_TOKEN?.trim()) return '';
+
+  try {
+    if (platform === 'instagram') {
+      const actor = process.env.APIFY_INSTAGRAM_ACTOR?.trim() || 'apify/instagram-scraper';
+      const rows = await runApifyActorDatasetItems(actor, {
+        directUrls: [sourceUrl],
+        resultsType: 'posts',
+        resultsLimit: 1,
+        addParentData: false,
+      }, Number(process.env.APIFY_TIMEOUT_MS || 240_000), 'Instagram thumbnail repair');
+      return firstImageUrl(rows.map(item => [item.displayUrl, item.images, item]));
+    }
+  } catch (error) {
+    console.warn('[videos] image post thumbnail recrawl failed:', error instanceof Error ? error.message : error);
+  }
+  return '';
+}
+
+export async function repairMissingCrawledThumbnails(records: unknown[], limit = 5): Promise<number> {
+  const normalizedRecords = records.map(raw => raw as Record<string, unknown>);
+  const candidates = normalizedRecords
+    .filter(record => ['youtube', 'tiktok', 'facebook', 'instagram'].includes(String(record.platform || '')))
+    .filter(record => /^https?:\/\//i.test(String(record.sourceUrl || '')))
+    .filter(record => {
+      const thumb = normalizeThumbnailUrl(String(record.thumbnailUrl || ''));
+      const stableYouTubeThumbnail = record.platform === 'youtube'
+        ? youtubeThumbnailFromUrl(String(record.sourceUrl || ''))
+        : '';
+      return !thumb
+        || isMissingLocalThumbnail(thumb)
+        || isSignedExpiringThumbnail(thumb)
+        || Boolean(stableYouTubeThumbnail && thumb !== stableYouTubeThumbnail)
+        || canonicalSourceUrl(record.platform as Platform, String(record.sourceUrl || ''), '') !== String(record.sourceUrl || '');
+    })
+    .slice(0, Math.max(1, limit));
+
+  let repaired = 0;
+  for (const record of candidates) {
+    try {
+      const platform = record.platform as Platform;
+      const existingSourceUrl = String(record.sourceUrl || '');
+      const canonicalUrl = canonicalSourceUrl(platform, existingSourceUrl, '');
+      const existingThumbnail = normalizeThumbnailUrl(String(record.thumbnailUrl || ''));
+      const usableExistingThumbnail = isMissingLocalThumbnail(existingThumbnail) ? '' : existingThumbnail;
+      // YouTube may return hq720/custom thumbnails that later become 404.
+      // The standard hqdefault endpoint is stable for public videos, so always
+      // canonicalize old YouTube thumbnail URLs during opportunistic repair.
+      let thumbnailUrl = platform === 'youtube'
+        ? youtubeThumbnailFromUrl(canonicalUrl)
+        : thumbnailForPlatform(platform, canonicalUrl, usableExistingThumbnail);
+      let sourceUrl = canonicalUrl;
+      const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+      if (!thumbnailUrl && analysis.contentFormat === 'image') {
+        const refreshedImage = await recrawlImagePostThumbnail(record);
+        if (refreshedImage) {
+          const local = await cacheThumbnailLocally(String(record.id), refreshedImage);
+          thumbnailUrl = local || refreshedImage;
+        }
+      }
+      if (!thumbnailUrl || isExpiredSignedThumbnail(thumbnailUrl)) {
+        const meta = await crawlYtDlpMetadata(platform, sourceUrl, String(record.title || platform));
+        sourceUrl = meta.sourceUrl || sourceUrl;
+        thumbnailUrl = meta.thumbnailUrl || thumbnailUrl;
+      }
+      if (isSignedExpiringThumbnail(thumbnailUrl) && !isExpiredSignedThumbnail(thumbnailUrl)) {
+        const local = await cacheThumbnailLocally(String(record.id), thumbnailUrl);
+        if (local) thumbnailUrl = local;
+      }
+      if (thumbnailUrl && (sourceUrl !== existingSourceUrl || thumbnailUrl !== String(record.thumbnailUrl || ''))) {
+        await store.update(COL, String(record.id), { sourceUrl, thumbnailUrl });
+        repaired += 1;
+      }
+    } catch (e) {
+      console.warn('[videos] thumbnail repair skipped:', e instanceof Error ? e.message : e);
+    }
+  }
+  return repaired;
+}
+
+// 提交全片精确分析时会写入 requestedAnalysisMode，而清掉它的只有两条路径：分析成功，
+// 或 persistManualVideoFailure 记录失败。两者都没走到时（服务重启、手动上传的分析没触发、
+// 运维任务丢失），标记就永远留在记录上——前端「精确分析生成中…」按钮是 disabled 的，
+// 用户连重试都点不了。超时后主动释放，让它退回可重试状态。
+const EXACT_ANALYSIS_STALL_MS = Math.max(
+  5 * 60_000,
+  Number(process.env.EXACT_ANALYSIS_STALL_MS || 5 * 60_000),
+);
+
+// 卡住的记录是少数，但分布在整个库里，只扫第一页会漏。全量翻页，靠节流控制开销。
+const lastStallSweepAt = new Map<string, number>();
+
+async function releaseStalledExactAnalysis(forceInterrupted = false, tenantId?: string): Promise<number> {
+  const now = Date.now();
+  const sweepKey = `${currentDataAuthority() || 'default'}:${tenantId || '__global__'}`;
+  const lastSweep = lastStallSweepAt.get(sweepKey) || 0;
+  if (!forceInterrupted && now - lastSweep < Math.max(60_000, Math.floor(EXACT_ANALYSIS_STALL_MS / 6))) return 0;
+  lastStallSweepAt.set(sweepKey, now);
+
+  const candidates: Record<string, unknown>[] = [];
+  let page = 1;
+  for (;;) {
+    const result = await store.list<Record<string, unknown>>(COL, { where: tenantId ? { tenantId } : undefined, page, perPage: 500 });
+    for (const record of result.items) {
+      if (parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {}).requestedAnalysisMode === 'exact') {
+        candidates.push(record);
+      }
+    }
+    if (page >= result.totalPages || page >= 20) break;
+    page += 1;
+  }
+  if (!candidates.length) return 0;
+
+  // 运维队列里还在排队/处理中的不抢，交给 worker 继续跑完。
+  const inFlight = process.env.CRAWLER_OPS_WORKER_ENABLED === '0'
+    ? new Set<string>()
+    : new Set(loadCrawlerOpsTasks()
+      .filter(task => !tenantId || task.tenantId === tenantId || candidates.some(record => String(record.id || '') === task.recordId))
+      .filter(task => ['queued', 'pushed', 'processing'].includes(task.status))
+      .map(task => task.recordId));
+
+  let released = 0;
+  for (const record of candidates) {
+    const recordId = String(record.id || '');
+    if (!recordId || inFlight.has(recordId) || activeAnalysisRecords.has(recordId) || durableAnalysisRecords.has(recordId)) continue;
+    const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+    const startedAt = Date.parse(String(analysis.reanalyzeQueuedAt || record.updated || ''));
+    // The durable ownership check above also protects work in sibling local
+    // processes. Only ownerless work can be released immediately on startup.
+    if (!forceInterrupted && Number.isFinite(startedAt) && now - startedAt < EXACT_ANALYSIS_STALL_MS) continue;
+    await store.update(COL, recordId, {
+      status: 'analyzed' as VideoStatus,
+      aiAnalysis: JSON.stringify({
+        ...analysis,
+        requestedAnalysisMode: undefined,
+        // 超时的升级不能冒充已完成的精确分析。
+        analysisMode: analysis.analysisMode === 'exact' ? 'exact' : 'strategy',
+        geminiStatus: analysis.gemini ? 'analyzed' : 'video_failed',
+        videoLevelFailureStatus: analysis.videoLevelFailureStatus || '全片精确分析超时/未完成',
+        analysisError: analysis.analysisError || 'exact_analysis_stalled',
+      }),
+    });
+    released += 1;
+    console.warn(`[videos] exact analysis ${forceInterrupted ? 'interrupted by restart' : 'stalled'}, released for retry: ${recordId}`);
+  }
+  return released;
+}
+
+async function releaseStalledExactAnalysisAcrossAuthorities(forceInterrupted = false): Promise<number> {
+  let released = await releaseStalledExactAnalysis(forceInterrupted);
+  // Local demo accounts and PocketBase accounts can coexist in development.
+  // A process-level sweep has no request authority, so a healthy PocketBase
+  // connection used to make local JSON records invisible to recovery and left
+  // their UI permanently stuck on “分析中”. Sweep the explicitly enabled local
+  // authority as a second, isolated data source.
+  if (localFallbacksEnabled() && currentDataAuthority() !== 'local') {
+    released += await runWithDataAuthority('local', () => releaseStalledExactAnalysis(forceInterrupted));
+  }
+  return released;
+}
+
+export async function backfillMissingCrawledMedia(records: unknown[]): Promise<void> {
+  const normalizedRecords = records
+    .map(raw => raw as Record<string, unknown>)
+    .filter(record => recordContentFormat(record) === 'video');
+  for (const record of normalizedRecords) {
+    const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+    if (record.videoFileId && !analysis.videoStorage) {
+      await store.update(COL, String(record.id), {
+        aiAnalysis: JSON.stringify({ ...analysis, videoStorage: 'pocketbase' }),
+      });
+      record.aiAnalysis = JSON.stringify({ ...analysis, videoStorage: 'pocketbase' });
+    }
+  }
+  const storageCandidates = normalizedRecords.filter(record => {
+    const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+    const recordId = String(record.id || '');
+    const retryAfter = pocketBaseBackfillFailures.get(recordId) || 0;
+    return !record.videoFileId
+      && !analysis.videoObjectKey
+      && /^https?:\/\//i.test(String(record.sourceUrl || ''))
+      && Date.now() >= retryAfter
+      && !['downloading', 'queued', 'failed', 'download_failed', 'unavailable', 'metadata_only'].includes(String(analysis.downloadStatus || ''));
+  }).slice(0, 3);
+  for (const record of storageCandidates) {
+    const recordId = String(record.id || '');
+    void downloadMaterialJob({ record, tenantId: String(record.tenantId || ''), sourceUrl: String(record.sourceUrl), title: String(record.title || '爬取视频'), platform: record.platform as Platform, duration: Number(record.duration || 0) })
+      .then(() => pocketBaseBackfillFailures.delete(recordId))
+      .catch(error => {
+        // Failed public downloads should not be hammered every minute. Manual retry remains available.
+        pocketBaseBackfillFailures.set(recordId, Date.now() + 6 * 60 * 60 * 1000);
+        console.warn('[videos] PocketBase video backfill failed:', error instanceof Error ? error.message : error);
+      });
+  }
+  await repairMissingCrawledThumbnails(normalizedRecords, 5);
+}
+
+let pocketBaseBackfillTimer: NodeJS.Timeout | null = null;
+let pocketBaseBackfillRunning = false;
+export function initPocketBaseVideoBackfill(): void {
+  // Backfill is an operational migration, not a normal runtime responsibility.
+  // It is opt-in so local/admin/tenant dashboards cannot accidentally start a
+  // full-library media conversion merely by starting the API.
+  if (pocketBaseBackfillTimer || process.env.PB_VIDEO_BACKFILL_ENABLED !== 'true') return;
+  const run = async () => {
+    if (pocketBaseBackfillRunning) return;
+    pocketBaseBackfillRunning = true;
+    try {
+      const first = await store.list<Record<string, unknown>>(COL, { sort: '-crawledAt', page: 1, perPage: 100 });
+      const records = [...first.items];
+      for (let page = 2; page <= first.totalPages; page += 1) {
+        const next = await store.list<Record<string, unknown>>(COL, { sort: '-crawledAt', page, perPage: 100 });
+        records.push(...next.items);
+      }
+      await backfillMissingCrawledMedia(records);
+    } catch (error) {
+      console.warn('[videos] scheduled PocketBase backfill failed:', error instanceof Error ? error.message : error);
+    } finally {
+      pocketBaseBackfillRunning = false;
+    }
+  };
+  void run();
+  pocketBaseBackfillTimer = setInterval(() => void run(), Math.max(30_000, Number(process.env.PB_VIDEO_BACKFILL_INTERVAL_MS || 60_000)));
+  pocketBaseBackfillTimer.unref();
+}
+
+function shouldQueueVideoAnalysis(record: Record<string, unknown>): boolean {
+  const sourceUrl = String(record.sourceUrl || '').trim();
+  if (!/^https?:\/\//i.test(sourceUrl)) return false;
+  const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+  if (analysis.analysisPausedAt || analysis.geminiStatus === 'paused') return false;
+  const status = String(analysis.downloadStatus || '');
+  const videoFetchStatus = String(analysis.videoFetchStatus || '');
+  const geminiStatus = String(analysis.geminiStatus || '');
+  if (['metadata_only', 'analyzed'].includes(status) || ['unavailable', 'url_failed', 'ops_failed'].includes(videoFetchStatus) || geminiStatus === 'metadata_fallback') return false;
+  if (['queued', 'downloading', 'analyzing'].includes(status)) return false;
+  if (analysis.analysisQuality === 'video' && status === 'analyzed') return false;
+  const queuedAt = Date.parse(String(analysis.analysisQueuedAt || analysis.videoAnalysisAttemptedAt || ''));
+  if (Number.isFinite(queuedAt) && Date.now() - queuedAt < 5 * 60 * 1000) return false;
+  return true;
+}
+
+function resolvedPublicVideoSource(
+  record: Record<string, unknown> | null,
+  input: { sourceUrl?: string; platform?: Platform },
+): ValidatedPublicVideoSource | null {
+  return resolvePublicVideoSource({
+    recordSourceUrl: record?.sourceUrl,
+    recordPlatform: record?.platform,
+    requestedSourceUrl: input.sourceUrl,
+    requestedPlatform: input.platform,
+  });
+}
+
+async function handleDownloadMaterial(
+  req: Request,
+  res: Response,
+  input: { id?: string; sourceUrl?: string; title?: string; platform?: Platform; async?: boolean },
+): Promise<void> {
+  const { tenantId } = res.locals as AuthLocals;
+  try {
+    let record: Record<string, unknown> | null = null;
+    if (input.id) {
+      record = await store.getById(COL, input.id);
+      if (!record || (record.tenantId !== tenantId && !await requireAdminUser(req))) {
+        res.status(404).json({ error: 'Video record not found' });
+        return;
+      }
+    }
+
+    if (record) {
+      const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+      const linkedMaterialId = String(analysis.materialId || '').trim();
+      const materials = loadMaterials();
+      const linkedMaterial = materials.find(item => item.id === linkedMaterialId && item.tenantId === tenantId);
+      if (linkedMaterial) {
+        linkedMaterial.pinned = true;
+        persistMaterials(materials);
+        res.status(200).json({ ok: true, material: linkedMaterial });
+        return;
+      }
+
+      const hasStoredVideo = Boolean(analysis.videoObjectKey || record.videoFileId);
+      if (hasStoredVideo) {
+        const material = await copyStoredCrawlerVideoToMaterial({
+          record,
+          tenantId,
+          title: String(input.title || record.title || `${record.platform || 'tiktok'}-video`),
+          platform: (input.platform || record.platform || 'tiktok') as Platform,
+          duration: Number(record.duration || 0),
+        });
+        res.status(201).json({ ok: true, material });
+        return;
+      }
+    }
+
+    const source = resolvedPublicVideoSource(record, input);
+    if (!source) {
+      res.status(400).json({ error: '只允许当前记录绑定的 YouTube、TikTok、Instagram 或 Facebook HTTPS 单条视频链接' });
+      return;
+    }
+    const job = {
+      record,
+      tenantId,
+      sourceUrl: source.sourceUrl,
+      title: String(input.title || record?.title || `${source.platform}-video`),
+      platform: source.platform,
+      duration: Number(record?.duration || 0),
+    };
+
+    if (input.async && record?.id) {
+      const analysis = parseJsonRecord(record.aiAnalysis, {});
+      await store.update(COL, String(record.id), {
+        status: 'pending' as VideoStatus,
+        aiAnalysis: JSON.stringify({ ...analysis, downloadStatus: 'queued', downloadQueuedAt: new Date().toISOString() }),
+      });
+      void downloadMaterialJob(job).catch((e) => {
+        console.warn('[videos] async download-material failed:', e instanceof Error ? e.message : e);
+      });
+      res.status(202).json({ ok: true, status: 'queued', id: record.id });
+      return;
+    }
+
+    const material = await downloadMaterialJob(job);
+    res.status(201).json({ ok: true, material });
+  } catch (e) {
+    console.error('[videos] download-material failed:', e);
+    res.status(502).json({ error: e instanceof Error ? e.message : 'Video download failed' });
+  }
+}
+
+async function storedCrawlerVideo(record: Record<string, unknown>): Promise<{ buf: Buffer; contentType: string } | null> {
+  const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+  const objectKey = String(analysis.videoObjectKey || '').trim();
+  if (objectKey) {
+    try {
+      const stored = await objectStorageDownload(objectKey);
+      if (stored?.buf.length) return { buf: stored.buf, contentType: stored.contentType || 'video/mp4' };
+    } catch (error) {
+      console.warn('[videos] stored favorite COS read failed, trying local/PocketBase copy:', error instanceof Error ? error.message : error);
+    }
+  }
+
+  const filename = String(record.videoFileId || '').replace(/\\/g, '/').replace(/^\/+/, '');
+  const recordTenantId = String(record.tenantId || '').trim();
+  if (filename && recordTenantId) {
+    const expectedPrefix = `tenants/${recordTenantId}/`;
+    const tenantRoot = path.resolve(MEDIA_DIR, 'tenants', recordTenantId);
+    const localPath = path.resolve(MEDIA_DIR, filename);
+    if (filename.startsWith(expectedPrefix)
+      && localPath.startsWith(`${tenantRoot}${path.sep}`)
+      && fs.existsSync(localPath)
+      && fs.statSync(localPath).isFile()) {
+      return { buf: fs.readFileSync(localPath), contentType: 'video/mp4' };
+    }
+  }
+  if (!filename) return null;
+  const stored = await fetchFile(COL, String(record.id || ''), filename);
+  return stored?.buf.length ? { buf: stored.buf, contentType: stored.contentType || 'video/mp4' } : null;
+}
+
+async function copyStoredCrawlerVideoToMaterial(input: {
+  record: Record<string, unknown>;
+  tenantId: string;
+  title: string;
+  platform: Platform;
+  duration: number;
+}): Promise<Material> {
+  const stored = await storedCrawlerVideo(input.record);
+  if (!stored) throw new Error('站内视频文件暂不可用，请稍后重试');
+
+  const tenantMediaDir = tenantAssetDir(MEDIA_DIR, input.tenantId);
+  fs.mkdirSync(tenantMediaDir, { recursive: true });
+  const id = randomUUID();
+  const videoFile = `${id}.mp4`;
+  const posterFile = `${id}.poster.jpg`;
+  const videoPath = path.join(tenantMediaDir, videoFile);
+  const posterPath = path.join(tenantMediaDir, posterFile);
+  fs.writeFileSync(videoPath, stored.buf);
+  const posterOk = await extractPoster(videoPath, posterPath, input.duration > 1 ? 1 : 0);
+  const createdAt = new Date().toISOString();
+  const sourceUrl = String(input.record.sourceUrl || `/api/overseas/videos/${encodeURIComponent(String(input.record.id || ''))}/media`);
+  const base = buildDownloadedReferenceMaterial({
+    id,
+    tenantId: input.tenantId,
+    name: safeMaterialName(input.title, input.platform),
+    platform: input.platform,
+    sourceUrl,
+    duration: input.duration || await probeDuration(videoPath),
+    size: humanSize(stored.buf.length),
+    file: tenantAssetRelativePath(input.tenantId, videoFile),
+    poster: posterOk ? tenantAssetRelativePath(input.tenantId, posterFile) : undefined,
+    contentSha256: createHash('sha256').update(stored.buf).digest('hex'),
+    createdAt,
+  });
+  const material = {
+    ...base,
+    provenance: {
+      ...base.provenance,
+      sourceRecordId: String(input.record.id || ''),
+      copiedFromStoredVideo: true,
+    },
+  } as Material;
+  persistMaterials([material, ...loadMaterials().filter(item => item.id !== material.id)]);
+
+  const analysis = parseJsonRecord<Record<string, unknown>>(input.record.aiAnalysis, {});
+  await store.update(COL, String(input.record.id || ''), {
+    aiAnalysis: JSON.stringify({
+      ...analysis,
+      materialId: material.id,
+      materialUrl: material.url,
+      materialPoster: material.poster,
+      downloadedAt: createdAt,
+      downloadStatus: 'downloaded',
+    }),
+  });
+  return material;
+}
+
+async function downloadMaterialJob(input: {
+  record: Record<string, unknown> | null;
+  tenantId: string;
+  sourceUrl: string;
+  title: string;
+  platform: Platform;
+  duration: number;
+}): Promise<Material> {
+  const source = validatePublicVideoSourceUrl(input.sourceUrl, input.platform);
+  if (!source) throw new Error('unsafe_public_video_source');
+  if (!input.tenantId.trim()) throw new Error('download_material_tenant_missing');
+  return withDownloadSlot(() => downloadMaterialJobInner({ ...input, ...source }));
+}
+
+async function compressPocketBasePreview(sourcePath: string): Promise<string> {
+  if (!ffmpegBin) throw new Error('ffmpeg is required for PocketBase preview compression');
+  fs.mkdirSync(ANALYSIS_DIR, { recursive: true });
+  const outputPath = path.join(ANALYSIS_DIR, `pb-preview-${Date.now()}-${randomUUID()}.mp4`);
+  await execFileAsync(ffmpegBin, [
+    '-hide_banner', '-loglevel', 'error', '-i', sourcePath,
+    '-vf', "scale='if(gt(iw,ih),480,-2)':'if(gt(iw,ih),-2,480)'",
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '29', '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-b:a', '64k', '-ac', '1', '-movflags', '+faststart', '-y', outputPath,
+  ], { timeout: 180_000 });
+  // The production PocketBase request path rejects large multipart bodies even
+  // when the collection file field itself allows 100 MiB. Keep long-video
+  // previews below 6 MiB so the payload remains safe after multipart overhead.
+  if (fs.statSync(outputPath).size > 6 * 1024 * 1024) {
+    const compactPath = path.join(ANALYSIS_DIR, `pb-preview-compact-${Date.now()}-${randomUUID()}.mp4`);
+    try {
+      await execFileAsync(ffmpegBin, [
+        '-hide_banner', '-loglevel', 'error', '-i', sourcePath,
+        '-vf', "scale='if(gt(iw,ih),160,-2)':'if(gt(iw,ih),-2,160)'",
+        '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', '32k', '-maxrate', '48k', '-bufsize', '96k',
+        '-c:a', 'aac', '-b:a', '16k', '-ac', '1', '-movflags', '+faststart', '-y', compactPath,
+      ], { timeout: 240_000 });
+      fs.renameSync(compactPath, outputPath);
+    } finally {
+      try { if (fs.existsSync(compactPath)) fs.unlinkSync(compactPath); } catch { /* best effort */ }
+    }
+  }
+  return outputPath;
+}
+
+async function compressVideoBufferForPocketBase(buf: Buffer, extension: string): Promise<Buffer> {
+  fs.mkdirSync(ANALYSIS_DIR, { recursive: true });
+  const sourcePath = path.join(ANALYSIS_DIR, `pb-source-${Date.now()}-${randomUUID()}.${extension.replace(/[^a-z0-9]/gi, '') || 'mp4'}`);
+  fs.writeFileSync(sourcePath, buf);
+  let previewPath = '';
+  try { previewPath = await compressPocketBasePreview(sourcePath); return fs.readFileSync(previewPath); }
+  finally { try { fs.unlinkSync(sourcePath); } catch { /* best effort */ } try { if (previewPath) fs.unlinkSync(previewPath); } catch { /* best effort */ } }
+}
+
+async function downloadMaterialJobInner(input: {
+  record: Record<string, unknown> | null;
+  tenantId: string;
+  sourceUrl: string;
+  title: string;
+  platform: Platform;
+  duration: number;
+}): Promise<Material> {
+  const recordId = input.record?.id ? String(input.record.id) : '';
+  try {
+    if (recordId) {
+      const analysis = parseJsonRecord(input.record?.aiAnalysis, {});
+      await store.update(COL, recordId, {
+        status: 'pending' as VideoStatus,
+        aiAnalysis: JSON.stringify({ ...analysis, downloadStatus: 'downloading', downloadStartedAt: new Date().toISOString() }),
+      });
+    }
+
+    const material = await downloadVideoToMaterial(input);
+    if (recordId) {
+      const localVideoPath = path.join(MEDIA_DIR, material.file);
+      if (!fs.existsSync(localVideoPath)) throw new Error('Downloaded video file missing before PocketBase upload');
+      const previewPath = await compressPocketBasePreview(localVideoPath);
+      const pocketBaseFilename = await uploadCrawlerCosObject(recordId, 'video', fs.readFileSync(previewPath), 'video/mp4');
+      try { fs.unlinkSync(previewPath); } catch { /* best effort */ }
+      if (!pocketBaseFilename) throw new Error('PocketBase video persistence failed');
+      const analysis = parseJsonRecord(input.record?.aiAnalysis, {});
+      await store.update(COL, recordId, {
+        videoFileId: pocketBaseFilename,
+        thumbnailUrl: material.poster || String(input.record?.thumbnailUrl || ''),
+        aiAnalysis: JSON.stringify({
+          ...analysis,
+          materialId: material.id,
+          materialUrl: `/api/overseas/videos/${recordId}/media`,
+          videoStorage: 'cos',
+          videoObjectKey: pocketBaseFilename,
+          materialPoster: material.poster,
+          downloadedAt: material.createdAt,
+          downloadStatus: 'downloaded',
+        }),
+      });
+      void analyzeDownloadedMaterial(recordId, path.join(MEDIA_DIR, material.file), material);
+    }
+    return material;
+    } catch (e) {
+      const soft = softDownloadFailure(input.platform, e);
+      if (recordId) {
+        const analysis = parseJsonRecord(input.record?.aiAnalysis, {});
+        await store.update(COL, recordId, {
+        status: soft ? 'pending' as VideoStatus : 'failed' as VideoStatus,
+        aiAnalysis: JSON.stringify({
+          ...analysis,
+          downloadStatus: soft ? soft.status : 'failed',
+          downloadError: e instanceof Error ? e.message : 'Video download failed',
+        }),
+      });
+    }
+    throw e;
+  }
+}
+
+async function withDownloadSlot<T>(fn: () => Promise<T>): Promise<T> {
+  const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+  while (activeDownloadJobs >= MAX_DOWNLOAD_JOBS) {
+    await sleep(150);
+  }
+  activeDownloadJobs += 1;
+  try {
+    return await fn();
+  } finally {
+    activeDownloadJobs = Math.max(0, activeDownloadJobs - 1);
+  }
+}
+
+const activeAnalysisRecords = new RecordWorkRegistry();
+const durableAnalysisRecords = new AnalysisLeaseRegistry(path.join(__dirname, '../../data/analysis-locks'));
+
+export type SourceAnalysisAdapters = {
+  lease?: AnalysisLeaseRegistry;
+  download?: typeof downloadVideoForAnalysis;
+  analyze?: typeof analyzeDownloadedVideoWithFallback;
+  compressPreview?: typeof compressPocketBasePreview;
+};
+
+export async function analyzeSourceVideoJob(input: {
+  record: Record<string, unknown> | null;
+  sourceUrl: string;
+  title: string;
+  platform: Platform;
+  opsTaskId?: string;
+  suppressOpsRequeue?: boolean;
+  skipYoutubeUrlAnalysis?: boolean;
+  suppressVisibleBackfill?: boolean;
+  forceManualFailure?: boolean;
+}, adapters: SourceAnalysisAdapters = {}): Promise<unknown> {
+  const source = validatePublicVideoSourceUrl(input.sourceUrl, input.platform);
+  if (!source) throw new Error('unsafe_public_video_source');
+  input = { ...input, ...source };
+  const key = String(input.record?.id || '');
+  const execute = () => withDownloadSlot(() => analyzeSourceVideoJobInner(input, adapters));
+  return key ? activeAnalysisRecords.run(key, () => (adapters.lease || durableAnalysisRecords).run(key, execute)) : execute();
+}
+
+async function analyzeSourceVideoJobInner(input: {
+  record: Record<string, unknown> | null;
+  sourceUrl: string;
+  title: string;
+  platform: Platform;
+  opsTaskId?: string;
+  suppressOpsRequeue?: boolean;
+  skipYoutubeUrlAnalysis?: boolean;
+  suppressVisibleBackfill?: boolean;
+  forceManualFailure?: boolean;
+}, adapters: SourceAnalysisAdapters = {}): Promise<unknown> {
+  const recordId = input.record?.id ? String(input.record.id) : '';
+  const inputAnalysis = parseJsonRecord<Record<string, unknown>>(input.record?.aiAnalysis, {});
+  const requestedMode = inputAnalysis.requestedAnalysisMode;
+  // A crawled video is useful to the director only after full-timeline shot
+  // analysis. Keep the lighter mode solely for explicitly requested strategy
+  // jobs; ordinary ingestion goes straight to the detailed pipeline.
+  const analysisMode = requestedMode === 'strategy' ? 'strategy' : 'exact';
+  const analysisRunId = String(inputAnalysis.analysisRunId || randomUUID());
+  const stillOwnsRun = async (): Promise<boolean> => {
+    if (!recordId) return true;
+    const latest = await store.getById(COL, recordId);
+    const latestAnalysis = parseJsonRecord<Record<string, unknown>>(latest?.aiAnalysis, {});
+    return !latestAnalysis.analysisRunId || String(latestAnalysis.analysisRunId) === analysisRunId;
+  };
+  let tempPath = '';
+  try {
+    if (analysisMode !== 'exact' && input.platform === 'youtube' && !input.skipYoutubeUrlAnalysis && (input.forceManualFailure || !shouldUseQwenFirst())) {
+      const direct = await tryAnalyzeYouTubeUrl(input);
+      if (direct) return direct;
+      if (input.forceManualFailure) {
+        return persistMetadataFallbackAnalysis(input, 'youtube_url_failed', {
+          downloadStatus: 'metadata_only',
+          videoFetchStatus: 'url_failed',
+          geminiStatus: 'metadata_fallback',
+          crawlerOpsStatus: 'skipped',
+        });
+      }
+      if (!youtubeDownloadFallbackSyncEnabled()) {
+        if (youtubeDownloadFallbackEnabled()) scheduleYouTubeDownloadFallback(input);
+        return persistMetadataFallbackAnalysis(input, 'youtube_url_failed', {
+          downloadStatus: youtubeDownloadFallbackEnabled() ? 'download_retrying' : 'metadata_only',
+          videoFetchStatus: youtubeDownloadFallbackEnabled() ? 'download_retrying' : 'url_failed',
+          geminiStatus: 'metadata_fallback',
+          crawlerOpsStatus: youtubeDownloadFallbackEnabled() ? 'background_downloading' : 'skipped',
+        });
+      }
+    }
+
+    if (recordId) {
+      const latest = await store.getById(COL, recordId);
+      const analysis: Record<string, unknown> = parseJsonRecord(latest?.aiAnalysis ?? input.record?.aiAnalysis, {} as Record<string, unknown>);
+      if (analysis.analysisRunId && String(analysis.analysisRunId) !== analysisRunId && analysis.analysisRunMode === 'exact') {
+        console.warn(`[videos] stale source analysis skipped for ${recordId}: ${analysisRunId}`);
+        return analysis.gemini || null;
+      }
+      await store.update(COL, recordId, {
+        status: 'pending' as VideoStatus,
+        aiAnalysis: JSON.stringify({
+          ...analysis,
+          downloadStatus: 'downloading',
+          videoFetchStatus: 'downloading',
+          geminiStatus: 'waiting_for_video',
+          analysisSource: 'gemini-temp-video',
+          downloadStartedAt: new Date().toISOString(),
+          analysisRunId,
+          analysisRunMode: analysisMode,
+        }),
+      });
+    }
+
+    const downloaded = await (adapters.download || downloadVideoForAnalysis)(input);
+    tempPath = downloaded.filePath;
+    // Precise analysis previously deleted its temporary file without attaching a
+    // playable copy to the record.  Persist a compact preview first so a record
+    // that passes video-level analysis is also guaranteed to play in-app.
+    if (recordId) {
+      if (!await stillOwnsRun()) return null;
+      let previewPath = '';
+      try {
+        previewPath = await (adapters.compressPreview || compressPocketBasePreview)(downloaded.filePath);
+        const pocketBaseFilename = await uploadCrawlerCosObject(recordId, 'video', fs.readFileSync(previewPath), 'video/mp4');
+        if (!pocketBaseFilename) throw new Error('PocketBase analysis preview persistence failed');
+        const latest = await store.getById(COL, recordId);
+        const analysis = parseJsonRecord(latest?.aiAnalysis ?? input.record?.aiAnalysis, {});
+        await store.update(COL, recordId, {
+          videoFileId: pocketBaseFilename,
+          aiAnalysis: JSON.stringify({
+            ...analysis,
+            videoStorage: 'cos',
+            videoObjectKey: pocketBaseFilename,
+            materialUrl: `/api/overseas/videos/${recordId}/media`,
+            previewPersistedAt: new Date().toISOString(),
+          }),
+        });
+      } catch (error) {
+        // A preview is an optional playback optimization. The source permalink
+        // remains playable, and the downloaded file is still valid input for
+        // Gemini. Do not turn a successful crawl into a failed analysis merely
+        // because ffmpeg/COS preview persistence failed.
+        console.warn('[videos] analysis preview persistence skipped:', error instanceof Error ? error.message : error);
+      } finally {
+        if (previewPath) {
+          try { fs.unlinkSync(previewPath); } catch { /* best effort */ }
+        }
+      }
+    }
+    if (recordId) {
+      if (!await stillOwnsRun()) return null;
+      const latest = await store.getById(COL, recordId);
+      const analysis = parseJsonRecord<Record<string, unknown>>(latest?.aiAnalysis ?? input.record?.aiAnalysis, {});
+      await store.update(COL, recordId, {
+        status: 'pending' as VideoStatus,
+        aiAnalysis: JSON.stringify({
+          ...analysis,
+          downloadStatus: 'analyzing',
+          videoFetchStatus: 'fetched',
+          geminiStatus: 'queued',
+          analysisSource: 'gemini-temp-video',
+          analysisFileSize: humanSize(downloaded.size),
+          downloadedAt: new Date().toISOString(),
+        }),
+      });
+    }
+
+    if (recordId) {
+      if (!await stillOwnsRun()) return null;
+      const latest = await store.getById(COL, recordId);
+      const analysis = parseJsonRecord(latest?.aiAnalysis ?? input.record?.aiAnalysis, {});
+      await store.update(COL, recordId, {
+        status: 'pending' as VideoStatus,
+        aiAnalysis: JSON.stringify({
+          ...analysis,
+          downloadStatus: 'analyzing',
+          videoFetchStatus: 'fetched',
+          geminiStatus: 'analyzing',
+          geminiStartedAt: new Date().toISOString(),
+        }),
+      });
+    }
+
+    const videoAnalysis = await (adapters.analyze || analyzeDownloadedVideoWithFallback)({
+      filePath: downloaded.filePath,
+      mimeType: downloaded.mimeType,
+      title: String(input.record?.title || input.title),
+      platform: input.platform,
+      duration: Number(input.record?.duration || 0),
+      views: String(input.record?.views || ''),
+      tags: parseJsonRecord<string[]>(input.record?.tags, []),
+      sourceLabel: 'gemini-temp-video',
+      analysisMode,
+    });
+
+    if (recordId && analysisMode === 'exact') {
+      videoAnalysis.analysis = await persistExactShotEvidence(recordId, downloaded.filePath, videoAnalysis.analysis);
+    }
+
+    if (recordId) {
+      if (!await stillOwnsRun()) {
+        console.warn(`[videos] stale source analysis success ignored for ${recordId}: ${analysisRunId}`);
+        return videoAnalysis.analysis;
+      }
+      const latest = await store.getById(COL, recordId);
+      const previous = parseJsonRecord<Record<string, unknown>>(latest?.aiAnalysis ?? input.record?.aiAnalysis, {});
+      const persisted = await store.update(COL, recordId, {
+        status: 'analyzed' as VideoStatus,
+        aiAnalysis: JSON.stringify({
+          ...previous,
+          ...videoLevelSuccessPatch({
+            analysis: videoAnalysis.analysis,
+            source: videoAnalysis.source,
+            videoFetchStatus: 'fetched',
+            extra: { tempVideoDeleted: true, analysisMode, requestedAnalysisMode: undefined },
+          }),
+        }),
+      });
+      if (!persisted) throw new Error('video_analysis_writeback_failed');
+    }
+    return videoAnalysis.analysis;
+  } catch (e) {
+    const soft = softDownloadFailure(input.platform, e);
+    const errorMessage = e instanceof Error ? e.message : 'Video download failed';
+    const nonRetryableFetch = isNonRetryableVideoFetch(input.platform, errorMessage)
+      || isTikTokUnusableWithoutVideoFallback(input.platform, errorMessage, input.record);
+    const forceManualFailure = input.forceManualFailure === true;
+    const fallback = metadataFallbackAnalysis({
+      platform: input.platform,
+      title: String(input.record?.title || input.title),
+      duration: Number(input.record?.duration || 0),
+      views: String(parseJsonRecord<Record<string, unknown>>(input.record?.aiAnalysis, {}).views || input.platform),
+      tags: parseJsonRecord<string[]>(input.record?.tags, []),
+    });
+    if (recordId) {
+      if (!await stillOwnsRun()) {
+        console.warn(`[videos] stale source analysis failure ignored for ${recordId}: ${analysisRunId}`);
+        throw e;
+      }
+      const failureReason = soft?.status || classifyCrawlerFailure(errorMessage);
+      if (nonRetryableFetch || forceManualFailure) {
+        await persistManualVideoFailure(input, errorMessage, failureReason, fallback);
+        return fallback;
+      }
+      const latest = await store.getById(COL, recordId);
+      const previous = parseJsonRecord<Record<string, unknown>>(latest?.aiAnalysis ?? input.record?.aiAnalysis, {});
+      const compactError = compactVideoPipelineError(errorMessage);
+      const compactReason = compactVideoPipelineError(failureReason, 360);
+      const opsWorkerEnabled = process.env.CRAWLER_OPS_WORKER_ENABLED !== '0';
+      if (!opsWorkerEnabled && previous.requestedAnalysisMode === 'exact') {
+        // Production may intentionally pause the historical crawler-ops worker.
+        // In that mode a retryable exact-analysis failure must become a visible,
+        // retryable failure instead of entering a queue that nobody consumes.
+        await store.update(COL, recordId, {
+          status: 'analyzed' as VideoStatus,
+          aiAnalysis: JSON.stringify({
+            ...previous,
+            requestedAnalysisMode: undefined,
+            analysisMode: previous.analysisMode === 'exact' ? 'exact' : 'strategy',
+            downloadStatus: previous.analysisQuality === 'video' ? 'analyzed' : 'manual_required',
+            videoFetchStatus: previous.analysisQuality === 'video' ? 'fetched' : 'manual_required',
+            geminiStatus: previous.analysisQuality === 'video' ? 'analyzed' : 'video_failed',
+            crawlerOpsStatus: 'failed',
+            crawlerOpsReason: compactReason,
+            analysisError: compactError,
+            analysisRetryable: true,
+            analysisFailureKind: 'quality_or_timeout',
+            videoLevelFailureStatus: '全片精确分析失败，可重试',
+            downloadError: compactError,
+          }),
+        });
+        throw e;
+      }
+      const opsTask = input.suppressOpsRequeue
+        ? updateCrawlerOpsTask(input.opsTaskId || '', {
+          status: 'failed',
+          reason: compactReason,
+          lastError: compactError,
+          updatedAt: new Date().toISOString(),
+        })
+        : enqueueCrawlerOpsTask({
+          recordId,
+          tenantId: String(input.record?.tenantId || '').trim() || undefined,
+          platform: input.platform,
+          sourceUrl: input.sourceUrl,
+          title: String(input.record?.title || input.title),
+          reason: compactReason,
+          forceQueue: true,
+        });
+      if (opsTask && !input.suppressOpsRequeue) {
+        void pushCrawlerOpsTask(opsTask).catch((pushError) => {
+          console.warn('[videos] crawler ops push failed:', pushError instanceof Error ? pushError.message : pushError);
+        });
+      }
+      await store.update(COL, recordId, {
+        status: 'analyzed' as VideoStatus,
+        aiAnalysis: JSON.stringify({
+          ...previous,
+          ...(previous.gemini ? { gemini: previous.gemini } : isRetryableAnalysisFailure(e) ? { gemini: undefined } : { gemini: fallback }),
+          analysisSource: previous.gemini ? previous.analysisSource || 'metadata-fallback' : isRetryableAnalysisFailure(e) ? 'analysis-pending' : 'metadata-fallback',
+          analysisQuality: previous.gemini ? previous.analysisQuality || 'metadata' : isRetryableAnalysisFailure(e) ? 'pending' : 'metadata',
+          videoAnalysisAttemptedAt: new Date().toISOString(),
+          downloadStatus: 'ops_queued',
+          videoFetchStatus: 'ops_queued',
+          geminiStatus: 'waiting_for_video',
+          crawlerOpsTaskId: opsTask?.id || input.opsTaskId || previous.crawlerOpsTaskId,
+          crawlerOpsStatus: opsTask?.status || 'failed',
+          crawlerOpsReason: compactReason,
+          analysisError: compactError,
+          analysisRetryable: isRetryableAnalysisFailure(e),
+          analysisFailureKind: isRetryableAnalysisFailure(e) ? 'quality_or_timeout' : previous.analysisFailureKind,
+          downloadError: compactError,
+        }),
+      });
+    }
+    throw e;
+  } finally {
+    if (tempPath) cleanupTempVideo(tempPath);
+  }
+}
+
+async function persistManualVideoFailure(input: {
+  record: Record<string, unknown> | null;
+  sourceUrl: string;
+  title: string;
+  platform: Platform;
+  suppressVisibleBackfill?: boolean;
+}, errorMessage: string, reason: string, fallback: VideoAiAnalysis): Promise<void> {
+  const recordId = input.record?.id ? String(input.record.id) : '';
+  if (!recordId) return;
+
+  const latest = await store.getById(COL, recordId);
+  const record = latest ?? input.record;
+  const previous = parseJsonRecord<Record<string, unknown>>(record?.aiAnalysis, {});
+  const tenantId = String(record?.tenantId || '');
+  const title = String(record?.title || input.title || `${input.platform}-video`);
+  const now = new Date().toISOString();
+  const hadVideoAnalysis = isVideoLevelAnalysis(previous)
+    || (previous.analysisQuality === 'video' && Boolean(previous.gemini) && typeof previous.gemini === 'object');
+  const requestedAnalysisMode = previous.requestedAnalysisMode === 'exact' ? 'exact' : undefined;
+  const compactError = compactVideoPipelineError(errorMessage);
+  const compactReason = compactVideoPipelineError(reason, 360);
+  const failure = {
+    statusLabel: '视频级失败/需人工处理',
+    reason: compactReason,
+    error: compactError,
+    platform: input.platform,
+    sourceUrl: input.sourceUrl,
+    recordedAt: now,
+  };
+
+  await store.update(COL, recordId, {
+    status: 'analyzed' as VideoStatus,
+    aiAnalysis: JSON.stringify({
+      ...previous,
+      gemini: previous.gemini || fallback,
+      analysisSource: hadVideoAnalysis ? previous.analysisSource : previous.gemini ? previous.analysisSource || 'metadata-fallback' : 'metadata-fallback',
+      analysisQuality: hadVideoAnalysis ? 'video' : 'metadata',
+      videoAnalysisAttemptedAt: now,
+      // A failed upgrade must not be presented as a completed exact analysis.
+      analysisMode: previous.analysisMode === 'exact' ? 'exact' : 'strategy',
+      requestedAnalysisMode: undefined,
+      downloadStatus: hadVideoAnalysis ? previous.downloadStatus || 'analyzed' : 'manual_required',
+      videoFetchStatus: hadVideoAnalysis ? previous.videoFetchStatus || 'fetched' : 'manual_required',
+      geminiStatus: hadVideoAnalysis ? previous.geminiStatus || 'analyzed' : 'video_failed',
+      crawlerOpsStatus: 'needs_manual',
+      crawlerOpsReason: compactReason,
+      videoLevelFailureStatus: '视频级失败/需人工处理',
+      manualRequiredReason: compactReason,
+      userVisible: hadVideoAnalysis ? previous.userVisible : false,
+      adminOnlyVideoFailure: failure,
+      analysisError: compactError,
+      downloadError: compactError,
+    }),
+  });
+
+  recordVideoAdminAlert({
+    recordId,
+    tenantId,
+    platform: input.platform,
+    title,
+    sourceUrl: input.sourceUrl,
+    reason: compactReason,
+    error: compactError,
+  });
+
+  if (!hadVideoAnalysis && tenantId && !input.suppressVisibleBackfill) {
+    const keyword = String(previous.keyword || '');
+    scheduleTestTenantVideoBackfill({
+      tenantId,
+      platform: input.platform,
+      keyword,
+      target: 1,
+      replacementForRecordId: recordId,
+      reason,
+      forceCreate: true,
+      dateFrom: String(previous.dateFrom || ''),
+      dateTo: String(previous.dateTo || ''),
+    });
+  }
+}
+
+async function persistMetadataFallbackAnalysis(input: {
+  record: Record<string, unknown> | null;
+  sourceUrl: string;
+  title: string;
+  platform: Platform;
+}, reason: string, status: {
+  downloadStatus?: string;
+  videoFetchStatus?: string;
+  geminiStatus?: string;
+  crawlerOpsStatus?: string;
+} = {}): Promise<VideoAiAnalysis> {
+  const fallback = metadataFallbackAnalysis({
+    platform: input.platform,
+    title: String(input.record?.title || input.title),
+    duration: Number(input.record?.duration || 0),
+    views: String(parseJsonRecord<Record<string, unknown>>(input.record?.aiAnalysis, {}).views || input.platform),
+    tags: parseJsonRecord<string[]>(input.record?.tags, []),
+  });
+  const recordId = input.record?.id ? String(input.record.id) : '';
+  const finalManualFailure = (status.downloadStatus || 'metadata_only') === 'metadata_only'
+    || (status.videoFetchStatus || 'url_failed') === 'url_failed';
+  if (recordId && finalManualFailure) {
+    await persistManualVideoFailure(input, reason, reason, fallback);
+    return fallback;
+  }
+  if (recordId) {
+    const latest = await store.getById(COL, recordId);
+    const previous = parseJsonRecord<Record<string, unknown>>(latest?.aiAnalysis ?? input.record?.aiAnalysis, {});
+    await store.update(COL, recordId, {
+      status: 'analyzed' as VideoStatus,
+      aiAnalysis: JSON.stringify({
+        ...previous,
+        gemini: previous.gemini || fallback,
+        analysisSource: previous.gemini ? previous.analysisSource || 'metadata-fallback' : 'metadata-fallback',
+        analysisQuality: previous.gemini ? previous.analysisQuality || 'metadata' : 'metadata',
+        downloadStatus: status.downloadStatus || 'metadata_only',
+        videoFetchStatus: status.videoFetchStatus || 'url_failed',
+        geminiStatus: status.geminiStatus || 'metadata_fallback',
+        crawlerOpsStatus: status.crawlerOpsStatus || 'skipped',
+        crawlerOpsReason: reason,
+        videoAnalysisAttemptedAt: new Date().toISOString(),
+      }),
+    });
+  }
+  return fallback;
+}
+
+function scheduleYouTubeDownloadFallback(input: {
+  record: Record<string, unknown> | null;
+  sourceUrl: string;
+  title: string;
+  platform: Platform;
+  suppressVisibleBackfill?: boolean;
+  forceManualFailure?: boolean;
+}): void {
+  if (input.platform !== 'youtube') return;
+  const recordId = input.record?.id ? String(input.record.id) : '';
+  if (!recordId) return;
+  void (async () => {
+    const latest = await store.getById(COL, recordId);
+    if (!latest) return;
+    const analysis = parseJsonRecord<Record<string, unknown>>(latest.aiAnalysis, {});
+    if (analysis.analysisQuality === 'video') return;
+    await analyzeSourceVideoJob({
+      record: latest,
+      sourceUrl: input.sourceUrl,
+      title: input.title,
+      platform: input.platform,
+      skipYoutubeUrlAnalysis: true,
+      suppressVisibleBackfill: input.suppressVisibleBackfill,
+      forceManualFailure: input.forceManualFailure,
+    });
+  })().catch((e) => {
+    console.warn('[videos] YouTube background download fallback failed:', e instanceof Error ? e.message : e);
+  });
+}
+
+function youtubeDownloadFallbackEnabled(): boolean {
+  return process.env.YOUTUBE_DOWNLOAD_FALLBACK_ENABLED !== '0';
+}
+
+function youtubeDownloadFallbackSyncEnabled(): boolean {
+  return process.env.YOUTUBE_DOWNLOAD_FALLBACK_MODE === 'sync';
+}
+
+async function tryAnalyzeYouTubeUrl(input: {
+  record: Record<string, unknown> | null;
+  sourceUrl: string;
+  title: string;
+  platform: Platform;
+}): Promise<unknown | null> {
+  const recordId = input.record?.id ? String(input.record.id) : '';
+  try {
+    if (recordId) {
+      const latest = await store.getById(COL, recordId);
+      const analysis = parseJsonRecord(latest?.aiAnalysis ?? input.record?.aiAnalysis, {});
+      await store.update(COL, recordId, {
+        status: 'pending' as VideoStatus,
+        aiAnalysis: JSON.stringify({
+          ...analysis,
+          downloadStatus: 'analyzing',
+          videoFetchStatus: 'direct_url',
+          geminiStatus: 'analyzing',
+          analysisSource: 'gemini-youtube-url',
+          geminiStartedAt: new Date().toISOString(),
+        }),
+      });
+    }
+    const geminiAnalysis = await analyzeYouTubeUrl({ url: input.sourceUrl });
+    if (recordId) {
+      const latest = await store.getById(COL, recordId);
+      const previous = parseJsonRecord<Record<string, unknown>>(latest?.aiAnalysis ?? input.record?.aiAnalysis, {});
+      await store.update(COL, recordId, {
+        status: 'analyzed' as VideoStatus,
+        aiAnalysis: JSON.stringify({
+          ...previous,
+          ...videoLevelSuccessPatch({
+            analysis: geminiAnalysis,
+            source: 'gemini-youtube-url',
+            videoFetchStatus: 'direct_url',
+          }),
+        }),
+      });
+    }
+    return geminiAnalysis;
+  } catch (e) {
+    if (recordId) {
+      const latest = await store.getById(COL, recordId);
+      const previous = parseJsonRecord<Record<string, unknown>>(latest?.aiAnalysis ?? input.record?.aiAnalysis, {});
+      await store.update(COL, recordId, {
+        status: 'pending' as VideoStatus,
+        aiAnalysis: JSON.stringify({
+          ...previous,
+          youtubeDirectError: compactVideoPipelineError(e instanceof Error ? e.message : 'YouTube direct Gemini analysis failed'),
+          downloadStatus: 'metadata_only',
+          videoFetchStatus: youtubeDownloadFallbackEnabled() ? 'queued' : 'url_failed',
+          geminiStatus: youtubeDownloadFallbackEnabled() ? 'waiting_for_video' : 'metadata_fallback',
+        }),
+      });
+    }
+    return null;
+  }
+}
+
+async function analyzeDownloadedMaterial(recordId: string, filePath: string, material: Material, analysisMode: 'strategy' | 'exact' = 'exact', expectedRunId?: string): Promise<void> {
+  try {
+    await store.update(COL, recordId, { status: 'pending' as VideoStatus });
+    const videoAnalysis = await analyzeDownloadedVideoWithFallback({
+      filePath,
+      mimeType: mimeFromPath(filePath),
+      title: material.name,
+      duration: material.duration,
+      sourceLabel: 'gemini-video',
+      analysisMode,
+    });
+    if (analysisMode === 'exact') {
+      videoAnalysis.analysis = await persistExactShotEvidence(recordId, filePath, videoAnalysis.analysis);
+    }
+    const latest = await store.getById(COL, recordId);
+    const previous: Record<string, unknown> = parseJsonRecord(latest?.aiAnalysis, {} as Record<string, unknown>);
+    if (expectedRunId && String(previous.analysisRunId || '') !== expectedRunId) {
+      console.warn(`[videos] stale material analysis success ignored for ${recordId}: ${expectedRunId}`);
+      return;
+    }
+    await store.update(COL, recordId, {
+      status: 'analyzed' as VideoStatus,
+      aiAnalysis: JSON.stringify({
+        ...previous,
+        ...videoLevelSuccessPatch({
+          analysis: videoAnalysis.analysis,
+          source: videoAnalysis.source,
+          videoFetchStatus: 'fetched',
+          extra: {
+            analysisMode,
+            requestedAnalysisMode: undefined,
+            materialId: material.id,
+            materialUrl: material.url,
+            materialPoster: material.poster,
+          },
+        }),
+      }),
+    });
+  } catch (e) {
+    console.error(`[videos] Gemini material analysis failed for ${recordId}:`, e);
+    const latest = await store.getById(COL, recordId);
+    const previous = parseJsonRecord<Record<string, unknown>>(latest?.aiAnalysis, {});
+    if (expectedRunId && String(previous.analysisRunId || '') !== expectedRunId) {
+      console.warn(`[videos] stale material analysis failure ignored for ${recordId}: ${expectedRunId}`);
+      return;
+    }
+    const platform = (latest?.platform || inferPlatformFromUrl(String(latest?.sourceUrl || ''))) as Platform;
+    if (latest && isRetryableAnalysisFailure(e)) {
+      await store.update(COL, recordId, {
+        status: 'analyzed' as VideoStatus,
+        aiAnalysis: JSON.stringify({
+          ...previous,
+          requestedAnalysisMode: undefined,
+          geminiStatus: 'analysis_retryable',
+          analysisRetryable: true,
+          analysisFailureKind: 'quality_or_timeout',
+          analysisError: compactVideoPipelineError(e instanceof Error ? e.message : String(e)),
+          videoLevelFailureStatus: '分析未完成，可重试',
+        }),
+      });
+      return;
+    }
+    const fallback = metadataFallbackAnalysis({
+      platform,
+      title: String(latest?.title || material.name),
+      duration: Number(latest?.duration || material.duration || 0),
+      views: String(previous.views || platform),
+      tags: parseJsonRecord<string[]>(latest?.tags, []),
+    });
+    if (latest) {
+      await persistManualVideoFailure({
+        record: latest,
+        sourceUrl: String(latest.sourceUrl || material.url || ''),
+        title: String(latest.title || material.name),
+        platform,
+      }, e instanceof Error ? e.message : 'Gemini analysis failed', classifyCrawlerFailure(e instanceof Error ? e.message : String(e)), fallback);
+    } else {
+      await store.update(COL, recordId, {
+        status: 'failed' as VideoStatus,
+        aiAnalysis: JSON.stringify({
+          ...previous,
+          analysisSource: 'gemini-video',
+          analysisError: compactVideoPipelineError(e instanceof Error ? e.message : 'Gemini analysis failed'),
+        }),
+      });
+    }
+  }
+}
+
+async function crawlSocialUrlOrFallback(platform: Platform, keyword: string, limit: number, dateFrom = '', dateTo = ''): Promise<CrawledVideo[]> {
+  const input = keyword.trim();
+  if (isPlatformUrl(input, platform)) return [await crawlYtDlpMetadata(platform, input, keyword)];
+  return crawlPublicSearch(platform, input, limit, dateFrom, dateTo);
+}
+
+async function crawlTikTokWithApifyFallback(keyword: string, limit: number, dateFrom = '', dateTo = ''): Promise<CrawledVideo[]> {
+  const input = keyword.trim();
+  if (isPlatformUrl(input, 'tiktok')) return [await crawlYtDlpMetadata('tiktok', input, keyword)];
+
+  const items: CrawledVideo[] = [];
+  try {
+    items.push(...await crawlPublicSearch('tiktok', input, limit, dateFrom, dateTo));
+  } catch (e) {
+    console.warn('[videos] TikTok local crawl failed, trying Apify:', e instanceof Error ? e.message : e);
+  }
+
+  const seen = new Set(items.map(item => item.sourceUrl));
+  if (items.length < limit && canUseApifyTikTokCrawlFallback()) {
+    try {
+      const apifyItems = await crawlTikTokApify(input, Math.max(limit - items.length, limit), dateFrom, dateTo);
+      for (const item of apifyItems) {
+        if (seen.has(item.sourceUrl)) continue;
+        if (!isKeywordRelevant(item, input)) continue;
+        if (!isWithinDateRange(item.uploadedAt, dateFrom, dateTo)) continue;
+        if (!hasRealThumbnail(item)) continue;
+        seen.add(item.sourceUrl);
+        items.push(item);
+        if (items.length >= limit) break;
+      }
+    } catch (e) {
+      console.warn('[videos] TikTok Apify fallback failed:', e instanceof Error ? e.message : e);
+    }
+  }
+
+  if (items.length === 0) throw new Error('TikTok keyword search returned no usable videos');
+  return sortByHeat(items).slice(0, limit);
+}
+
+async function crawlTikTokApify(keyword: string, limit: number, dateFrom = '', dateTo = ''): Promise<CrawledVideo[]> {
+  const token = process.env.APIFY_TOKEN?.trim();
+  if (!token) throw new Error('APIFY_TOKEN is not configured');
+  const actor = process.env.APIFY_TIKTOK_ACTOR?.trim() || 'clockworks/tiktok-scraper';
+  // TikTok profiles can interleave photo-mode slideshows with actual videos.
+  // Fetch a small candidate window so a video-only task with limit=1 does not
+  // persist the first slideshow and then fail forever in the video downloader.
+  const input = buildApifyTikTokInput(keyword, Math.max(limit * 5, 5), dateFrom, dateTo);
+  const runUrl = `https://api.apify.com/v2/acts/${encodeURIComponent(actor)}/run-sync-get-dataset-items?clean=true&token=${encodeURIComponent(token)}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Number(process.env.APIFY_TIMEOUT_MS || 120_000));
+  try {
+    const r = await fetch(runUrl, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    });
+    const text = await r.text();
+    if (!r.ok) throw new Error(`Apify TikTok HTTP ${r.status}: ${text.slice(0, 300)}`);
+    const data = JSON.parse(text) as unknown;
+    const rows = Array.isArray(data) ? data as Record<string, unknown>[] : [];
+    return rows
+      .map(item => apifyTikTokItemToCrawledVideo(item, keyword))
+      .filter((item): item is CrawledVideo => Boolean(item))
+      .slice(0, limit);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function buildApifyTikTokInput(keyword: string, limit: number, dateFrom = '', dateTo = ''): Record<string, unknown> {
+  const raw = keyword.trim();
+  const account = tiktokUsername(raw);
+  const videoId = tiktokVideoId(raw);
+  const cleanKeyword = raw.replace(/^#/, '').trim();
+  const input: Record<string, unknown> = {
+    resultsPerPage: Math.min(100, Math.max(1, limit)),
+    shouldDownloadVideos: false,
+    shouldDownloadCovers: false,
+    shouldDownloadSubtitles: false,
+    shouldDownloadSlideshowImages: false,
+    shouldDownloadAvatars: false,
+    shouldDownloadMusicCovers: false,
+    shouldDownloadMusic: false,
+  };
+  if (videoId) {
+    input.postURLs = [raw];
+  } else if (account) {
+    input.profiles = [account];
+  } else {
+    input.hashtags = [cleanKeyword];
+  }
+  if (hasDateRange(dateFrom, dateTo)) {
+    input.oldestPostDate = dateFrom || undefined;
+    input.newestPostDate = dateTo || undefined;
+  }
+  return input;
+}
+
+function apifyTikTokItemToCrawledVideo(item: Record<string, unknown>, keyword: string): CrawledVideo | null {
+  if (item.isSlideshow === true || (Array.isArray(item.slideshowImageLinks) && item.slideshowImageLinks.length > 0)) return null;
+  const author = apifyAuthor(item);
+  const sourceUrl = canonicalSourceUrl('tiktok', String(item.webVideoUrl || item.url || item.shareUrl || item.videoUrl || item.link || '').trim(), author);
+  if (!sourceUrl || !isPlatformUrl(sourceUrl, 'tiktok')) return null;
+  const text = String(item.text || item.description || item.desc || item.title || '').trim();
+  const title = cleanupAnalysisTitle(text || (author ? `TikTok video by ${author}` : 'TikTok video'));
+  const thumbnailUrl = firstImageUrl([
+    item.videoMeta,
+    item.coverUrl,
+    item.thumbnailUrl,
+    item.thumbnail,
+    item.dynamicCover,
+    item.originCover,
+    item.covers,
+    item.images,
+    item,
+  ]);
+  const duration = Number(item.videoMeta && typeof item.videoMeta === 'object' && 'duration' in item.videoMeta
+    ? (item.videoMeta as Record<string, unknown>).duration
+    : item.duration || 0);
+  const maxVideoDuration = Math.max(15, Number(process.env.CRAWLER_MAX_VIDEO_DURATION_SECONDS || 180));
+  if (duration > maxVideoDuration) return null;
+  const playCount = Number(item.playCount || item.views || item.viewCount || 0);
+  const diggCount = Number(item.diggCount || item.likes || item.likeCount || 0);
+  const commentCount = Number(item.commentCount || item.comments || 0);
+  const tags = apifyTikTokTags(item, keyword);
+  return {
+    platform: 'tiktok',
+    title,
+    sourceUrl,
+    thumbnailUrl,
+    duration,
+    views: playCount > 0 ? compactNumber(playCount) : 'TikTok',
+    tags,
+    uploadedAt: apifyUploadedAt(item),
+    author,
+    likes: diggCount > 0 ? compactNumber(diggCount) : undefined,
+    comments: commentCount > 0 ? compactNumber(commentCount) : undefined,
+    source: 'apify',
+  };
+}
+
+function apifyAuthor(item: Record<string, unknown>): string {
+  const authorMeta = item.authorMeta && typeof item.authorMeta === 'object' ? item.authorMeta as Record<string, unknown> : {};
+  return String(authorMeta.name || authorMeta.nickName || item.author || item.username || '').trim();
+}
+
+function apifyUploadedAt(item: Record<string, unknown>): string | undefined {
+  const timestamp = Number(item.createTime || item.createTimeISO || item.timestamp || 0);
+  if (timestamp > 1_000_000_000_000) return new Date(timestamp).toISOString();
+  if (timestamp > 1_000_000_000) return new Date(timestamp * 1000).toISOString();
+  const iso = String(item.createTimeISO || item.createdAt || item.date || '').trim();
+  return iso && !Number.isFinite(Number(iso)) ? iso : undefined;
+}
+
+function apifyTikTokTags(item: Record<string, unknown>, keyword: string): string[] {
+  const raw = [
+    ...(Array.isArray(item.hashtags) ? item.hashtags : []),
+    ...(Array.isArray(item.mentions) ? item.mentions : []),
+    ...tagsFromKeyword(keyword, 'tiktok'),
+  ];
+  return [...new Set(raw
+    .map(tag => typeof tag === 'string' ? tag : String((tag as Record<string, unknown>)?.name || (tag as Record<string, unknown>)?.title || ''))
+    .map(tag => tag.replace(/^#/, '').trim())
+    .filter(Boolean))].slice(0, 8);
+}
+
+// ─── Instagram 采集：cookie(yt-dlp) 为主，Apify 兜底 ─────────────────────────
+// 结构与 crawlTikTokWithApifyFallback 一致。IG 封了匿名访问：
+//   · 直链 → 先走 yt-dlp（未登录会失败，配置了 YT_DLP_COOKIE_FILES 的 cookie 文件才通）；
+//   · 关键词 → IG 无公开搜索接口，yt-dlp 走不通，直接用 Apify hashtag 搜索。
+// 两种情况下 yt-dlp 拿不到时统一回落 Apify（apify/instagram-scraper）。
+async function crawlInstagramWithApifyFallback(keyword: string, limit: number, dateFrom = '', dateTo = ''): Promise<CrawledVideo[]> {
+  const input = keyword.trim();
+  const directUrl = isPlatformUrl(input, 'instagram');
+  const items: CrawledVideo[] = [];
+
+  if (directUrl) {
+    // 直链优先走 yt-dlp（配置了 cookie 文件即可，免 Apify 费用）；成功即返回，不再叠加 Apify。
+    try {
+      return [await crawlYtDlpMetadata('instagram', input, keyword)];
+    } catch (e) {
+      console.warn('[videos] Instagram yt-dlp metadata failed, trying Apify:', e instanceof Error ? e.message : e);
+    }
+  }
+
+  const seen = new Set(items.map(item => item.sourceUrl));
+  if (items.length < limit && canUseApifyInstagramCrawlFallback()) {
+    try {
+      const apifyItems = await crawlInstagramApify(input, Math.max(limit - items.length, limit), dateFrom, dateTo);
+      for (const item of apifyItems) {
+        if (seen.has(item.sourceUrl)) continue;
+        if (!directUrl && !isKeywordRelevant(item, input)) continue;
+        if (!directUrl && !isWithinDateRange(item.uploadedAt, dateFrom, dateTo)) continue;
+        if (!hasRealThumbnail(item)) continue;
+        seen.add(item.sourceUrl);
+        items.push(item);
+        if (items.length >= limit) break;
+      }
+    } catch (e) {
+      console.warn('[videos] Instagram Apify fallback failed:', e instanceof Error ? e.message : e);
+    }
+  }
+
+  if (items.length === 0) {
+    throw new Error('Instagram 抓取无可用视频：请配置 YT_DLP_COOKIE_FILES 登录态 cookie，或开启 Apify 兜底（APIFY_TOKEN / APIFY_INSTAGRAM_CRAWL_FALLBACK_ENABLED）');
+  }
+  return directUrl ? items.slice(0, limit) : sortByHeat(items).slice(0, limit);
+}
+
+async function crawlInstagramApify(keyword: string, limit: number, dateFrom = '', dateTo = ''): Promise<CrawledVideo[]> {
+  const token = process.env.APIFY_TOKEN?.trim();
+  if (!token) throw new Error('APIFY_TOKEN is not configured');
+  const directUrl = isPlatformUrl(keyword.trim(), 'instagram');
+  const actor = directUrl
+    ? (process.env.APIFY_INSTAGRAM_ACTOR?.trim() || 'apify/instagram-scraper')
+    : (process.env.APIFY_INSTAGRAM_SEARCH_ACTOR?.trim()
+      || process.env.APIFY_INSTAGRAM_ACTOR?.trim()
+      || 'apify/instagram-scraper');
+  // Hashtag results mix image posts and Reels. Fetching exactly `limit` rows can
+  // return only images which are correctly filtered below, leaving a false zero.
+  // Oversample keyword searches, then keep the requested number of real videos.
+  const fetchLimit = limit;
+  const input = buildApifyInstagramInput(keyword, fetchLimit, dateFrom, dateTo);
+  const rows = await runApifyActorDatasetItems(actor, input, Number(process.env.APIFY_TIMEOUT_MS || 240_000), 'Instagram crawl');
+  return rows
+    .map(item => apifyInstagramItemToCrawledVideo(item, keyword))
+    .filter((item): item is CrawledVideo => Boolean(item))
+    .slice(0, limit);
+}
+
+function buildApifyInstagramInput(keyword: string, limit: number, dateFrom = '', _dateTo = ''): Record<string, unknown> {
+  const input = keyword.trim();
+  const resultsLimit = Math.min(50, Math.max(1, limit));
+  const base: Record<string, unknown> = {
+    resultsType: 'reels',
+    resultsLimit,
+    addParentData: false,
+  };
+  if (isPlatformUrl(input, 'instagram')) {
+    base.directUrls = [input];
+    if (dateFrom) base.onlyPostsNewerThan = dateFrom;
+  } else {
+    // The actor's search mode currently redirects some English hashtags to an
+    // unrelated localized tag page. Direct hashtag URLs are stable; fetch a
+    // small page and apply the requested date window locally below.
+    const tag = input.replace(/^#/, '').trim();
+    base.directUrls = [`https://www.instagram.com/explore/tags/${encodeURIComponent(tag)}/`];
+  }
+  return base;
+}
+
+function apifyInstagramItemToCrawledVideo(item: Record<string, unknown>, keyword: string): CrawledVideo | null {
+  // 只保留可拿到 mp4 的视频/Reel，跳过纯图片帖。
+  const type = String(item.type || '').toLowerCase();
+  const isVideo = type === 'video' || item.productType === 'clips' || Boolean(item.videoUrl);
+  if (!isVideo) return null;
+  const author = String(item.ownerUsername || '').trim();
+  const shortCode = String(item.shortCode || '').trim();
+  const rawUrl = String(item.url || (shortCode ? `https://www.instagram.com/reel/${shortCode}/` : '')).trim();
+  const sourceUrl = canonicalSourceUrl('instagram', rawUrl, author);
+  if (!sourceUrl || !isPlatformUrl(sourceUrl, 'instagram')) return null;
+  const caption = String(item.caption || '').trim();
+  const title = cleanupAnalysisTitle(caption || (author ? `Instagram video by ${author}` : 'Instagram video'));
+  const thumbnailUrl = firstImageUrl([item.displayUrl, item.images, item]);
+  const duration = Number(item.videoDuration || 0);
+  const playCount = Number(item.videoPlayCount || item.videoViewCount || 0);
+  const likeCount = Number(item.likesCount || 0);
+  const commentCount = Number(item.commentsCount || 0);
+  const tags = apifyInstagramTags(item, keyword);
+  return {
+    platform: 'instagram',
+    title,
+    sourceUrl,
+    thumbnailUrl,
+    duration,
+    views: playCount > 0 ? compactNumber(playCount) : 'Instagram',
+    tags,
+    uploadedAt: apifyInstagramUploadedAt(item),
+    author,
+    likes: likeCount > 0 ? compactNumber(likeCount) : undefined,
+    comments: commentCount > 0 ? compactNumber(commentCount) : undefined,
+    source: 'apify',
+  };
+}
+
+function apifyInstagramUploadedAt(item: Record<string, unknown>): string | undefined {
+  const iso = String(item.timestamp || item.takenAt || '').trim();
+  return iso && !Number.isFinite(Number(iso)) ? iso : undefined;
+}
+
+function apifyInstagramTags(item: Record<string, unknown>, keyword: string): string[] {
+  const raw = [
+    ...(Array.isArray(item.hashtags) ? item.hashtags : []),
+    ...(Array.isArray(item.mentions) ? item.mentions : []),
+    ...tagsFromKeyword(keyword, 'instagram'),
+  ];
+  return [...new Set(raw
+    .map(tag => typeof tag === 'string' ? tag : String((tag as Record<string, unknown>)?.name || (tag as Record<string, unknown>)?.title || ''))
+    .map(tag => tag.replace(/^#/, '').trim())
+    .filter(Boolean))].slice(0, 8);
+}
+
+// ─── Facebook 账号主页采集：yt-dlp 为主，Apify posts actor 兜底 ───────────────
+// Facebook Page 的 /videos 列表经常无法匿名枚举。Apify 返回的是帖子列表，
+// 因此这里严格只收 media 中确认为 Video 的条目，避免把图片帖混入视频库。
+async function crawlFacebookAccountApify(accountUrl: string, limit: number, dateFrom = '', dateTo = ''): Promise<CrawledVideo[]> {
+  const token = process.env.APIFY_TOKEN?.trim();
+  if (!token) throw new Error('APIFY_TOKEN is not configured');
+  const actor = process.env.APIFY_FACEBOOK_ACTOR?.trim() || 'apify/facebook-posts-scraper';
+  const input = buildApifyFacebookAccountInput(accountUrl, limit);
+  const rows = await runApifyActorDatasetItems(actor, input, Number(process.env.APIFY_TIMEOUT_MS || 240_000), 'Facebook account crawl');
+  return rows
+    .map(item => apifyFacebookPostToCrawledVideo(item, accountUrl))
+    .filter((item): item is CrawledVideo => Boolean(item))
+    .filter(item => isWithinDateRange(item.uploadedAt, dateFrom, dateTo))
+    .slice(0, limit);
+}
+
+function buildApifyFacebookAccountInput(accountUrl: string, limit: number): Record<string, unknown> {
+  const resultsLimit = Math.min(50, Math.max(limit * 4, limit, 10));
+  return {
+    startUrls: [{ url: accountUrl }],
+    resultsLimit,
+    maxPosts: resultsLimit,
+  };
+}
+
+function apifyFacebookPostToCrawledVideo(item: Record<string, unknown>, accountUrl: string): CrawledVideo | null {
+  const media = findFacebookVideoMedia(item);
+  if (!media) return null;
+  const rawUrl = String(media.url || media.permalink_url || item.url || item.topLevelUrl || '').trim();
+  const sourceUrl = rawUrl && isPlatformUrl(rawUrl, 'facebook') ? stripTrackingParams(rawUrl) : '';
+  if (!sourceUrl || !looksLikeVideoUrl(sourceUrl, 'facebook')) return null;
+  const author = String(item.pageName || asRecord(item.user).name || accountLabelFromUrl(accountUrl)).trim();
+  const text = String(item.text || item.message || '').trim();
+  const title = cleanupAnalysisTitle(text || (author ? `Facebook video by ${author}` : 'Facebook video'));
+  const durationMs = Number(media.playable_duration_in_ms || 0);
+  const likes = Number(item.likes || item.reactionLikeCount || 0);
+  const comments = Number(item.comments || 0);
+  const shares = Number(item.shares || 0);
+  return {
+    platform: 'facebook',
+    title,
+    sourceUrl,
+    thumbnailUrl: firstImageUrl([media.thumbnail, media.thumbnailImage, media.image, media]),
+    duration: durationMs > 0 ? Math.round(durationMs / 1000) : Number(media.duration || 0),
+    views: shares > 0 ? `${compactNumber(shares)} shares` : 'Facebook',
+    tags: facebookTagsFromPost(item, accountUrl),
+    uploadedAt: apifyFacebookUploadedAt(item, media),
+    author,
+    likes: likes > 0 ? compactNumber(likes) : undefined,
+    comments: comments > 0 ? compactNumber(comments) : undefined,
+    source: 'apify',
+  };
+}
+
+function findFacebookVideoMedia(value: unknown, depth = 0): Record<string, unknown> | null {
+  if (depth > 8 || value == null) return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findFacebookVideoMedia(item, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (typeof value !== 'object') return null;
+  const record = value as Record<string, unknown>;
+  const type = String(record.__typename || record.__isMedia || '').toLowerCase();
+  const playable = record.is_playable === true
+    || type === 'video'
+    || Boolean(record.playable_url || record.playable_url_quality_hd || record.browser_native_hd_url || record.browser_native_sd_url || record.videoId);
+  const mediaUrl = String(record.url || record.permalink_url || '').trim();
+  if (playable && (!mediaUrl || isPlatformUrl(mediaUrl, 'facebook'))) return record;
+  for (const key of ['media', 'attachments', 'video', 'videos', 'comet_sections']) {
+    const found = findFacebookVideoMedia(record[key], depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+function apifyFacebookUploadedAt(item: Record<string, unknown>, media: Record<string, unknown>): string | undefined {
+  const iso = String(item.time || item.createdAt || item.date || '').trim();
+  if (iso && !Number.isFinite(Number(iso))) return iso;
+  const timestamp = Number(item.timestamp || media.publish_time || 0);
+  if (timestamp > 1_000_000_000_000) return new Date(timestamp).toISOString();
+  if (timestamp > 1_000_000_000) return new Date(timestamp * 1000).toISOString();
+  return undefined;
+}
+
+function facebookTagsFromPost(item: Record<string, unknown>, accountUrl: string): string[] {
+  const tags = new Set<string>();
+  const text = String(item.text || '').trim();
+  for (const match of text.matchAll(/#([\p{L}\p{N}_-]+)/gu)) tags.add(match[1]);
+  const account = accountLabelFromUrl(accountUrl).replace(/^@/, '').trim();
+  if (account) tags.add(account);
+  tags.add('facebook');
+  return [...tags].filter(Boolean).slice(0, 8);
+}
+
+// ─── 图文/图片帖采集 ─────────────────────────────────────────────────────────
+async function crawlInstagramImagePostsApify(keyword: string, limit: number): Promise<CrawledImagePost[]> {
+  const token = process.env.APIFY_TOKEN?.trim();
+  if (!token) throw new Error('APIFY_TOKEN is not configured');
+  const actor = process.env.APIFY_INSTAGRAM_ACTOR?.trim() || 'apify/instagram-scraper';
+  const cleanKeyword = keyword.replace(/^#/, '').trim();
+  const rows = await runApifyActorDatasetItems(actor, {
+    directUrls: [`https://www.instagram.com/explore/tags/${encodeURIComponent(cleanKeyword)}/`],
+    resultsType: 'posts',
+    resultsLimit: Math.min(50, Math.max(limit * 4, limit, 12)),
+    addParentData: false,
+  }, Number(process.env.APIFY_TIMEOUT_MS || 240_000), 'Instagram image posts');
+  return rows
+    .map(item => apifyInstagramItemToImagePost(item, keyword))
+    .filter((item): item is CrawledImagePost => Boolean(item))
+    .slice(0, limit);
+}
+
+function apifyInstagramItemToImagePost(item: Record<string, unknown>, keyword: string): CrawledImagePost | null {
+  const type = String(item.type || '').toLowerCase();
+  const isVideo = type === 'video' || item.productType === 'clips' || Boolean(item.videoUrl);
+  if (isVideo) return null;
+  const author = String(item.ownerUsername || '').trim();
+  const shortCode = String(item.shortCode || '').trim();
+  const rawUrl = String(item.url || (shortCode ? `https://www.instagram.com/p/${shortCode}/` : '')).trim();
+  const sourceUrl = canonicalSourceUrl('instagram', rawUrl, author);
+  if (!sourceUrl || !isPlatformUrl(sourceUrl, 'instagram')) return null;
+  if (!/\/p\//i.test(sourceUrl)) return null;
+  const thumbnailUrl = firstImageUrl([item.displayUrl, item.images, item]);
+  if (!thumbnailUrl) return null;
+  const caption = String(item.caption || '').trim();
+  const imageUrls = imageUrlsFrom([item.displayUrl, item.images, item.childPosts, item]).filter(url => !/\.(?:mp4|mov|webm)(?:[?#]|$)/i.test(url));
+  const likes = Number(item.likesCount || 0);
+  const comments = Number(item.commentsCount || 0);
+  const owner = asRecord(item.owner);
+  return {
+    platform: 'instagram',
+    title: cleanupAnalysisTitle(caption || (author ? `Instagram post by ${author}` : 'Instagram image post')),
+    sourceUrl,
+    thumbnailUrl,
+    caption,
+    imageUrls: imageUrls.length ? imageUrls : [thumbnailUrl],
+    views: likes > 0 ? `${compactNumber(likes)} likes` : 'Instagram',
+    tags: apifyInstagramTags(item, keyword),
+    uploadedAt: apifyInstagramUploadedAt(item),
+    author,
+    likes: likes > 0 ? compactNumber(likes) : undefined,
+    comments: comments > 0 ? compactNumber(comments) : undefined,
+    followers: Number(item.ownerFollowersCount || item.followersCount || owner.followersCount || 0) || undefined,
+    isPaidPartnership: item.isPaidPartnership === true || item.isPaidPartnershipPost === true,
+    source: 'apify-image',
+  };
+}
+
+async function crawlTikTokImagePostsApify(keyword: string, limit: number): Promise<CrawledImagePost[]> {
+  const token = process.env.APIFY_TOKEN?.trim();
+  if (!token) throw new Error('APIFY_TOKEN is not configured');
+  const actor = process.env.APIFY_TIKTOK_ACTOR?.trim() || 'clockworks/tiktok-scraper';
+  const input = {
+    ...buildApifyTikTokInput(keyword, limit),
+    shouldDownloadSlideshowImages: true,
+  };
+  const rows = await runApifyActorDatasetItems(actor, input, Number(process.env.APIFY_TIMEOUT_MS || 240_000), 'TikTok image posts');
+  return rows
+    .map(item => apifyTikTokItemToImagePost(item, keyword))
+    .filter((item): item is CrawledImagePost => Boolean(item))
+    .slice(0, limit);
+}
+
+function apifyTikTokItemToImagePost(item: Record<string, unknown>, keyword: string): CrawledImagePost | null {
+  const hasImages = Boolean(item.imagePost)
+    || (Array.isArray(item.images) && item.images.length > 0)
+    || (Array.isArray(item.imageUrls) && item.imageUrls.length > 0)
+    || String(item.type || item.mediaType || '').toLowerCase().includes('photo');
+  if (!hasImages) return null;
+  const author = apifyAuthor(item);
+  const sourceUrl = canonicalSourceUrl('tiktok', String(item.webVideoUrl || item.url || item.shareUrl || item.link || '').trim(), author);
+  if (!sourceUrl || !isPlatformUrl(sourceUrl, 'tiktok')) return null;
+  const text = String(item.text || item.description || item.desc || item.title || '').trim();
+  const thumbnailUrl = firstImageUrl([item.imagePost, item.images, item.imageUrls, item.coverUrl, item.thumbnailUrl, item]);
+  const imageUrls = imageUrlsFrom([item.imagePost, item.images, item.imageUrls, item.coverUrl, item.thumbnailUrl, item]);
+  const likes = Number(item.diggCount || item.likes || item.likeCount || 0);
+  const comments = Number(item.commentCount || item.comments || 0);
+  const shares = Number(item.shareCount || item.shares || 0);
+  const plays = Number(item.playCount || item.plays || 0);
+  const authorMeta = asRecord(item.authorMeta);
+  return {
+    platform: 'tiktok',
+    title: cleanupAnalysisTitle(text || (author ? `TikTok photo post by ${author}` : 'TikTok photo post')),
+    sourceUrl,
+    thumbnailUrl,
+    caption: text,
+    imageUrls: imageUrls.length ? imageUrls : [thumbnailUrl].filter(Boolean),
+    views: likes > 0 ? `${compactNumber(likes)} likes` : 'TikTok',
+    tags: apifyTikTokTags(item, keyword),
+    uploadedAt: apifyUploadedAt(item),
+    author,
+    likes: likes > 0 ? compactNumber(likes) : undefined,
+    comments: comments > 0 ? compactNumber(comments) : undefined,
+    shares: shares > 0 ? compactNumber(shares) : undefined,
+    plays: plays > 0 ? compactNumber(plays) : undefined,
+    followers: Number(authorMeta.fans || authorMeta.followers || 0) || undefined,
+    isAd: item.isAd === true || item.isSponsored === true,
+    source: 'apify-image',
+  };
+}
+
+async function crawlFacebookImagePostsApify(keyword: string, limit: number): Promise<CrawledImagePost[]> {
+  const token = process.env.APIFY_TOKEN?.trim();
+  if (!token) throw new Error('APIFY_TOKEN is not configured');
+  const actor = process.env.APIFY_FACEBOOK_ACTOR?.trim() || 'apify/facebook-posts-scraper';
+  const inputUrl = isPlatformUrl(keyword, 'facebook')
+    ? keyword
+    : await discoverFacebookPageUrl(keyword);
+  const rows = await runApifyActorDatasetItems(actor, {
+    startUrls: [{ url: inputUrl }],
+    resultsLimit: Math.min(50, Math.max(limit * 4, 10)),
+    maxPosts: Math.min(50, Math.max(limit * 4, 10)),
+  }, Number(process.env.APIFY_TIMEOUT_MS || 240_000), 'Facebook image posts');
+  const mapped = rows
+    .map(item => apifyFacebookPostToImagePost(item, keyword))
+    .filter((item): item is CrawledImagePost => Boolean(item))
+    .slice(0, limit);
+  if (mapped.length > 0) return mapped;
+  return crawlFacebookImagePostsPublicSearch(keyword, limit);
+}
+
+async function discoverFacebookPageUrl(keyword: string): Promise<string> {
+  const actor = process.env.APIFY_FACEBOOK_SEARCH_ACTOR?.trim() || 'apify/facebook-search-scraper';
+  const rows = await runApifyActorDatasetItems(actor, {
+    categories: [keyword.trim()],
+    resultsLimit: 1,
+  }, Number(process.env.APIFY_TIMEOUT_MS || 240_000), 'Facebook page search');
+  const pageUrl = String(rows[0]?.pageUrl || rows[0]?.facebookUrl || rows[0]?.url || '').trim();
+  if (!isPlatformUrl(pageUrl, 'facebook')) throw new Error(`Facebook page search returned no public page for: ${keyword}`);
+  return stripTrackingParams(pageUrl);
+}
+
+function isDirectFacebookImageAsset(value: string): boolean {
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    if (host === 'facebook.com' || host.endsWith('.facebook.com')) return false;
+    return host.endsWith('.fbcdn.net') || /\.(?:jpe?g|png|webp|avif)(?:$|[?#])/i.test(url.pathname + url.search);
+  } catch { return false; }
+}
+
+function apifyFacebookPostToImagePost(item: Record<string, unknown>, keyword: string): CrawledImagePost | null {
+  if (findFacebookVideoMedia(item)) return null;
+  const media = findFacebookImageMedia(item);
+  const sourceUrl = String(item.url || item.topLevelUrl || media?.url || '').trim();
+  if (!sourceUrl || !isPlatformUrl(sourceUrl, 'facebook')) return null;
+  if (/\/search\//i.test(sourceUrl)) return null;
+  const imageUrls = imageUrlsFrom([media, item.media, item]).filter(isDirectFacebookImageAsset);
+  const thumbnailUrl = imageUrls[0] || '';
+  if (!media || !thumbnailUrl) return null;
+  const author = String(item.pageName || asRecord(item.user).name || '').trim();
+  const text = String(item.text || item.message || '').trim();
+  const captionTags = [...text.matchAll(/#([\p{L}\p{N}_-]+)/gu)].map(match => match[1]!).filter(Boolean);
+  const likes = Number(item.likes || item.reactionLikeCount || 0);
+  const comments = Number(item.comments || 0);
+  const shares = Number(item.shares || item.shareCount || 0);
+  const user = asRecord(item.user);
+  return {
+    platform: 'facebook',
+    title: cleanupAnalysisTitle(text || (author ? `Facebook post by ${author}` : 'Facebook image post')),
+    sourceUrl: stripTrackingParams(sourceUrl),
+    thumbnailUrl,
+    caption: text,
+    imageUrls: imageUrls.length ? imageUrls : [thumbnailUrl],
+    views: likes > 0 ? `${compactNumber(likes)} likes` : 'Facebook',
+    tags: [...new Set([...captionTags, ...tagsFromKeyword(/^https?:\/\//i.test(keyword) ? '' : keyword, 'facebook')])].slice(0, 12),
+    uploadedAt: apifyFacebookUploadedAt(item, media || {}),
+    author,
+    likes: likes > 0 ? compactNumber(likes) : undefined,
+    comments: comments > 0 ? compactNumber(comments) : undefined,
+    shares: shares > 0 ? compactNumber(shares) : undefined,
+    followers: Number(item.followersCount || item.pageFollowers || user.followersCount || 0) || undefined,
+    source: 'apify-image',
+  };
+}
+
+function findFacebookImageMedia(value: unknown, depth = 0): Record<string, unknown> | null {
+  if (depth > 8 || value == null) return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findFacebookImageMedia(item, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (typeof value !== 'object') return null;
+  const record = value as Record<string, unknown>;
+  const type = String(record.__typename || record.__isMedia || '').toLowerCase();
+  if (type === 'photo' || record.photo_image || record.photoImage || record.image || record.thumbnail || record.thumbnail_image) return record;
+  for (const key of ['media', 'attachments', 'attachment', 'subattachments', 'all_subattachments', 'styles', 'photo', 'photos']) {
+    const found = findFacebookImageMedia(record[key], depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+async function crawlFacebookImagePostsPublicSearch(keyword: string, limit: number): Promise<CrawledImagePost[]> {
+  const query = `site:facebook.com "${keyword}" ("/photos/" OR "photo" OR "/posts/")`;
+  const url = `https://www.bing.com/search?format=rss&q=${encodeURIComponent(query)}`;
+  const xml = await fetchText(url, 20_000);
+  const items: CrawledImagePost[] = [];
+  const seen = new Set<string>();
+  for (const match of xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)) {
+    const block = match[1] || '';
+    const link = cleanSearchResultUrl(decodeHtml(block.match(/<link>([^<]+)<\/link>/i)?.[1] || '').trim());
+    if (!link || !isPlatformUrl(link, 'facebook') || /\/(?:search|watch|reel|videos)\b/i.test(link) || seen.has(link)) continue;
+    seen.add(link);
+    const title = decodeHtml(block.match(/<title>([^<]+)<\/title>/i)?.[1] || '').trim();
+    items.push({
+      platform: 'facebook',
+      title: cleanupAnalysisTitle(title || `Facebook image post: ${keyword}`),
+      sourceUrl: link,
+      thumbnailUrl: '',
+      caption: title,
+      imageUrls: [],
+      views: 'Facebook',
+      tags: tagsFromKeyword(keyword, 'facebook'),
+      source: 'public-search-image',
+    });
+    if (items.length >= limit) break;
+  }
+  if (items.length === 0) throw new Error('Facebook public search did not expose image posts for this keyword');
+  return items;
+}
+
+async function crawlYouTubeCommunityPostsPublicSearch(keyword: string, limit: number): Promise<CrawledImagePost[]> {
+  const query = `site:youtube.com/post "${keyword}"`;
+  const url = `https://www.bing.com/search?format=rss&q=${encodeURIComponent(query)}`;
+  const xml = await fetchText(url, 20_000);
+  const items: CrawledImagePost[] = [];
+  const seen = new Set<string>();
+  const itemMatches = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)];
+  for (const match of itemMatches) {
+    const block = match[1] || '';
+    const link = cleanSearchResultUrl(decodeHtml(block.match(/<link>([^<]+)<\/link>/i)?.[1] || '').trim());
+    if (!link || !isPlatformUrl(link, 'youtube') || !/\/post\//i.test(link) || seen.has(link)) continue;
+    seen.add(link);
+    const title = decodeHtml(block.match(/<title>([^<]+)<\/title>/i)?.[1] || '').trim();
+    items.push({
+      platform: 'youtube',
+      title: cleanupAnalysisTitle(title || `YouTube Community post: ${keyword}`),
+      sourceUrl: link,
+      thumbnailUrl: '',
+      caption: title,
+      imageUrls: [],
+      views: 'YouTube',
+      tags: tagsFromKeyword(keyword, 'youtube'),
+      source: 'public-search-image',
+    });
+    if (items.length >= limit) break;
+  }
+  if (items.length === 0) throw new Error('YouTube Community posts are not exposed reliably by public search');
+  return items;
+}
+
+function imagePostRelevant(item: CrawledImagePost, keyword: string): boolean {
+  const clean = keyword.trim().toLowerCase();
+  if (!clean || /^https?:\/\//i.test(clean)) return true;
+  const text = `${item.title} ${item.tags.join(' ')}`.toLowerCase();
+  return clean.split(/\s+/).some(token => token.length > 1 && text.includes(token.replace(/^#/, '')));
+}
+
+async function fetchImageForAnalysis(url: string): Promise<{ base64: string; mimeType: string } | null> {
+  const normalized = normalizeThumbnailUrl(url);
+  if (!normalized) return null;
+  try {
+    let filePath = '';
+    if (normalized.startsWith('/media/')) filePath = path.join(MEDIA_DIR, path.basename(normalized));
+    if (filePath && fs.existsSync(filePath)) {
+      return { base64: fs.readFileSync(filePath).toString('base64'), mimeType: mimeFromImagePath(filePath) };
+    }
+    const resp = await fetch(normalized, {
+      signal: AbortSignal.timeout(20_000),
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/125 Safari/537.36',
+        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+      },
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const mimeType = resp.headers.get('content-type') || 'image/jpeg';
+    if (!mimeType.startsWith('image/')) return null;
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (!buf.length || buf.length > 8 * 1024 * 1024) return null;
+    return { base64: buf.toString('base64'), mimeType };
+  } catch {
+    return null;
+  }
+}
+
+function mimeFromImagePath(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === '.png') return 'image/png';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.gif') return 'image/gif';
+  return 'image/jpeg';
+}
+
+async function analyzeImagePostBestEffort(item: CrawledImagePost, keyword: string, _fallback?: VideoAiAnalysis): Promise<{ status: 'analyzed' | 'failed'; analysis?: ImagePostEvidenceAnalysis; error?: string; provider?: 'qwen' | 'gemini' }> {
+  const urls = [...new Set((item.imageUrls?.length ? item.imageUrls : [item.thumbnailUrl]).filter(Boolean))].slice(0, 10);
+  const images = (await Promise.all(urls.map(async (url, index) => {
+    const image = await fetchImageForAnalysis(url);
+    return image ? { ...image, imageIndex: index + 1 } : null;
+  }))).filter((image): image is { base64: string; mimeType: string; imageIndex: number } => Boolean(image));
+  if (!images.length) return { status: 'failed', error: '公开图片下载失败，未执行视觉分析' };
+  const input = {
+    images,
+    title: item.title,
+    caption: item.caption,
+    platform: item.platform,
+    tags: [...new Set([...item.tags, ...tagsFromKeyword(keyword, item.platform)])],
+  };
+  try {
+    const analysis = await analyzeImagePostEvidenceWithQwen(input);
+    return { status: 'analyzed', analysis, provider: 'qwen' };
+  } catch (qwenError) {
+    console.warn('[videos] Qwen image post analysis failed, trying Gemini:', qwenError instanceof Error ? qwenError.message : qwenError);
+    try {
+      const analysis = await analyzeImagePostEvidenceWithGemini({
+      images,
+      title: item.title,
+      caption: item.caption,
+      platform: item.platform,
+      tags: [...new Set([...item.tags, ...tagsFromKeyword(keyword, item.platform)])],
+      });
+      return { status: 'analyzed', analysis, provider: 'gemini' };
+    } catch (geminiError) {
+      console.warn('[videos] Gemini image post analysis failed:', geminiError instanceof Error ? geminiError.message : geminiError);
+      const qwenMessage = qwenError instanceof Error ? qwenError.message : String(qwenError);
+      const geminiMessage = geminiError instanceof Error ? geminiError.message : String(geminiError);
+      return { status: 'failed', error: `Qwen: ${qwenMessage}; Gemini: ${geminiMessage}`.slice(0, 900) };
+    }
+  }
+}
+
+// 反爬节流：同一平台的元数据请求全局排队串行，条与条之间加随机间隔，
+// 避免多个入口（手动爬取/定时任务/backfill）叠加成并发快打触发风控。
+const crawlPacingQueues = new Map<string, Promise<void>>();
+const CRAWL_MIN_INTERVAL_MS = Number(process.env.CRAWLER_MIN_INTERVAL_MS || 3000);
+const CRAWL_JITTER_MS = Number(process.env.CRAWLER_JITTER_MS || 4000);
+
+async function withPlatformCrawlPacing<T>(platform: string, task: () => Promise<T>): Promise<T> {
+  const prev = crawlPacingQueues.get(platform) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  crawlPacingQueues.set(platform, prev.then(() => gate));
+  await prev;
+  try {
+    return await task();
+  } finally {
+    setTimeout(release, CRAWL_MIN_INTERVAL_MS + Math.random() * CRAWL_JITTER_MS);
+  }
+}
+
+async function crawlYtDlpMetadata(platform: Platform, url: string, keyword: string): Promise<CrawledVideo> {
+  return withPlatformCrawlPacing(platform, () => crawlYtDlpMetadataNow(platform, url, keyword));
+}
+
+async function crawlYtDlpMetadataNow(platform: Platform, url: string, keyword: string): Promise<CrawledVideo> {
+  let stdout = '';
+  try {
+    ({ stdout } = await execFileAsync('python3', buildYtDlpArgs(['--dump-json', '--skip-download'], url, false), { maxBuffer: 8 * 1024 * 1024, timeout: 45_000, env: crawlerExecEnv() }));
+  } catch {
+    if (!usesServerCookiesForCrawl(platform)) throw new Error(`${platform} anonymous metadata crawl failed`);
+    stdout = await execYtDlpWithCookieFallback(['--dump-json', '--skip-download'], url, 60_000, 8 * 1024 * 1024);
+  }
+  const line = stdout.split('\n').find(Boolean);
+  if (!line) throw new Error(`${platform} returned empty metadata`);
+  const meta = JSON.parse(line) as Record<string, unknown>;
+  const webpageUrl = canonicalSourceUrl(platform, String(meta.webpage_url || meta.original_url || meta.url || url), metadataUploader(meta));
+  const title = metadataTitle(platform, meta);
+  const thumbnail = thumbnailForPlatform(platform, webpageUrl, firstImageUrl([meta.thumbnails, meta.thumbnail, meta]));
+  const duration = Number(meta.duration || 0);
+  const uploadedAt = uploadedAtFromMeta(meta);
+  const views = typeof meta.view_count === 'number' ? compactNumber(meta.view_count) : platform;
+  const tags = Array.isArray(meta.tags)
+    ? meta.tags.filter((t): t is string => typeof t === 'string').slice(0, 5)
+    : [];
+  return normalizeCrawledVideo({ platform, title, sourceUrl: webpageUrl, thumbnailUrl: thumbnail, duration, views, tags, uploadedAt });
+}
+
+async function downloadVideoToMaterial(input: {
+  sourceUrl: string;
+  title: string;
+  platform: Platform;
+  duration: number;
+  tenantId: string;
+  record?: Record<string, unknown> | null;
+}): Promise<Material> {
+  const tenantMediaDir = tenantAssetDir(MEDIA_DIR, input.tenantId);
+  fs.mkdirSync(tenantMediaDir, { recursive: true });
+  const id = randomUUID();
+  const outTpl = path.join(tenantMediaDir, `${id}.%(ext)s`);
+  const downloadArgs = [
+    '--no-playlist',
+    '--merge-output-format', 'mp4',
+    '--max-filesize', '120m',
+    '-f', 'bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/bv*[height<=720]+ba/best[height<=720]/best',
+    '-o', outTpl,
+  ];
+  const cleanupIncompleteDownload = () => {
+    try {
+      for (const filename of fs.readdirSync(tenantMediaDir)) {
+        if (filename.startsWith(`${id}.`) && filename.endsWith('.part')) fs.unlinkSync(path.join(tenantMediaDir, filename));
+      }
+    } catch { /* best effort */ }
+  };
+
+  let ytDlpError: unknown = null;
+  try {
+    await execFileAsync('python3', buildYtDlpArgs(downloadArgs, input.sourceUrl, false), { maxBuffer: 4 * 1024 * 1024, timeout: 180_000, env: crawlerExecEnv() });
+  } catch (e) {
+    ytDlpError = e;
+    if (usesServerCookiesForCrawl(input.platform)) {
+      try {
+        await execYtDlpWithCookieFallback(downloadArgs, input.sourceUrl, 180_000, 4 * 1024 * 1024);
+        ytDlpError = null;
+      } catch (cookieError) {
+        ytDlpError = cookieError;
+      }
+    }
+  }
+  if (ytDlpError && (input.platform === 'instagram' || input.platform === 'tiktok')) {
+    const tenantId = apifyTenantIdFromRecord(input.record);
+    if (canUseApifyVideoFallback(tenantId, input.platform)) {
+      const downloaded = input.platform === 'instagram'
+        ? await downloadInstagramVideoViaApify(input.sourceUrl, tenantId)
+        : await downloadTikTokVideoViaApify(input.sourceUrl, tenantId);
+      const materialPath = path.join(tenantMediaDir, `${id}.mp4`);
+      fs.copyFileSync(downloaded.filePath, materialPath);
+      cleanupTempVideo(downloaded.filePath);
+      ytDlpError = null;
+    }
+  }
+  if (ytDlpError) {
+    cleanupIncompleteDownload();
+    throw ytDlpError instanceof Error ? ytDlpError : new Error('yt-dlp failed for material download');
+  }
+  const downloaded = pickDownloadedVideoFile(id, tenantMediaDir);
+  if (!downloaded) {
+    cleanupIncompleteDownload();
+    throw new Error('yt-dlp did not produce a video file');
+  }
+
+  const fullPath = path.join(tenantMediaDir, downloaded);
+  const posterFile = `${id}.poster.jpg`;
+  const posterPath = path.join(tenantMediaDir, posterFile);
+  const posterOk = await extractPoster(fullPath, posterPath, input.duration > 1 ? 1 : 0);
+  const createdAt = new Date().toISOString();
+  const material = buildDownloadedReferenceMaterial({
+    id,
+    tenantId: input.tenantId,
+    name: safeMaterialName(input.title, input.platform),
+    platform: input.platform,
+    sourceUrl: input.sourceUrl,
+    duration: input.duration || await probeDuration(fullPath),
+    size: humanSize(fs.statSync(fullPath).size),
+    file: tenantAssetRelativePath(input.tenantId, downloaded),
+    poster: posterOk ? tenantAssetRelativePath(input.tenantId, posterFile) : undefined,
+    contentSha256: createHash('sha256').update(fs.readFileSync(fullPath)).digest('hex'),
+    createdAt,
+  }) as Material;
+  persistMaterials([material, ...loadMaterials().filter(m => m.id !== material.id)]);
+  return material;
+}
+
+export async function downloadVideoForAnalysis(input: {
+  sourceUrl: string;
+  title: string;
+  platform: Platform;
+  record?: Record<string, unknown> | null;
+}, executeDownload = execFileAsync, budget = new DownloadBudget(Math.max(10_000, Number(process.env.VIDEO_ANALYSIS_DOWNLOAD_TIMEOUT_MS || 150_000)))): Promise<{ filePath: string; fileName: string; mimeType: string; size: number }> {
+  const source = validatePublicVideoSourceUrl(input.sourceUrl, input.platform);
+  if (!source) throw new Error('unsafe_public_video_source');
+  input = { ...input, ...source };
+  fs.mkdirSync(ANALYSIS_DIR, { recursive: true });
+  const tenantId = apifyTenantIdFromRecord(input.record);
+  // Facebook's public page frequently blocks yt-dlp or makes it retry several
+  // formats before failing. The configured posts actor already exposes the
+  // playable CDN URL, so use it first for an explicit analysis request.
+  if (input.platform === 'facebook' && canUseApifyVideoFallback(tenantId, 'facebook')) {
+    try {
+      return await downloadFacebookVideoViaApify(input.sourceUrl, tenantId, budget);
+    } catch (error) {
+      budget.record('Apify', error);
+      budget.remaining();
+      console.warn('[videos] Facebook Apify analysis video fallback failed, trying yt-dlp:', error instanceof Error ? error.message : error);
+    }
+  }
+  // Datacenter YouTube traffic is commonly challenged before yt-dlp can obtain
+  // media bytes. A dedicated downloader actor stores one low-res MP4 in Apify
+  // KVS, which we immediately copy into our own PocketBase-backed pipeline.
+  if (input.platform === 'youtube' && canUseApifyVideoFallback(tenantId, 'youtube')) {
+    try {
+      return await downloadYouTubeVideoViaApify(input.sourceUrl, tenantId, budget);
+    } catch (error) {
+      budget.record('Apify', error);
+      budget.remaining();
+      console.warn('[videos] YouTube Apify analysis video fallback failed, trying yt-dlp:', error instanceof Error ? error.message : error);
+    }
+  }
+  const id = randomUUID();
+  const outTpl = path.join(ANALYSIS_DIR, `${id}.%(ext)s`);
+  const clipSeconds = Math.max(30, Number(process.env.VIDEO_ANALYSIS_CLIP_SECONDS || 180));
+  const baseDownloadArgs = [
+    '--no-playlist',
+    '--merge-output-format', 'mp4',
+    '--max-filesize', process.env.VIDEO_ANALYSIS_MAX_FILESIZE || '80m',
+    ...(ffmpegBin ? ['--ffmpeg-location', ffmpegBin] : []),
+    '-o', outTpl,
+  ];
+  const formatCandidates: Array<{ format?: string; section?: boolean; label: string }> = [
+    { format: 'h264_720p_1023806-1/h264_720p_1023806-0/download/best[height<=720]/best', section: false, label: 'tiktok-h264-full' },
+    { format: 'bv*[height<=480]+ba/bv*[height<=480]/b[height<=480][vcodec!=none]/best[height<=480][vcodec!=none]/best[vcodec!=none]', section: false, label: '480-full' },
+    { format: 'bv*+ba/bv*/b[vcodec!=none]/best[vcodec!=none]', section: false, label: 'best-full' },
+    { section: false, label: 'auto-full' },
+    { format: 'bv*[height<=360]+ba/bv*[height<=360]/b[height<=360][vcodec!=none]/best[height<=360][vcodec!=none]/best[vcodec!=none]', section: true, label: '360-section' },
+    { format: 'bv*[height<=480]+ba/bv*[height<=480]/b[height<=480][vcodec!=none]/best[height<=480][vcodec!=none]/best[vcodec!=none]', section: true, label: '480-section' },
+    { format: 'bv*+ba/bv*/b[vcodec!=none]/best[vcodec!=none]', section: true, label: 'best-section' },
+  ];
+
+  let lastError: unknown = null;
+  for (const candidate of formatCandidates) {
+    const downloadArgs = [
+      ...baseDownloadArgs,
+      ...(candidate.section && ffmpegBin ? ['--download-sections', `*0-${clipSeconds}`] : []),
+      ...(candidate.format ? ['-f', candidate.format] : []),
+    ];
+    try {
+      await executeDownload('python3', buildYtDlpArgs(downloadArgs, input.sourceUrl, false), { maxBuffer: 4 * 1024 * 1024, timeout: budget.remaining(), env: crawlerExecEnv() });
+      lastError = null;
+      break;
+    } catch (e) {
+      lastError = e;
+      budget.record(candidate.label, e);
+      if (terminalDownloadFailure(e)) break;
+      if (usesServerCookiesForCrawl(input.platform) && (cookieBrowsers().length > 0 || cookieFiles().length > 0)) {
+        try {
+          await execYtDlpWithCookieFallback(downloadArgs, input.sourceUrl, budget.remaining(), 4 * 1024 * 1024, budget);
+          lastError = null;
+          break;
+        } catch (cookieError) {
+          lastError = cookieError;
+          if (terminalDownloadFailure(cookieError)) break;
+        }
+      }
+      try { budget.remaining(); } catch (error) { lastError = error; break; }
+      console.warn(`[videos] analysis download attempt failed (${candidate.label}):`, lastError instanceof Error ? lastError.message : lastError);
+    }
+  }
+  if (lastError) {
+    cleanupDownloadedFilesById(id, ANALYSIS_DIR);
+    if (input.platform === 'tiktok' && canUseApifyVideoFallback(tenantId, 'tiktok')) {
+      try {
+        console.warn('[videos] TikTok yt-dlp analysis download failed, trying Apify video fallback:', lastError instanceof Error ? lastError.message : lastError);
+        return await downloadTikTokVideoViaApify(input.sourceUrl, tenantId, budget);
+      } catch (apifyError) {
+        budget.record('Apify', apifyError);
+        console.warn('[videos] TikTok Apify analysis video fallback failed:', apifyError instanceof Error ? apifyError.message : apifyError);
+      }
+    }
+    if (input.platform === 'instagram' && canUseApifyVideoFallback(tenantId, 'instagram')) {
+      try {
+        console.warn('[videos] Instagram yt-dlp analysis download failed, trying Apify video fallback:', lastError instanceof Error ? lastError.message : lastError);
+        return await downloadInstagramVideoViaApify(input.sourceUrl, tenantId, budget);
+      } catch (apifyError) {
+        budget.record('Apify', apifyError);
+        console.warn('[videos] Instagram Apify analysis video fallback failed:', apifyError instanceof Error ? apifyError.message : apifyError);
+      }
+    }
+    throw budget.error(lastError instanceof Error ? lastError.message.slice(0, 200) : 'yt-dlp failed for all analysis formats');
+  }
+  const downloaded = pickDownloadedVideoFile(id, ANALYSIS_DIR);
+  if (!downloaded) {
+    cleanupDownloadedFilesById(id, ANALYSIS_DIR);
+    throw new Error('yt-dlp did not produce an analysis video file');
+  }
+
+  const filePath = path.join(ANALYSIS_DIR, downloaded);
+  return {
+    filePath,
+    fileName: downloaded,
+    mimeType: mimeFromPath(filePath),
+    size: fs.statSync(filePath).size,
+  };
+}
+
+function pickDownloadedVideoFile(id: string, dir = MEDIA_DIR): string | undefined {
+  const files = fs.readdirSync(dir)
+    .filter(file => file.startsWith(`${id}.`) && !file.includes('.poster.'));
+  return files.find(file => /\.(mp4|webm|mov|mkv)$/i.test(file));
+}
+
+function cleanupDownloadedFilesById(id: string, dir: string): void {
+  try {
+    for (const file of fs.readdirSync(dir)) {
+      if (file.startsWith(`${id}.`)) fs.unlinkSync(path.join(dir, file));
+    }
+  } catch {
+    // best effort cleanup
+  }
+}
+
+async function downloadTikTokVideoViaApify(sourceUrl: string, tenantId?: string, budget = new DownloadBudget(Math.max(10_000, Number(process.env.VIDEO_ANALYSIS_DOWNLOAD_TIMEOUT_MS || 150_000)))): Promise<{ filePath: string; fileName: string; mimeType: string; size: number }> {
+  const token = process.env.APIFY_TOKEN?.trim();
+  if (!token) throw new Error('APIFY_TOKEN is not configured');
+  if (!canUseApifyVideoFallback(tenantId)) throw new Error('Apify video fallback daily limit reached for this account or server');
+  const actor = process.env.APIFY_TIKTOK_ACTOR?.trim() || 'clockworks/tiktok-scraper';
+  const input = {
+    postURLs: [sourceUrl],
+    resultsPerPage: 1,
+    shouldDownloadVideos: true,
+    shouldDownloadCovers: false,
+    shouldDownloadSubtitles: false,
+    shouldDownloadSlideshowImages: false,
+    shouldDownloadAvatars: false,
+    shouldDownloadMusicCovers: false,
+    shouldDownloadMusic: false,
+  };
+  const runUrl = `https://api.apify.com/v2/acts/${encodeURIComponent(actor)}/run-sync-get-dataset-items?clean=true&token=${encodeURIComponent(token)}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.min(budget.remaining(), Number(process.env.APIFY_VIDEO_TIMEOUT_MS || 180_000)));
+  try {
+    const r = await fetch(runUrl, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    });
+    const text = await r.text();
+    if (!r.ok) throw new Error(`Apify TikTok video HTTP ${r.status}: ${text.slice(0, 300)}`);
+    const rows = JSON.parse(text) as unknown;
+    const row = Array.isArray(rows) ? rows[0] as Record<string, unknown> | undefined : undefined;
+    const videoUrl = row ? findApifyVideoDownloadUrl(row) : '';
+    if (!videoUrl) throw new Error('Apify did not return a downloadable video URL');
+    const videoRes = await fetch(videoUrl, { signal: AbortSignal.timeout(budget.remaining()) });
+    if (!videoRes.ok) throw new Error(`Apify video download HTTP ${videoRes.status}`);
+    const buf = Buffer.from(await videoRes.arrayBuffer());
+    if (buf.length < 1024) throw new Error('Apify returned an empty video file');
+    fs.mkdirSync(ANALYSIS_DIR, { recursive: true });
+    const fileName = `${randomUUID()}.mp4`;
+    const filePath = path.join(ANALYSIS_DIR, fileName);
+    fs.writeFileSync(filePath, buf);
+    recordApifyVideoFallbackUse(tenantId);
+    return {
+      filePath,
+      fileName,
+      mimeType: videoRes.headers.get('content-type')?.split(';')[0] || 'video/mp4',
+      size: buf.length,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function downloadYouTubeVideoViaApify(sourceUrl: string, tenantId?: string, budget = new DownloadBudget(Math.max(10_000, Number(process.env.VIDEO_ANALYSIS_DOWNLOAD_TIMEOUT_MS || 150_000)))): Promise<{ filePath: string; fileName: string; mimeType: string; size: number }> {
+  const token = process.env.APIFY_TOKEN?.trim();
+  if (!token) throw new Error('APIFY_TOKEN is not configured');
+  if (!canUseApifyVideoFallback(tenantId, 'youtube')) throw new Error('Apify YouTube fallback daily limit reached for this account or server');
+  const actor = process.env.APIFY_YOUTUBE_VIDEO_ACTOR?.trim() || 'streamers/youtube-video-downloader';
+  const rows = await runApifyActorDatasetItems(actor, {
+    videos: [{ url: sourceUrl }],
+    storeInKVStore: true,
+    preferredQuality: '360p',
+    preferredFormat: 'mp4',
+    filenameTemplateParts: [],
+  }, Math.min(budget.remaining(), Number(process.env.APIFY_YOUTUBE_VIDEO_TIMEOUT_MS || 300_000)), 'YouTube video');
+  const videoUrl = String(rows[0]?.downloadedFileUrl || '').trim();
+  if (!videoUrl) throw new Error('Apify did not return a downloaded YouTube video URL');
+  const videoRes = await fetch(`${videoUrl}${videoUrl.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`, {
+    signal: AbortSignal.timeout(Math.min(budget.remaining(), Number(process.env.APIFY_YOUTUBE_FILE_TIMEOUT_MS || 120_000))),
+  });
+  if (!videoRes.ok) throw new Error(`Apify YouTube video download HTTP ${videoRes.status}`);
+  const buf = Buffer.from(await videoRes.arrayBuffer());
+  if (buf.length < 1024) throw new Error('Apify returned an empty YouTube video file');
+  fs.mkdirSync(ANALYSIS_DIR, { recursive: true });
+  const fileName = `${randomUUID()}.mp4`;
+  const filePath = path.join(ANALYSIS_DIR, fileName);
+  fs.writeFileSync(filePath, buf);
+  recordApifyVideoFallbackUse(tenantId);
+  return {
+    filePath,
+    fileName,
+    mimeType: videoRes.headers.get('content-type')?.split(';')[0] || 'video/mp4',
+    size: buf.length,
+  };
+}
+
+async function downloadInstagramVideoViaApify(sourceUrl: string, tenantId?: string, budget = new DownloadBudget(Math.max(10_000, Number(process.env.VIDEO_ANALYSIS_DOWNLOAD_TIMEOUT_MS || 150_000)))): Promise<{ filePath: string; fileName: string; mimeType: string; size: number }> {
+  const token = process.env.APIFY_TOKEN?.trim();
+  if (!token) throw new Error('APIFY_TOKEN is not configured');
+  if (!canUseApifyVideoFallback(tenantId, 'instagram')) throw new Error('Apify video fallback daily limit reached for this account or server');
+  const actor = process.env.APIFY_INSTAGRAM_ACTOR?.trim() || 'apify/instagram-scraper';
+  const input = {
+    directUrls: [sourceUrl],
+    resultsType: 'posts',
+    resultsLimit: 1,
+    addParentData: false,
+  };
+  const rows = await runApifyActorDatasetItems(actor, input, Math.min(budget.remaining(), Number(process.env.APIFY_VIDEO_TIMEOUT_MS || 240_000)), 'Instagram video');
+  const row = rows[0];
+  // IG 的 videoUrl 是 cdninstagram 签名直链（无扩展名），findApifyVideoDownloadUrl 的
+  // 扩展名/白名单规则匹配不到，这里优先直接读 videoUrl 字段，再退回通用查找。
+  const videoUrl = String(row?.videoUrl || '').trim() || (row ? findApifyVideoDownloadUrl(row) : '');
+  if (!videoUrl) throw new Error('Apify did not return a downloadable video URL');
+  const videoRes = await fetch(videoUrl, { signal: AbortSignal.timeout(budget.remaining()) });
+  if (!videoRes.ok) throw new Error(`Apify video download HTTP ${videoRes.status}`);
+  const buf = Buffer.from(await videoRes.arrayBuffer());
+  if (buf.length < 1024) throw new Error('Apify returned an empty video file');
+  fs.mkdirSync(ANALYSIS_DIR, { recursive: true });
+  const fileName = `${randomUUID()}.mp4`;
+  const filePath = path.join(ANALYSIS_DIR, fileName);
+  fs.writeFileSync(filePath, buf);
+  recordApifyVideoFallbackUse(tenantId);
+  return {
+    filePath,
+    fileName,
+    mimeType: videoRes.headers.get('content-type')?.split(';')[0] || 'video/mp4',
+    size: buf.length,
+  };
+}
+
+function findFacebookPlayableUrl(value: unknown, depth = 0): string {
+  if (depth > 6 || value == null) return '';
+  if (typeof value === 'string') return /^https?:\/\//i.test(value.trim()) ? value.trim() : '';
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findFacebookPlayableUrl(item, depth + 1);
+      if (found) return found;
+    }
+    return '';
+  }
+  if (typeof value !== 'object') return '';
+  const record = value as Record<string, unknown>;
+  for (const key of ['browser_native_hd_url', 'playable_url_quality_hd', 'browser_native_sd_url', 'playable_url', 'videoUrl', 'downloadUrl']) {
+    const found = findFacebookPlayableUrl(record[key], depth + 1);
+    if (found) return found;
+  }
+  for (const item of Object.values(record)) {
+    if (typeof item === 'object' && item) {
+      const found = findFacebookPlayableUrl(item, depth + 1);
+      if (found) return found;
+    }
+  }
+  return '';
+}
+
+async function downloadFacebookVideoViaApify(sourceUrl: string, tenantId?: string, budget = new DownloadBudget(Math.max(10_000, Number(process.env.VIDEO_ANALYSIS_DOWNLOAD_TIMEOUT_MS || 150_000)))): Promise<{ filePath: string; fileName: string; mimeType: string; size: number }> {
+  if (!process.env.APIFY_TOKEN?.trim()) throw new Error('APIFY_TOKEN is not configured');
+  if (!canUseApifyVideoFallback(tenantId, 'facebook')) throw new Error('Apify video fallback daily limit reached for this account or server');
+  const actor = process.env.APIFY_FACEBOOK_ACTOR?.trim() || 'apify/facebook-posts-scraper';
+  const rows = await runApifyActorDatasetItems(actor, {
+    startUrls: [{ url: sourceUrl }],
+    resultsLimit: 1,
+    maxPosts: 1,
+  }, Math.min(budget.remaining(), Number(process.env.APIFY_VIDEO_TIMEOUT_MS || 180_000)), 'Facebook video');
+  const videoUrl = rows[0] ? findFacebookPlayableUrl(rows[0]) : '';
+  if (!videoUrl) throw new Error('Apify did not return a downloadable Facebook video URL');
+  const videoRes = await fetch(videoUrl, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(Math.min(90_000, budget.remaining())) });
+  if (!videoRes.ok) throw new Error(`Apify Facebook video download HTTP ${videoRes.status}`);
+  const buf = Buffer.from(await videoRes.arrayBuffer());
+  if (buf.length < 1024) throw new Error('Apify returned an empty Facebook video file');
+  fs.mkdirSync(ANALYSIS_DIR, { recursive: true });
+  const fileName = `${randomUUID()}.mp4`;
+  const filePath = path.join(ANALYSIS_DIR, fileName);
+  fs.writeFileSync(filePath, buf);
+  recordApifyVideoFallbackUse(tenantId);
+  return {
+    filePath,
+    fileName,
+    mimeType: videoRes.headers.get('content-type')?.split(';')[0] || 'video/mp4',
+    size: buf.length,
+  };
+}
+
+async function runApifyActorDatasetItems(actor: string, input: Record<string, unknown>, timeoutMs: number, label: string): Promise<Record<string, unknown>[]> {
+  const token = process.env.APIFY_TOKEN?.trim();
+  if (!token) throw new Error('APIFY_TOKEN is not configured');
+  const deadline = Date.now() + Math.max(1, timeoutMs);
+  const startUrl = `https://api.apify.com/v2/acts/${encodeURIComponent(actor)}/runs?token=${encodeURIComponent(token)}`;
+  const start = await apifyJsonRequest(startUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  }, deadline, `${label} start`);
+  const startRecord = asRecord(start);
+  const run = asRecord(startRecord.data) || startRecord;
+  const runId = String(run.id || '').trim();
+  const datasetId = String(run.defaultDatasetId || '').trim();
+  if (!runId || !datasetId) throw new Error(`Apify ${label} did not return run/dataset identifiers`);
+
+  const pollIntervalMs = Math.max(1000, Number(process.env.APIFY_POLL_INTERVAL_MS || 5000));
+  let status = String(run.status || '').toUpperCase();
+  while (!['SUCCEEDED', 'FAILED', 'ABORTED', 'TIMED-OUT'].includes(status)) {
+    if (Date.now() >= deadline) throw new Error(`Apify ${label} timed out while waiting for run ${runId}`);
+    await delay(Math.min(pollIntervalMs, Math.max(1, deadline - Date.now())));
+    const current = await apifyJsonRequest(
+      `https://api.apify.com/v2/actor-runs/${encodeURIComponent(runId)}?token=${encodeURIComponent(token)}`,
+      { method: 'GET' },
+      deadline,
+      `${label} poll`,
+    );
+    const currentRecord = asRecord(current);
+    const currentRun = asRecord(currentRecord.data) || currentRecord;
+    status = String(currentRun.status || '').toUpperCase();
+  }
+  if (status !== 'SUCCEEDED') throw new Error(`Apify ${label} run ${runId} ended with status ${status}`);
+
+  const items = await apifyJsonRequest(
+    `https://api.apify.com/v2/datasets/${encodeURIComponent(datasetId)}/items?clean=true&token=${encodeURIComponent(token)}`,
+    { method: 'GET' },
+    deadline,
+    `${label} dataset`,
+  );
+  return Array.isArray(items) ? items as Record<string, unknown>[] : [];
+}
+
+async function apifyJsonRequest(url: string, init: RequestInit, deadline: number, label: string): Promise<unknown> {
+  const controller = new AbortController();
+  if (deadline <= Date.now()) throw new Error(`Apify ${label} 下载累计超时`);
+  const timer = setTimeout(() => controller.abort(), Math.max(1, deadline - Date.now()));
+  try {
+    const r = await fetch(url, { ...init, signal: controller.signal });
+    const text = await r.text();
+    if (!r.ok) throw new Error(`Apify ${label} HTTP ${r.status}: ${text.slice(0, 300)}`);
+    return text ? JSON.parse(text) as unknown : {};
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function findApifyVideoDownloadUrl(value: unknown, depth = 0): string {
+  if (depth > 5 || value == null) return '';
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (/^https?:\/\//i.test(text) && (/\.(mp4|mov|webm)(?:[?#]|$)/i.test(text) || /api\.apify\.com|api\.apifyusercontent\.com|storage\.googleapis\.com/i.test(text))) {
+      return text;
+    }
+    return '';
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findApifyVideoDownloadUrl(item, depth + 1);
+      if (found) return found;
+    }
+    return '';
+  }
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const priority = [
+      'downloadedVideoUrl',
+      'downloadUrl',
+      'videoDownloadUrl',
+      'videoUrl',
+      'playAddr',
+      'downloadAddr',
+      'url',
+    ];
+    for (const key of priority) {
+      const found = findApifyVideoDownloadUrl(record[key], depth + 1);
+      if (found) return found;
+    }
+    for (const item of Object.values(record)) {
+      const found = findApifyVideoDownloadUrl(item, depth + 1);
+      if (found) return found;
+    }
+  }
+  return '';
+}
+
+function metadataFallbackAnalysis(input: Pick<CrawledVideo, 'platform' | 'title' | 'views' | 'tags'> & { duration?: number }): VideoAiAnalysis {
+  const tags = input.tags.filter(Boolean).slice(0, 5);
+  const title = cleanupAnalysisTitle(input.title);
+  const platform = PLATFORM_LABEL[input.platform] || input.platform;
+  const topic = tags.length > 0 ? tags.slice(0, 3).join(' / ') : title;
+  const durationHint = input.duration && input.duration > 90 ? '长视频评测/教程' : '短视频种草';
+  return {
+    theme: `${platform} ${durationHint}：${title}`,
+    hooks: [
+      `用标题承诺切入：${title}`,
+      input.views ? `用热度做社会证明：${input.views}` : '先展示结果或冲突，再解释产品',
+      tags.length ? `前三秒围绕「${tags[0]}」放大场景痛点` : '前三秒突出产品效果或前后反差',
+    ],
+    sellingPoints: tags.length
+      ? tags.map(tag => `可围绕「${tag}」展开卖点或场景`)
+      : ['产品演示', '痛点解决', '结果证明', '行动引导'],
+    mood: input.platform === 'tiktok' || input.platform === 'instagram' ? '快节奏 / 社媒感 / 视觉种草' : '信息型 / 评测型 / 解释清晰',
+    structure: `标题/封面钩子 → 场景痛点 → 核心展示（${topic}） → 证明细节 → CTA`,
+    baseRequirements: `基础要求：情绪氛围围绕「${title}」制造好奇、信任和种草；光影应清晰突出人物与产品；全片主要场景围绕产品实拍、使用演示、结果对比和行动引导；质感强调真实口播、产品近景、包装/材质/效果细节；创作上需要强反转开头、真人口播、卡点剪辑、特效拉满，并把产品质感拍清楚。`,
+    firstTenSeconds: {
+      atmosphere: `前 10 秒大概率用「${title}」建立观看预期，并借助 ${platform} 平台语境形成信任或好奇。`,
+      audioVisual: `字幕/标题应快速解释「${topic}」，画面需要同步出现产品、结果或痛点。`,
+      camera: '建议先按近景展示、快速切换、结果对比三类镜头理解；视频级分析完成后会回填真实运镜细节。',
+      visuals: tags.length ? `画面核心应围绕「${tags.slice(0, 3).join(' / ')}」展开。` : '画面核心应优先呈现产品、使用场景和前后反差。',
+      voiceMusic: `配音/配乐应匹配「${input.platform === 'tiktok' || input.platform === 'instagram' ? '快节奏种草' : '评测解释'}」节奏。`,
+    },
+    coarseStructure: [
+      { time: '0-3s', label: '标题承诺', description: `用标题或封面信息承接：${title}` },
+      { time: '3-6s', label: '场景痛点', description: tags[0] ? `放大「${tags[0]}」相关使用场景或问题` : '展示用户痛点或结果反差' },
+      { time: '6-9s', label: '核心展示', description: `进入核心展示：${topic}` },
+      { time: '9-12s', label: '证明细节', description: input.views ? `用热度/评论/使用结果强化可信度：${input.views}` : '补充使用细节或效果证明' },
+      { time: '12-15s', label: '行动引导', description: '给出购买、收藏、询盘或继续观看理由' },
+    ],
+    scriptSummary15s: {
+      visualStyle: input.platform === 'youtube' ? '真人写实评测风格' : '真人社媒写实风格',
+      coreEmotion: input.platform === 'tiktok' || input.platform === 'instagram' ? '快速种草、好奇、轻松' : '信任、解释、种草',
+      competitors: [],
+    },
+    scriptDetails15s: [
+      {
+        time: '0.2s',
+        environment: '产品实拍或人物口播场景',
+        shot: '特写',
+        camera: '固定镜头',
+        visual: `用标题或封面信息承接「${title}」，优先出现人物、产品或结果画面。`,
+        subtitle: `围绕「${title}」建立观看理由。`,
+        audio: '配音/BGM 待真实视频分析回填。',
+      },
+      {
+        time: '3.2s',
+        environment: '使用场景或痛点展示场景',
+        shot: '中近景',
+        camera: '轻微推近',
+        visual: tags[0] ? `放大「${tags[0]}」相关场景或痛点。` : '展示用户痛点或使用前后反差。',
+        subtitle: '用一句口播解释为什么继续看。',
+        audio: '轻节奏 BGM 或解释型配音。',
+      },
+      {
+        time: '6.2s-9.2s',
+        environment: '核心产品展示场景',
+        shot: '近景',
+        camera: '固定或手持跟拍',
+        visual: `进入核心展示「${topic}」，突出产品、动作或效果。`,
+        subtitle: '说明核心卖点/使用结果。',
+        audio: '音效配合产品展示或字幕节奏。',
+      },
+      {
+        time: '9.2s-12.2s',
+        environment: '证明细节或反馈展示场景',
+        shot: '中景',
+        camera: '慢切或平移',
+        visual: input.views ? `用热度、评论或结果画面强化可信度：${input.views}。` : '补充细节证明和真实使用反馈。',
+        subtitle: '补强可信度和适用人群。',
+        audio: '配音继续解释，BGM 不抢信息。',
+      },
+      {
+        time: '12.2s-15.0s',
+        environment: '产品收束或人物 CTA 场景',
+        shot: '中近景',
+        camera: '收束镜头',
+        visual: '以结果、产品正面或人物反应收束，引导收藏/询盘/继续观看。',
+        subtitle: '给出行动引导。',
+        audio: 'BGM 进入收束节拍。',
+      },
+    ],
+    recommendedScriptType: input.duration && input.duration > 60 ? 'storyboard' : 'voiceover',
+  };
+}
+
+function cleanupAnalysisTitle(title: string): string {
+  return title.replace(/\s+/g, ' ').trim().slice(0, 140) || '未命名社媒视频';
+}
+
+function cleanupTempVideo(filePath: string): void {
+  const dir = path.dirname(filePath);
+  const base = path.basename(filePath).split('.')[0];
+  for (const file of fs.readdirSync(dir)) {
+    if (file.startsWith(`${base}.`)) {
+      try { fs.unlinkSync(path.join(dir, file)); } catch { /* best effort */ }
+    }
+  }
+}
+
+function isQwenConfigured(): boolean {
+  let fileKey = '';
+  try { fileKey = fs.readFileSync(process.env.DASHSCOPE_API_KEY_FILE || path.join(process.env.HOME || '', '.config/lingshu/dashscope.key'), 'utf8').trim(); } catch { /* optional */ }
+  const key = process.env.DASHSCOPE_API_KEY?.trim() || fileKey;
+  return /^[\x21-\x7E]{20,}$/.test(key);
+}
+
+function isGeminiConfigured(): boolean {
+  return Boolean(process.env.GEMINI_API_KEY?.trim());
+}
+
+function shouldUseQwenFirst(): boolean {
+  return (process.env.VIDEO_ANALYSIS_PROVIDER || 'qwen').trim().toLowerCase() === 'qwen';
+}
+
+function qwenFallbackTimeoutMs(): number {
+  return Math.max(3000, Number(process.env.QWEN_VIDEO_FALLBACK_TIMEOUT_MS || 12000));
+}
+
+function videoAnalysisHardTimeoutMs(analysisMode: 'strategy' | 'exact' = 'strategy'): number {
+  // Bound the complete frame extraction + ASR + VL request, not only the
+  // individual OpenAI-compatible HTTP call.  Otherwise a record can remain in
+  // `analyzing` forever when one of the preparatory stages stalls.
+  const fallback = analysisMode === 'exact' ? 720_000 : 150_000;
+  return Math.max(30_000, Number(process.env.VIDEO_ANALYSIS_HARD_TIMEOUT_MS || fallback));
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+function isRetryableAnalysisFailure(error: unknown): boolean {
+  return /analysis_quality_retryable|analysis_retryable|chunk_quality_failed|video_analysis_hard_timeout|exact_chunk_timeout/i
+    .test(error instanceof Error ? error.message : String(error));
+}
+
+/** Only phrase-aligned ASR may populate a shot's dialogue. The current Qwen
+ * ASR returns text without timestamps; its 30s chunk must never be copied to
+ * every overlapping shot as if each shot contained the entire speech. */
+type VideoAsrSegment = { words?: Array<{start: number; end: number; text: string}>; start: number; end: number; text: string; timingPrecision?: 'phrase' | 'coarse'; provenance?: string; needsReview?: boolean };
+
+/** Qwen's inline ASR supplies text but no word clock. Preserve each sentence as
+ * a reviewable interval within its actual extraction window; never invent a
+ * narrower timestamp or promote it to phrase alignment. */
+export function coarseAsrSentences(text: string, start: number, end: number): VideoAsrSegment[] {
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return [];
+  const lines = String(text || '').trim().match(/[^。！？!?\n]+[。！？!?]?/g) || [];
+  return lines.map(line => line.trim()).filter(Boolean).map(line => ({
+    start, end, text: line, timingPrecision: 'coarse' as const,
+    provenance: 'qwen3-asr-flash:inline_audio_window', needsReview: true,
+  }));
+}
+
+export function lockAsrTimeline(analysis: VideoAiAnalysis, transcript?: { text: string; segments: VideoAsrSegment[] }): VideoAiAnalysis {
+  if (!transcript?.segments.length || !analysis.scriptDetails15s?.length) return analysis;
+  return {
+    ...analysis,
+    audioTranscript: { ...transcript, text: transcript.text, segments: transcript.segments.map(segment => ({
+      start: segment.start, end: segment.end, text: segment.text, words: segment.words,
+      timingPrecision: segment.timingPrecision === 'phrase' ? 'phrase' as const : 'coarse' as const,
+      provenance: segment.provenance, needsReview: segment.needsReview ?? segment.timingPrecision !== 'phrase',
+    })) },
+    scriptDetails15s: analysis.scriptDetails15s.map(detail => {
+      const range = parseAnalysisTimeRange(String(detail.time || detail.timestamp || ''));
+      if (!range) return detail;
+      const aligned = transcript.segments.filter(segment => segment.timingPrecision === 'phrase'
+        && segment.end > segment.start && segment.end - segment.start <= Math.max(5, range.end - range.start + 1)
+        && segment.start < range.end && segment.end > range.start);
+      const dialogue = aligned.map(segment => segment.text.trim()).filter(Boolean).join(' ');
+      const coarseSpeechOverlaps = transcript.segments.some(segment => segment.timingPrecision !== 'phrase'
+        && segment.start < range.end && segment.end > range.start);
+      const uncertain = /品牌|款名|名称|价格|左右|眼|色号|ASR|不一致|核实|确认/i.test(String(detail.note || ''));
+      return { ...detail, dialogue, subtitle: detail.onScreenText || detail.subtitle || '',
+        audio: coarseSpeechOverlaps ? '检测到未对齐的口播，逐镜台词待复核' : detail.audio,
+        confidence: uncertain || coarseSpeechOverlaps ? Math.min(Number(detail.confidence) || 0.55, 0.55) : detail.confidence,
+        needsReview: Boolean(detail.needsReview || uncertain || coarseSpeechOverlaps) };
+    }),
+  };
+}
+
+export function selectFramesForPhysicalCuts<T extends { timeLabel: string }>(
+  frames: T[], cuts: number[], start: number, end: number, limit: number,
+): T[] {
+  if (frames.length <= limit) return frames;
+  const boundaries = [start, ...cuts.filter(cut => cut > start && cut < end), end];
+  const required: T[] = [];
+  for (let index = 0; index < boundaries.length - 1; index += 1) {
+    const from = boundaries[index]!, to = boundaries[index + 1]!;
+    if (to - from < 0.35 || to - from > 2.5) continue;
+    const middle = (from + to) / 2;
+    const candidate = frames.filter(frame => {
+      const time = qwenFrameSeconds(frame.timeLabel);
+      return time >= from && time < to;
+    }).sort((a, b) => Math.abs(qwenFrameSeconds(a.timeLabel) - middle) - Math.abs(qwenFrameSeconds(b.timeLabel) - middle))[0];
+    if (candidate && !required.includes(candidate)) required.push(candidate);
+  }
+  const available = frames.filter(frame => !required.includes(frame));
+  const room = Math.max(0, limit - required.length);
+  const context = available.length <= room ? available : Array.from({ length: room }, (_, index) =>
+    available[Math.round(index * (available.length - 1) / Math.max(1, room - 1))]!);
+  return [...required.slice(0, limit), ...context].sort((a, b) => qwenFrameSeconds(a.timeLabel) - qwenFrameSeconds(b.timeLabel));
+}
+
+export async function extractQwenAnalysisFrames(filePath: string, maxFrames = 30, duration = 0, analysisMode: 'strategy' | 'exact' = 'exact', physicalCuts: number[] = []): Promise<Array<{ base64: string; mimeType: string; timeLabel: string }>> {
+  if (!ffmpegBin) throw new Error('ffmpeg is not available for Qwen frame analysis');
+  if (!fs.existsSync(ANALYSIS_DIR)) fs.mkdirSync(ANALYSIS_DIR, { recursive: true });
+
+  const frameDir = path.join(ANALYSIS_DIR, `qwen-frames-${Date.now()}-${randomUUID()}`);
+  fs.mkdirSync(frameDir, { recursive: true });
+  try {
+    // The opening hook often contains sub-second hand/object actions. Keep every
+    // frame from the first four seconds at 3 fps; similarity de-duplication here
+    // previously erased the exact motion boundary that the director needs.
+    const densePattern = path.join(frameDir, 'dense-%02d.jpg');
+    const denseFps = analysisMode === 'exact' ? (maxFrames <= 24 ? 2 : 3) : 0;
+    const denseCount = denseFps * 4;
+    if (denseCount) {
+      await execFileAsync(ffmpegBin, [
+        '-hide_banner',
+        '-loglevel', 'error',
+        '-i', filePath,
+        '-vf', `trim=duration=4,fps=${denseFps},scale=384:-1`,
+        '-frames:v', String(denseCount),
+        '-q:v', '4',
+        densePattern,
+      ], { timeout: 90_000 });
+    }
+    const uniformPattern = path.join(frameDir, 'uniform-%02d.jpg');
+    const strategyInterval = 5;
+    const uniformCount = analysisMode === 'strategy'
+      ? Math.max(1, Math.min(maxFrames, Math.ceil(Math.max(duration, 1) / strategyInterval) + 1))
+      : Math.max(8, Math.min(42, Math.ceil((maxFrames - denseCount) * 0.6)));
+    const uniformInterval = analysisMode === 'strategy'
+      ? strategyInterval
+      : duration > 4 ? Math.max(1, (duration - 1) / Math.max(1, uniformCount - 1)) : 4;
+    await execFileAsync(ffmpegBin, [
+      '-hide_banner',
+      '-loglevel', 'error',
+      '-i', filePath,
+      '-vf', `fps=1/${uniformInterval},scale=384:-1`,
+      '-frames:v', String(uniformCount),
+      '-q:v', '4',
+      uniformPattern,
+    ], { timeout: 90_000 });
+    const scenePattern = path.join(frameDir, 'scene-%02d.jpg');
+    let sceneTimes: number[] = [];
+    try {
+      if (analysisMode !== 'exact') throw new Error('scene extraction disabled for strategy analysis');
+      const sceneCount = Math.max(6, maxFrames - denseCount - uniformCount);
+      const sceneRun = await execFileAsync(ffmpegBin, ['-hide_banner', '-loglevel', 'info', '-i', filePath, '-vf', "select='gt(scene,0.12)',showinfo,scale=384:-1", '-fps_mode', 'vfr', '-frames:v', String(sceneCount), '-q:v', '4', scenePattern], { timeout: 90_000, maxBuffer: 8 * 1024 * 1024 });
+      sceneTimes = Array.from(sceneRun.stderr.matchAll(/pts_time:([0-9.]+)/g)).map(match => Number(match[1])).filter(Number.isFinite).slice(0, sceneCount);
+    } catch { /* retain uniform frames */ }
+    // A transition frame can be blurred or show both products. Observe the
+    // middle of each short physical shot so the product label and item survive
+    // the handoff as one distinct visual requirement.
+    const cutCandidates = physicalCuts.length ? physicalCuts : sceneTimes;
+    const distinctCuts = cutCandidates.filter((time, index) => index === 0 || time - cutCandidates[index - 1]! >= 0.18);
+    const cutBounds = [0, ...distinctCuts, duration].filter(value => Number.isFinite(value));
+    const midpointRows: Array<{ file: string; time: number; dense: boolean }> = [];
+    if (analysisMode === 'exact') {
+      const shortIntervals = Array.from({ length: Math.max(0, cutBounds.length - 1) }, (_, index) => index)
+        .filter(index => cutBounds[index + 1]! - cutBounds[index]! >= 0.35 && cutBounds[index + 1]! - cutBounds[index]! <= 2.5);
+      const sampledIntervals = shortIntervals.length <= 24 ? shortIntervals : Array.from({ length: 24 }, (_, index) => shortIntervals[Math.round(index * (shortIntervals.length - 1) / 23)]!);
+      for (const index of sampledIntervals) {
+        const start = cutBounds[index]!, end = cutBounds[index + 1]!;
+        const time = +(start + (end - start) / 2).toFixed(2);
+        const file = `midpoint-${String(index).padStart(3, '0')}.jpg`;
+        try {
+          await execFileAsync(ffmpegBin, ['-hide_banner', '-loglevel', 'error', '-ss', String(time), '-i', filePath,
+            '-frames:v', '1', '-vf', 'scale=384:-1', '-q:v', '4', path.join(frameDir, file)], { timeout: 15_000 });
+          midpointRows.push({ file, time, dense: false });
+        } catch { /* keep the other sampled frames */ }
+      }
+    }
+    const denseRows = fs.readdirSync(frameDir)
+      .filter(file => /^dense-\d+\.jpg$/i.test(file))
+      .sort()
+      .map((file, index) => ({ file, time: denseFps ? index / denseFps : 0, dense: true }));
+    const supplementalRows = [
+      ...fs.readdirSync(frameDir).filter(file => /^uniform-\d+\.jpg$/i.test(file)).sort().map((file, index) => ({ file, time: index * uniformInterval, dense: false })),
+      ...fs.readdirSync(frameDir).filter(file => /^scene-\d+\.jpg$/i.test(file)).sort().map((file, index) => ({ file, time: sceneTimes[index] ?? index * 3, dense: false })),
+    ].sort((a, b) => a.time - b.time)
+      .filter(row => !denseRows.some(dense => Math.abs(dense.time - row.time) < 0.45))
+      .filter(row => !midpointRows.some(midpoint => Math.abs(midpoint.time - row.time) < 0.35))
+      .filter((row, index, all) => index === 0 || Math.abs(row.time - all[index - 1].time) >= 0.45);
+    const rows = [...denseRows, ...midpointRows, ...supplementalRows.slice(0, Math.max(0, maxFrames - denseRows.length - midpointRows.length))]
+      .sort((a, b) => a.time - b.time)
+      .slice(0, maxFrames);
+    return rows.map(row => ({ base64: fs.readFileSync(path.join(frameDir, row.file)).toString('base64'), mimeType: 'image/jpeg', timeLabel: `${row.time.toFixed(2)}s` }));
+  } finally {
+    try {
+      for (const file of fs.readdirSync(frameDir)) fs.unlinkSync(path.join(frameDir, file));
+      fs.rmdirSync(frameDir);
+    } catch {
+      // best effort cleanup
+    }
+  }
+}
+
+/** Keep hook motion evidence independent of the lower-density whole-video sample.
+ * Twelve real frames in the first second preserve the approach/gesture sequence. */
+async function extractOpeningHookFrames(filePath: string): Promise<Array<{ base64: string; mimeType: string; timeLabel: string }>> {
+  if (!ffmpegBin) throw new Error('ffmpeg is not available for opening hook analysis');
+  fs.mkdirSync(ANALYSIS_DIR, { recursive: true });
+  const frameDir = path.join(ANALYSIS_DIR, `hook-frames-${randomUUID()}`);
+  fs.mkdirSync(frameDir, { recursive: true });
+  try {
+    await execFileAsync(ffmpegBin, [
+      '-hide_banner', '-loglevel', 'error', '-i', filePath,
+      '-vf', 'trim=duration=1,fps=12,scale=720:-1', '-frames:v', '12',
+      '-q:v', '3', path.join(frameDir, 'hook-%02d.jpg'),
+    ], { timeout: 30_000 });
+    return fs.readdirSync(frameDir).filter(file => /^hook-\d+\.jpg$/i.test(file)).sort()
+      .map((file, index) => ({ base64: fs.readFileSync(path.join(frameDir, file)).toString('base64'),
+        mimeType: 'image/jpeg', timeLabel: `${(index / 12).toFixed(3)}s` }));
+  } finally {
+    for (const file of fs.readdirSync(frameDir)) fs.unlinkSync(path.join(frameDir, file));
+    fs.rmdirSync(frameDir);
+  }
+}
+
+function videoAnalysisTimelineEnd(analysis: VideoAiAnalysis): number {
+  return (analysis.scriptDetails15s || []).reduce((max, detail) => {
+    const range = parseAnalysisTimeRange(String(detail.time || detail.timestamp || ''));
+    return Math.max(max, range?.end || 0);
+  }, 0);
+}
+
+function assertFullVideoTimeline(analysis: VideoAiAnalysis, duration: number, source: string): void {
+  if (!duration || duration <= 0) return;
+  const analyzedUntil = videoAnalysisTimelineEnd(analysis);
+  const tolerance = Math.max(1, Math.min(3, duration * 0.03));
+  if (!analyzedUntil || analyzedUntil + tolerance < duration) {
+    throw new Error(`${source}_incomplete_timeline_${analyzedUntil.toFixed(1)}s_of_${duration.toFixed(1)}s`);
+  }
+}
+
+function qwenFrameSeconds(label: string): number {
+  const value = Number.parseFloat(String(label || '').replace(/s$/i, ''));
+  return Number.isFinite(value) ? value : 0;
+}
+
+function shiftedTimelineLabel(label: string, offset: number, localDuration: number): string {
+  const range = parseAnalysisTimeRange(String(label || ''));
+  const localStart = Math.max(0, Math.min(localDuration, range?.start || 0));
+  const localEnd = Math.max(localStart, Math.min(localDuration, range?.end || localStart));
+  const fmt = (value: number) => value.toFixed(2).replace(/\.00$/, '').replace(/(\.\d)0$/, '$1');
+  return `${fmt(localStart + offset)}s–${fmt(localEnd + offset)}s`;
+}
+
+/** Qwen receives short observation windows for accuracy. Those windows are
+ * evidence beats, not physical edits. Only an observed scene cut may start a
+ * new shot; chunk edges and the four-second sampling cadence cannot. */
+export function groupExactObservationWindows(analysis: VideoAiAnalysis, sceneCuts: number[]): VideoAiAnalysis {
+  const source = analysis.scriptDetails15s || [];
+  if (source.length < 2) return analysis;
+  const rows = source.map(detail => ({ detail, range: parseAnalysisTimeRange(String(detail.time || detail.timestamp || '')) }))
+    .filter((row): row is { detail: NonNullable<VideoAiAnalysis['scriptDetails15s']>[number]; range: { start: number; end: number } } => Boolean(row.range))
+    .sort((a, b) => a.range.start - b.range.start);
+  if (rows.length !== source.length) return analysis;
+  if (!sceneCuts.length) return {
+    ...analysis,
+    scriptDetails15s: rows.map(row => ({ ...row.detail, analysisGranularity: 'observation_window', needsReview: true })),
+  } as VideoAiAnalysis;
+  const groups: typeof rows[] = [];
+  let current: typeof rows = [];
+  for (const row of rows) {
+    const previous = current.at(-1);
+    const boundary = row.range.start;
+    // Boundaries are rounded to centiseconds on both sides. A wider tolerance
+    // mistakes nearby 12-second model chunk edges for physical scene cuts.
+    const hasObservedCut = previous && sceneCuts.some(cut => Math.abs(cut - boundary) <= 0.03);
+    if (hasObservedCut && current.length) { groups.push(current); current = []; }
+    current.push(row);
+  }
+  if (current.length) groups.push(current);
+  const uniqueText = (values: Array<string | undefined>) => [...new Set(values.map(value => String(value || '').trim()).filter(Boolean))].join('；');
+  const grouped = groups.map(group => {
+    const first = group[0]!.detail;
+    const last = group.at(-1)!.detail;
+    return {
+      ...first,
+      time: `${group[0]!.range.start.toFixed(2)}s–${group.at(-1)!.range.end.toFixed(2)}s`,
+      visual: uniqueText(group.map(row => row.detail.visual)),
+      dialogue: uniqueText(group.map(row => row.detail.dialogue)),
+      purpose: uniqueText(group.map(row => row.detail.purpose)),
+      observedFacts: uniqueText(group.map(row => row.detail.observedFacts)),
+      inferredIntent: uniqueText(group.map(row => row.detail.inferredIntent)),
+      transitionToNext: last.transitionToNext,
+      endState: last.endState,
+      needsReview: group.some(row => row.detail.needsReview === true),
+      analysisGranularity: 'scene_cut_estimated',
+      beats: group.flatMap(row => row.detail.beats?.length ? row.detail.beats : [{
+        time: `${row.range.start.toFixed(2)}s–${row.range.end.toFixed(2)}s`,
+        action: row.detail.visual,
+        dialogue: row.detail.dialogue,
+        onScreenText: row.detail.onScreenText,
+      }]),
+    };
+  });
+  return { ...analysis, scriptDetails15s: grouped } as VideoAiAnalysis;
+}
+
+async function detectVideoSceneCuts(filePath: string): Promise<number[]> {
+  if (!ffmpegBin) return [];
+  try {
+    const result = await execFileAsync(ffmpegBin, [
+      '-hide_banner', '-loglevel', 'info', '-i', filePath,
+      // Product montages often use wipes over similar bright backgrounds.
+      // A stricter threshold swallowed the individual product shots in a
+      // real six-item sequence; nearby transition frames are collapsed below.
+      '-vf', "select='gt(scene,0.12)',showinfo", '-fps_mode', 'vfr', '-f', 'null', '-',
+    ], { timeout: 90_000, maxBuffer: 16 * 1024 * 1024 });
+    const candidates = [...new Set(Array.from(result.stderr.matchAll(/pts_time:([0-9.]+)/g), match => Number(match[1]))
+      .filter(value => Number.isFinite(value) && value > 0.2).map(value => +value.toFixed(2)))].sort((a, b) => a - b);
+    return candidates.filter((value, index) => index === 0 || value - candidates[index - 1]! >= 0.18);
+  } catch (error) {
+    console.warn('[videos] scene cut detection unavailable; retaining continuous observation windows:', error instanceof Error ? error.message : error);
+    return [];
+  }
+}
+
+async function analyzeExactLongVideoChunks(input: {
+  frames: Array<{ base64: string; mimeType: string; timeLabel: string }>;
+  title?: string;
+  platform?: Platform;
+  duration: number;
+  views?: string;
+  tags?: string[];
+  transcript?: { text: string; segments: Array<{ start: number; end: number; text: string; timingPrecision?: 'phrase' | 'coarse' }> };
+  analysisMode?: 'strategy' | 'exact';
+  sceneCuts?: number[];
+}): Promise<VideoAiAnalysis> {
+  // Keep each VL request small enough to finish reliably. The previous 45s
+  // default put nearly all 42 exact frames into the first request of a 50s
+  // video, which repeatedly hit the 90s request timeout.
+  const chunkSeconds = Math.max(10, Math.min(30, Number(process.env.VIDEO_EXACT_CHUNK_SECONDS || 12)));
+  const inferredDuration = exactAnalysisDuration(input.duration, input.frames.map(frame => qwenFrameSeconds(frame.timeLabel)));
+  const chunks = Array.from({ length: Math.ceil(inferredDuration / chunkSeconds) }, (_, index) => ({
+    start: index * chunkSeconds,
+    end: Math.min(inferredDuration, (index + 1) * chunkSeconds),
+  }));
+  const timelinePlanError = (plan: QwenTimelinePlan, duration: number): string | null => {
+    const rows = plan.boundaries;
+    if (!plan.theme.trim()) return 'missing_theme';
+    if (!rows.length) return 'missing_boundaries';
+    const ids = new Set<string>();
+    let cursor = 0;
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index];
+      if (!row.id || ids.has(row.id)) return `duplicate_boundary_${index + 1}`;
+      ids.add(row.id);
+      if (!Number.isFinite(row.start) || !Number.isFinite(row.end) || row.end <= row.start) return `invalid_boundary_${index + 1}`;
+      if (Math.abs(row.start - cursor) > 0.35) return `boundary_gap_or_overlap_${index + 1}`;
+      if (row.end - row.start > 5.35) return `boundary_too_long_${index + 1}`;
+      cursor = row.end;
+    }
+    if (Math.abs(cursor - duration) > 0.5) return `boundary_tail_${cursor.toFixed(2)}_of_${duration.toFixed(2)}`;
+    return null;
+  };
+  const analyzeChunk = async (chunk: { start: number; end: number }, frameLimit: number, signal: AbortSignal) => {
+    const localDuration = chunk.end - chunk.start;
+    let selected = input.frames.filter(frame => {
+      const time = qwenFrameSeconds(frame.timeLabel);
+      return time >= chunk.start && (time < chunk.end || chunk.end === input.duration);
+    });
+    if (!selected.length) {
+      selected = [input.frames.reduce((nearest, frame) =>
+        Math.abs(qwenFrameSeconds(frame.timeLabel) - chunk.start) < Math.abs(qwenFrameSeconds(nearest.timeLabel) - chunk.start) ? frame : nearest
+      )];
+    }
+    selected = selectFramesForPhysicalCuts(selected, input.sceneCuts || [], chunk.start, chunk.end, frameLimit);
+    const localFrames = selected.map(frame => ({ ...frame, timeLabel: `${Math.max(0, qwenFrameSeconds(frame.timeLabel) - chunk.start).toFixed(2)}s` }));
+    const localSegments = (input.transcript?.segments || [])
+      .filter(segment => segment.timingPrecision === 'phrase' && segment.end > chunk.start && segment.start < chunk.end)
+      .map(segment => ({ ...segment, start: Math.max(0, segment.start - chunk.start), end: Math.min(localDuration, segment.end - chunk.start) }));
+    // Stage 1 is deterministic: lock continuous observation windows to the
+    // real video clock. This is not a claim that every boundary is a cut; the
+    // model only describes visible content inside each server-owned window.
+    const observationSeconds = Math.max(2, Math.min(5, Number(process.env.VIDEO_EXACT_OBSERVATION_SECONDS || 4)));
+    const cutPoints = [0, ...(input.sceneCuts || [])
+      .filter(value => value > chunk.start + 0.02 && value < chunk.end - 0.02)
+      .map(value => +(value - chunk.start).toFixed(2)), localDuration];
+    const windows: Array<{ start: number; end: number; reason: string }> = [];
+    for (let cutIndex = 0; cutIndex < cutPoints.length - 1; cutIndex += 1) {
+      const start = cutPoints[cutIndex]!;
+      const end = cutPoints[cutIndex + 1]!;
+      const sections = Math.max(1, Math.ceil((end - start) / observationSeconds));
+      for (let section = 0; section < sections; section += 1) {
+        windows.push({
+          start: +(start + (end - start) * section / sections).toFixed(2),
+          end: +(start + (end - start) * (section + 1) / sections).toFixed(2),
+          reason: section === 0 && cutIndex > 0 ? '检测到视觉切点' : '连续镜头观察段',
+        });
+      }
+    }
+    const timeline: QwenTimelinePlan = {
+      theme: String(input.title || '真实视频画面分析'),
+      identityEntities: [],
+      hooks: [], sellingPoints: [], mood: '', structure: '', baseRequirements: '',
+      firstTenSeconds: {}, coarseStructure: [], scriptSummary15s: {}, recommendedScriptType: 'storyboard',
+      boundaries: windows.map((window, index) => ({
+        id: `b${index + 1}`,
+        start: window.start,
+        end: window.end,
+        reason: window.reason,
+        evidence: '由真实视频时间轴及 ffmpeg 场景切点锁定，画面内容由关键帧分析填写',
+      })),
+    };
+    const planError = timelinePlanError(timeline, localDuration);
+    if (planError) throw new Error(`exact_timeline_quality_failed_${chunk.start.toFixed(0)}_${planError}`);
+    console.log(`[videos] exact details ${chunk.start.toFixed(0)}-${chunk.end.toFixed(0)}s started, boundaries=${timeline.boundaries.length}`);
+    const result = await analyzeVideoTimelineDetailsWithQwen({
+      frames: localFrames,
+      timeline,
+      transcript: localSegments.length ? { text: localSegments.map(item => item.text).join(''), segments: localSegments } : undefined,
+      signal,
+    });
+    const localQualityError = analysisTimelineQualityError(result, localDuration, input.analysisMode || 'exact');
+    if (localQualityError) throw new Error(`${input.analysisMode || 'exact'}_chunk_quality_failed_${chunk.start.toFixed(0)}_${localQualityError}`);
+    const details = (result.scriptDetails15s || []).map(detail => ({ ...detail, time: shiftedTimelineLabel(String(detail.time || detail.timestamp || ''), chunk.start, localDuration) }));
+    return {
+      ...result,
+      coarseStructure: (result.coarseStructure || []).map(item => ({ ...item, time: shiftedTimelineLabel(String(item.time || ''), chunk.start, localDuration) })),
+      scriptDetails15s: details,
+    };
+  };
+  // A schema-complete director storyboard commonly needs more than one minute
+  // even for a short clip. 110s remains bounded, while allowing the smaller
+  // retry to finish instead of aborting a healthy generation at 60s.
+  const chunkTimeoutMs = Math.max(20_000, Number(process.env.VIDEO_EXACT_CHUNK_TIMEOUT_MS || 150_000));
+  const primaryFrameLimit = Math.max(8, Math.min(20, Number(process.env.VIDEO_EXACT_CHUNK_FRAME_LIMIT || 12)));
+  const retryFrameLimit = Math.max(6, Math.min(primaryFrameLimit, Number(process.env.VIDEO_EXACT_RETRY_FRAME_LIMIT || 8)));
+  const runWithTimeout = async (chunk: { start: number; end: number }, frameLimit: number, attempt: number) => {
+    const startedAt = Date.now();
+    const controller = new AbortController();
+    const timeoutError = `exact_chunk_timeout_${chunk.start.toFixed(0)}_${chunk.end.toFixed(0)}`;
+    const timeout = setTimeout(() => controller.abort(), chunkTimeoutMs);
+    try {
+      console.log(`[videos] exact chunk ${chunk.start.toFixed(0)}-${chunk.end.toFixed(0)}s started, frames=${frameLimit}, attempt=${attempt}`);
+      const result = await analyzeChunk(chunk, frameLimit, controller.signal);
+      console.log(`[videos] exact chunk ${chunk.start.toFixed(0)}-${chunk.end.toFixed(0)}s completed in ${Date.now() - startedAt}ms, frames=${frameLimit}, attempt=${attempt}`);
+      return result;
+    } catch (error) {
+      const failure = controller.signal.aborted ? new Error(timeoutError) : error;
+      console.warn(`[videos] exact chunk ${chunk.start.toFixed(0)}-${chunk.end.toFixed(0)}s failed in ${Date.now() - startedAt}ms, frames=${frameLimit}, attempt=${attempt}:`, failure instanceof Error ? failure.message : failure);
+      throw failure;
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
+  const analyzeWithRetry = async (chunk: { start: number; end: number }) => {
+    try {
+      return await runWithTimeout(chunk, primaryFrameLimit, 1);
+    } catch {
+      return await runWithTimeout(chunk, retryFrameLimit, 2);
+    }
+  };
+  const settled: PromiseSettledResult<VideoAiAnalysis>[] = [];
+  const concurrency = Math.max(1, Math.min(3, Number(process.env.VIDEO_EXACT_CHUNK_CONCURRENCY || 2)));
+  for (let offset = 0; offset < chunks.length; offset += concurrency) {
+    settled.push(...await Promise.allSettled(chunks.slice(offset, offset + concurrency).map(analyzeWithRetry)));
+  }
+  const failure = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+  if (failure) throw new Error(`${input.analysisMode || 'exact'}_analysis_retryable: ${failure.reason instanceof Error ? failure.reason.message : String(failure.reason)}`);
+  const results = settled.map(result => (result as PromiseFulfilledResult<VideoAiAnalysis>).value);
+  const first = results[0];
+  const unique = (values: string[]) => [...new Set(values.filter(Boolean))];
+  return {
+    ...first,
+    hooks: unique(results.flatMap(result => result.hooks || [])).slice(0, 6),
+    sellingPoints: unique(results.flatMap(result => result.sellingPoints || [])).slice(0, 10),
+    structure: unique(results.map(result => result.structure || '')).join(' → '),
+    coarseStructure: results.flatMap(result => result.coarseStructure || []),
+    scriptDetails15s: results.flatMap(result => result.scriptDetails15s || []),
+  };
+}
+
+export function exactAnalysisDuration(duration: number, frameTimes: number[]): number {
+  if (Number.isFinite(duration) && duration > 0) return duration;
+  return Math.max(...frameTimes.filter(Number.isFinite).map(time => time + 3), 3);
+}
+
+export async function analyzeDownloadedVideoWithFallback(opts: {
+  filePath: string;
+  mimeType: string;
+  title?: string;
+  platform?: Platform;
+  duration?: number;
+  views?: string;
+  tags?: string[];
+  sourceLabel: string;
+  analysisMode?: 'strategy' | 'exact';
+}): Promise<{ analysis: VideoAiAnalysis; source: string }> {
+  const runQwen = async () => {
+    // Dense opening frames + evenly distributed full-video evidence. Sixty base64
+    // frames made long-video requests time out without materially improving the
+    // Eighteen frames combine a dense opening with uniform and scene-change
+    // evidence across the full duration, small enough for a reliable request.
+    const exactFrameCount = Math.max(24, Math.min(72, Number(process.env.VIDEO_QWEN_EXACT_FRAME_COUNT || 42)));
+    const strategyFrameCount = Math.max(3, Math.min(24, Number(process.env.VIDEO_QWEN_FRAME_COUNT || Math.ceil(Math.max(Number(opts.duration || 0), 10) / 5) + 1)));
+    const detectedSceneCuts = opts.analysisMode === 'exact' ? await detectVideoSceneCuts(opts.filePath) : [];
+    const frames = await extractQwenAnalysisFrames(
+      opts.filePath,
+      opts.analysisMode === 'exact' ? exactFrameCount : strategyFrameCount,
+      Number(opts.duration || 0),
+      opts.analysisMode === 'exact' ? 'exact' : 'strategy',
+      detectedSceneCuts,
+    );
+    let transcript: { text: string; segments: VideoAsrSegment[] } | undefined;
+    const asrDir = path.join(ANALYSIS_DIR, `qwen-asr-${Date.now()}-${randomUUID()}`);
+    try {
+      if (ffmpegBin) {
+        fs.mkdirSync(asrDir, { recursive: true });
+        if (Number(opts.duration) > 0 && Number(opts.duration) <= 180) {
+          transcript = await prepareReferenceNarration(opts.filePath, Number(opts.duration));
+        } else {
+        const pattern = path.join(asrDir, 'chunk-%03d.mp3');
+        // Exact analysis needs a narrow, honest interval for each spoken line.
+        // Inline Qwen ASR has no word timestamps, so these remain coarse even
+        // when a window contains just one sentence. Paid filetrans is separate
+        // and requires explicit authorization through its own guarded API.
+        const configuredAsrSeconds = Number(process.env.VIDEO_ASR_SEGMENT_SECONDS);
+        const asrSegmentSeconds = opts.analysisMode === 'exact'
+          ? Math.max(2, Math.min(6, Number.isFinite(configuredAsrSeconds) && configuredAsrSeconds > 0 ? configuredAsrSeconds : 3))
+          : Math.max(15, Number.isFinite(configuredAsrSeconds) && configuredAsrSeconds > 0 ? configuredAsrSeconds : 30);
+        await execFileAsync(ffmpegBin, ['-hide_banner', '-loglevel', 'error', '-i', opts.filePath, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '64k', '-f', 'segment', '-segment_time', String(asrSegmentSeconds), '-reset_timestamps', '1', '-y', pattern], { timeout: 90_000 });
+        const chunks = fs.readdirSync(asrDir).filter(file => /^chunk-\d+\.mp3$/.test(file)).sort();
+        const segments: VideoAsrSegment[] = [];
+        const concurrency = Math.max(1, Math.min(6, Number(process.env.VIDEO_ASR_CONCURRENCY || 6)));
+        const asrTimeoutMs = Math.max(10_000, Number(process.env.VIDEO_ASR_CHUNK_TIMEOUT_MS || 20_000));
+        for (let offset = 0; offset < chunks.length; offset += concurrency) {
+          const batch = chunks.slice(offset, offset + concurrency);
+          const results = await Promise.all(batch.map(async (file, batchIndex) => {
+            const index = offset + batchIndex;
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), asrTimeoutMs);
+            let result: { text: string; segments: Array<{ start: number; end: number; text: string }> } = { text: '', segments: [] };
+            try {
+              result = await transcribeAudioWithQwen({
+                audio: fs.readFileSync(path.join(asrDir, file)),
+                fileName: file,
+                signal: controller.signal,
+              });
+            } catch (error) {
+              console.warn(`[videos] Qwen ASR chunk ${index} skipped after ${asrTimeoutMs}ms:`, error instanceof Error ? error.message : error);
+            } finally {
+              clearTimeout(timer);
+            }
+            return result.text ? coarseAsrSentences(result.text,
+              index * asrSegmentSeconds,
+              Math.min(Number(opts.duration) || (index + 1) * asrSegmentSeconds, (index + 1) * asrSegmentSeconds)) : [];
+          }));
+          segments.push(...results.flat());
+        }
+        transcript = { text: segments.map(item => item.text).join(''), segments };
+        }
+      }
+    } catch (error) { console.warn('[videos] Qwen ASR unavailable, continuing with frames:', error instanceof Error ? error.message : error); }
+    finally { try { for (const file of fs.readdirSync(asrDir)) fs.unlinkSync(path.join(asrDir, file)); fs.rmdirSync(asrDir); } catch { /* best effort */ } }
+    // Exact mode always uses the chunk path, including short clips. Strategy
+    // mode also chunks longer clips so each request stays bounded. Missing or
+    // low-quality timelines now fail as retryable instead of being padded with
+    // invented tail segments.
+    const qwenAnalysis = opts.analysisMode === 'exact' || Number(opts.duration || 0) > 15
+      ? await analyzeExactLongVideoChunks({ frames, title: opts.title, platform: opts.platform, duration: Number(opts.duration), views: opts.views, tags: opts.tags, transcript, analysisMode: opts.analysisMode || 'strategy', sceneCuts: detectedSceneCuts })
+      : await analyzeVideoFramesWithQwen({
+        frames,
+        title: opts.title,
+        platform: opts.platform,
+        duration: opts.duration,
+        views: opts.views,
+        tags: opts.tags,
+        transcript,
+        analysisMode: opts.analysisMode || 'strategy',
+      });
+    const observationAnalysis = lockAsrTimeline(qwenAnalysis, transcript);
+    assertFullVideoTimeline(observationAnalysis, Number(opts.duration || 0), 'qwen');
+    const qualityError = analysisTimelineQualityError(observationAnalysis, Number(opts.duration || 0), opts.analysisMode || 'strategy');
+    if (qualityError) throw new Error(`analysis_quality_retryable_${qualityError}`);
+    let analysis = opts.analysisMode === 'exact'
+      ? groupExactObservationWindows(observationAnalysis, detectedSceneCuts)
+      : observationAnalysis;
+    let hookReviewReasons: string[] = [];
+    if (opts.analysisMode === 'exact') {
+      const hookIndex = firstSubstantiveOpeningShot(analysis);
+      if (hookIndex >= 0) {
+        const hook = analysis.scriptDetails15s?.[hookIndex];
+        const range = parseAnalysisTimeRange(String(hook?.time || hook?.timestamp || ''));
+        if (range) {
+          let motionEvidence;
+          try {
+            const hookFrames = await extractOpeningHookFrames(opts.filePath);
+            motionEvidence = await inspectOpeningHookMotionWithGemini({ frames: hookFrames });
+          } catch (error) {
+            console.warn('[videos] opening hook motion inspection unavailable:', error instanceof Error ? error.message : error);
+            motionEvidence = { observations: [], transitions: [], uncertainties: ['opening_hook_motion_inspection_failed'] };
+          }
+          const applied = applyOpeningHookMotionEvidence(analysis, motionEvidence);
+          analysis = applied.analysis;
+          hookReviewReasons = applied.reviewReasons;
+        }
+      } else {
+        hookReviewReasons = ['opening_hook_no_substantive_shot'];
+      }
+    }
+    return { analysis: { ...analysis, detectedSceneCuts, hookReviewReasons } as VideoAiAnalysis, source: 'qwen-frame-video' };
+  };
+
+  if (shouldUseQwenFirst()) {
+    if (!isQwenConfigured()) throw new Error('DASHSCOPE_API_KEY is not set');
+    return withTimeout(runQwen(), videoAnalysisHardTimeoutMs(opts.analysisMode), 'video_analysis_hard_timeout');
+  }
+
+  try {
+    const buf = fs.readFileSync(opts.filePath);
+    const geminiPromise = analyzeVideo({
+        videoBase64: buf.toString('base64'),
+        mimeType: opts.mimeType,
+        analysisMode: opts.analysisMode || 'strategy',
+      });
+    const analysis = isQwenConfigured()
+      ? await withTimeout(geminiPromise, qwenFallbackTimeoutMs(), 'Gemini analysis timed out before Qwen fallback')
+      : await geminiPromise;
+    assertFullVideoTimeline(analysis, Number(opts.duration || 0), 'gemini');
+    const qualityError = analysisTimelineQualityError(analysis, Number(opts.duration || 0), opts.analysisMode || 'strategy');
+    if (qualityError) throw new Error(`analysis_quality_retryable_${qualityError}`);
+    return { analysis, source: opts.sourceLabel };
+  } catch (e) {
+    if (shouldRetryGeminiWithNormalizedVideo(e)) {
+      const normalizedPath = await normalizeVideoForGemini(opts.filePath);
+      if (normalizedPath) {
+        try {
+          const buf = fs.readFileSync(normalizedPath);
+          const analysis = await analyzeVideo({
+            videoBase64: buf.toString('base64'),
+            mimeType: 'video/mp4',
+            analysisMode: opts.analysisMode || 'strategy',
+          });
+          assertFullVideoTimeline(analysis, Number(opts.duration || 0), 'gemini_normalized');
+          const qualityError = analysisTimelineQualityError(analysis, Number(opts.duration || 0), opts.analysisMode || 'strategy');
+          if (qualityError) throw new Error(`analysis_quality_retryable_${qualityError}`);
+          return { analysis, source: `${opts.sourceLabel}-normalized` };
+        } catch (normalizedError) {
+          console.warn('[videos] Gemini normalized video analysis failed:', normalizedError instanceof Error ? normalizedError.message : normalizedError);
+        } finally {
+          try { fs.unlinkSync(normalizedPath); } catch { /* best effort cleanup */ }
+        }
+      }
+    }
+    if (!isQwenConfigured()) throw e;
+    console.warn('[videos] Gemini video analysis failed, falling back to Qwen frames:', e instanceof Error ? e.message : e);
+    return withTimeout(runQwen(), videoAnalysisHardTimeoutMs(opts.analysisMode), 'video_analysis_hard_timeout');
+  }
+}
+
+function shouldRetryGeminiWithNormalizedVideo(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  return /0 Frames found|wrong video metadata|corrupted|INVALID_ARGUMENT/i.test(msg);
+}
+
+async function normalizeVideoForGemini(filePath: string): Promise<string> {
+  if (!ffmpegBin || !fs.existsSync(filePath)) return '';
+  const outPath = path.join(path.dirname(filePath), `${path.basename(filePath, path.extname(filePath))}.gemini.mp4`);
+  const ok = await runFfmpeg([
+    '-i', filePath,
+    '-map', '0:v:0',
+    '-map', '0:a?',
+    '-vf', 'scale=trunc(min(720,iw)/2)*2:-2',
+    '-r', '24',
+    '-pix_fmt', 'yuv420p',
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
+    '-crf', '28',
+    '-c:a', 'aac',
+    '-b:a', '96k',
+    '-movflags', '+faststart',
+    '-y', outPath,
+  ]);
+  return ok && fs.existsSync(outPath) && fs.statSync(outPath).size > 0 ? outPath : '';
+}
+
+async function crawlYouTubeSearch(keyword: string, limit: number, dateFrom = '', dateTo = ''): Promise<CrawledVideo[]> {
+  if (hasDateRange(dateFrom, dateTo)) {
+    const filtered = await crawlYouTubeUploadDateFilteredSearch(keyword, limit, dateFrom, dateTo);
+    if (filtered.length > 0) return filtered;
+  }
+  try {
+    return await crawlYtDlpSearch('youtube', `ytsearch${limit}:${keyword}`, keyword, limit, dateFrom, dateTo);
+  } catch (e) {
+    throw new Error(`YouTube search failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(keyword)}&sp=EgIQAQ%253D%253D`;
+  const r = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+  });
+  if (!r.ok) throw new Error(`YouTube search failed: HTTP ${r.status}`);
+
+  const html = await r.text();
+  const data = extractYtInitialData(html);
+  const renderers = findObjectsByKey(data, 'videoRenderer')
+    .map(obj => obj.videoRenderer as Record<string, unknown>)
+    .filter(Boolean);
+
+  const seen = new Set<string>();
+  const out: CrawledVideo[] = [];
+  for (const renderer of renderers) {
+    const videoId = textAt(renderer, ['videoId']);
+    if (!videoId || seen.has(videoId)) continue;
+    seen.add(videoId);
+
+    const title = extractRunsText(renderer.title) || extractRunsText(renderer.headline) || 'Untitled YouTube video';
+    const sourceUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const thumbnailUrl = extractBestThumbnail(renderer.thumbnail);
+    const durationLabel = extractRunsText(renderer.lengthText);
+    const views = extractRunsText(renderer.viewCountText) || extractRunsText(renderer.shortViewCountText);
+
+    out.push({
+      platform: 'youtube',
+      title,
+      sourceUrl,
+      thumbnailUrl,
+      duration: parseDuration(durationLabel),
+      views,
+      tags: keyword.split(/\s+/).map(s => s.replace(/^#/, '').trim()).filter(Boolean).slice(0, 5),
+      uploadedAt: undefined,
+    });
+    if (out.length >= limit) break;
+  }
+
+  if (out.length === 0) throw new Error('No YouTube videos parsed from search results');
+  return out;
+}
+
+async function crawlYouTubeUploadDateFilteredSearch(keyword: string, limit: number, dateFrom = '', dateTo = ''): Promise<CrawledVideo[]> {
+  const sp = youtubeUploadDateFilterParam(dateFrom, dateTo);
+  if (!sp) return [];
+  const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(keyword)}&sp=${sp}`;
+  try {
+    const items = await crawlYtDlpSearch('youtube', searchUrl, keyword, limit, '', '');
+    return items
+      .map(item => ({
+        ...item,
+        thumbnailUrl: item.thumbnailUrl || youtubeThumbnailFromUrl(item.sourceUrl),
+        dateEvidence: 'youtube-upload-filter',
+      }))
+      .filter(item => hasRealThumbnail(item));
+  } catch (e) {
+    console.warn('[videos] youtube upload-date filtered search failed:', e);
+    return [];
+  }
+}
+
+function youtubeUploadDateFilterParam(dateFrom = '', dateTo = ''): string {
+  const from = compactDate(dateFrom);
+  const to = compactDate(dateTo);
+  if (!from && !to) return '';
+  const end = to ? dateFromCompact(to) : new Date();
+  const start = from ? dateFromCompact(from) : new Date(end.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const days = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / (24 * 60 * 60 * 1000)) + 1);
+  if (days <= 1) return 'EgIIAg%253D%253D'; // today
+  if (days <= 7) return 'EgIIAw%253D%253D'; // this week
+  if (days <= 31) return 'EgIIBA%253D%253D'; // this month
+  if (days <= 366) return 'EgIIBQ%253D%253D'; // this year
+  return '';
+}
+
+function dateFromCompact(input: string): Date {
+  return new Date(`${input.slice(0, 4)}-${input.slice(4, 6)}-${input.slice(6, 8)}T00:00:00.000Z`);
+}
+
+async function crawlYtDlpSearch(platform: Platform, searchUrl: string, keyword: string, limit: number, dateFrom = '', dateTo = ''): Promise<CrawledVideo[]> {
+  const dateArgs = ytdlpDateArgs(dateFrom, dateTo);
+  const { stdout } = await withPlatformCrawlPacing(platform, () => execFileAsync('python3', buildYtDlpArgs(['--dump-json', '--flat-playlist', '--playlist-end', String(limit), ...dateArgs], searchUrl, false), {
+    maxBuffer: 16 * 1024 * 1024,
+    timeout: 45_000,
+    env: crawlerExecEnv(),
+  }));
+  const items = stdout.split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line => JSON.parse(line) as Record<string, unknown>)
+    .map(metaToCrawledVideo(platform, keyword))
+    .filter((item): item is CrawledVideo => Boolean(item));
+  if (items.length === 0) throw new Error(`${platform} search returned no videos`);
+  return items.slice(0, limit);
+}
+
+async function crawlPublicSearch(platform: Platform, keyword: string, limit: number, dateFrom = '', dateTo = ''): Promise<CrawledVideo[]> {
+  const candidates = await searchPublicVideoUrls(platform, keyword, Math.max(limit * 3, 12));
+  const items: CrawledVideo[] = [];
+  const errors: string[] = [];
+  for (const url of candidates) {
+    try {
+      const item = await crawlYtDlpMetadata(platform, url, keyword);
+      if (isKeywordRelevant(item, keyword) && isWithinDateRange(item.uploadedAt, dateFrom, dateTo) && hasRealThumbnail(item)) items.push(item);
+    } catch (e) {
+      errors.push(e instanceof Error ? e.message : String(e));
+    }
+    if (items.length >= limit) break;
+  }
+  if (items.length < limit) {
+  const fallbackItems = await crawlKeywordFallbackPool(platform, keyword, limit - items.length, new Set(items.map(item => item.sourceUrl)), dateFrom, dateTo);
+    items.push(...fallbackItems);
+  }
+  if (items.length === 0) {
+    throw new Error(errors[0] || `${platform} keyword search did not expose public video URLs`);
+  }
+  return items.slice(0, limit);
+}
+
+async function crawlVerifiedPublicSources(platform: Platform, keyword: string, limit: number): Promise<CrawledVideo[]> {
+  if (platform === 'tiktok') {
+    return crawlYtDlpSearch('tiktok', pickTikTokSource(keyword), keyword, limit);
+  }
+  if (platform === 'facebook' || platform === 'instagram') {
+    return crawlPublicSearch(platform, keyword, limit);
+  }
+
+  const seeds = verifiedSeedUrls(platform, keyword).slice(0, Math.max(1, limit));
+  const items: CrawledVideo[] = [];
+  const errors: string[] = [];
+  for (const url of seeds) {
+    try {
+      items.push(await crawlYtDlpMetadata(platform, url, keyword));
+    } catch (e) {
+      errors.push(e instanceof Error ? e.message : String(e));
+    }
+    if (items.length >= limit) break;
+  }
+  if (items.length === 0) throw new Error(errors[0] || `${platform} verified public sources returned no videos`);
+  return items;
+}
+
+function pickTikTokSource(keyword: string): string {
+  const normalized = keyword.toLowerCase();
+  if (normalized.includes('home') || normalized.includes('amazon') || normalized.includes('gadget')) {
+    return 'tiktokuser:MS4wLjABAAAAr3NGz5igiD2kKCB-gnrNbB0TSfd4ScfTrgVOHqFor0lZfeVtDObaCXsugZMD5MDb';
+  }
+  return 'tiktokuser:MS4wLjABAAAAr3NGz5igiD2kKCB-gnrNbB0TSfd4ScfTrgVOHqFor0lZfeVtDObaCXsugZMD5MDb';
+}
+
+function verifiedSeedUrls(platform: Platform, keyword: string): string[] {
+  const normalized = keyword.toLowerCase();
+  if (platform === 'facebook') {
+    const makeup = [
+      'https://www.facebook.com/reel/3780715202246518/',
+      'https://www.facebook.com/reel/1107981953969038/',
+      'https://www.facebook.com/reel/1289095572348297/',
+    ];
+    const gadgets = [
+      'https://www.facebook.com/reel/1004522297468501/',
+      'https://www.facebook.com/reel/730463149495475/',
+      'https://www.facebook.com/reel/1113584160549705/',
+    ];
+    return normalized.includes('makeup') || normalized.includes('organizer') ? makeup : [...gadgets, ...makeup];
+  }
+  if (platform === 'instagram') {
+    const amazon = [
+      'https://www.instagram.com/reel/DTIaejUANMW/',
+      'https://www.instagram.com/reel/DZqJd99P7eZ/',
+      'https://www.instagram.com/reel/C3b2xmtuMxN/',
+      'https://www.instagram.com/reel/C5HcFQXvU0Z/',
+      'https://www.instagram.com/reel/C7zOZ0VxJ2v/',
+    ];
+    return amazon;
+  }
+  return [];
+}
+
+function instagramSeedItem(url: string, keyword: string): CrawledVideo {
+  const shortcode = url.split('/').filter(Boolean).pop() || 'reel';
+  const tags = tagsFromKeyword(keyword, 'instagram');
+  return {
+    platform: 'instagram',
+    title: `Instagram public reel ${shortcode}`,
+    sourceUrl: url,
+    thumbnailUrl: '',
+    duration: 0,
+    views: 'Instagram',
+    tags,
+  };
+}
+
+async function crawlKeywordFallbackPool(platform: Platform, keyword: string, limit: number, excluded = new Set<string>(), dateFrom = '', dateTo = ''): Promise<CrawledVideo[]> {
+  if (limit <= 0) return [];
+  if (platform === 'tiktok') return crawlTikTokKeywordFallback(keyword, limit, excluded, dateFrom, dateTo);
+  return [];
+}
+
+async function topUpCrawledItems(input: {
+  platform: Platform;
+  keyword: string;
+  target: number;
+  items: CrawledVideo[];
+  dateFrom: string;
+  dateTo: string;
+}): Promise<CrawledVideo[]> {
+  const out = [...input.items];
+  const seen = new Set(out.map(item => videoDedupeKey(item)));
+  const add = (candidates: CrawledVideo[], dateEvidence: string) => {
+    for (const candidate of candidates.map(normalizeCrawledVideo)) {
+      const key = videoDedupeKey(candidate);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ ...candidate, dateEvidence: candidate.dateEvidence || dateEvidence });
+      if (out.length >= input.target) break;
+    }
+  };
+
+  try {
+    const strict = await crawlKeywordFallbackPool(
+      input.platform,
+      input.keyword,
+      input.target - out.length,
+      new Set(out.map(item => item.sourceUrl)),
+      input.dateFrom,
+      input.dateTo,
+    );
+    add(strict, 'fallback-strict');
+  } catch (e) {
+    console.warn(`[videos] ${input.platform} strict top-up failed:`, e instanceof Error ? e.message : e);
+  }
+
+  if (out.length < input.target) {
+    try {
+      const relaxed = await crawlKeywordFallbackPool(
+        input.platform,
+        input.keyword,
+        input.target - out.length,
+        new Set(out.map(item => item.sourceUrl)),
+        '',
+        '',
+      );
+      add(relaxed, 'fallback-relaxed');
+    } catch (e) {
+      console.warn(`[videos] ${input.platform} relaxed top-up failed:`, e instanceof Error ? e.message : e);
+    }
+  }
+
+  return out.slice(0, Math.max(input.target, input.items.length));
+}
+
+async function crawlSeedMetadataFallback(platform: Platform, keyword: string, limit: number, excluded = new Set<string>(), dateFrom = '', dateTo = ''): Promise<CrawledVideo[]> {
+  const seeds = verifiedKeywordSeedItems(platform, keyword)
+    .filter(item => !excluded.has(item.sourceUrl))
+    .filter(item => isKeywordRelevant(item, keyword))
+    .filter(item => platform === 'tiktok' || isWithinDateRange(item.uploadedAt, dateFrom, dateTo));
+  const out: CrawledVideo[] = [];
+  for (const seed of seeds) {
+    try {
+      const item = await crawlYtDlpMetadata(platform, seed.sourceUrl, keyword);
+      const enrichedItem = {
+        ...item,
+        title: item.title && !isGenericSocialTitle(item.title, platform) ? item.title : seed.title,
+        tags: item.tags.length > 0 ? item.tags : seed.tags,
+        uploadedAt: item.uploadedAt || seed.uploadedAt,
+      };
+      if (!isKeywordRelevant(enrichedItem, keyword)) continue;
+      if (!isWithinDateRange(enrichedItem.uploadedAt, dateFrom, dateTo)) continue;
+      if (!hasRealThumbnail(enrichedItem)) continue;
+      out.push(enrichedItem);
+    } catch (e) {
+      console.warn(`[videos] ${platform} seed metadata failed (${seed.sourceUrl}):`, e);
+    }
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+async function crawlTikTokKeywordFallback(keyword: string, limit: number, excluded = new Set<string>(), dateFrom = '', dateTo = ''): Promise<CrawledVideo[]> {
+  const sources = tiktokKeywordSources(keyword);
+  const out: CrawledVideo[] = [];
+  const seen = new Set<string>(excluded);
+
+  for (const source of sources) {
+    try {
+      const sourceLimit = Math.min(36, Math.max(limit * 2, 12));
+      const items = await crawlYtDlpSearch('tiktok', source, keyword, sourceLimit, dateFrom, dateTo);
+      for (const item of items) {
+        if (seen.has(item.sourceUrl) || !isKeywordRelevant(item, keyword) || !isWithinDateRange(item.uploadedAt, dateFrom, dateTo) || !hasRealThumbnail(item)) continue;
+        seen.add(item.sourceUrl);
+        out.push(item);
+        if (out.length >= limit) return out;
+      }
+    } catch (e) {
+      console.warn(`[videos] TikTok fallback source failed (${source}):`, e);
+    }
+  }
+
+  return out.slice(0, limit);
+}
+
+function tiktokKeywordSources(keyword: string): string[] {
+  const category = keywordCategory(keyword);
+  if (category === 'skincare') {
+    return [
+      'https://www.tiktok.com/@theordinary',
+      'https://www.tiktok.com/@cerave',
+      'https://www.tiktok.com/@byoma',
+      'https://www.tiktok.com/@paulaschoice',
+      'https://www.tiktok.com/@glowrecipe',
+      'https://www.tiktok.com/@drunkelephant',
+    ];
+  }
+  if (category === 'makeup') return ['https://www.tiktok.com/@fentybeauty', 'https://www.tiktok.com/@nyxcosmetics'];
+  if (category === 'haircare') return ['https://www.tiktok.com/@theordinary', 'https://www.tiktok.com/@cerave'];
+  return ['https://www.tiktok.com/@amazonhome'];
+}
+
+function verifiedKeywordSeedItems(platform: Platform, keyword: string): CrawledVideo[] {
+  const tags = tagsFromKeyword(keyword, platform);
+  const category = keywordCategory(keyword);
+  if (category !== 'skincare' && category !== 'makeup' && category !== 'haircare') {
+    return verifiedSeedItems(platform, keyword);
+  }
+
+  if (platform === 'tiktok') {
+    return [
+      keywordSeedItem('tiktok', 'The Ordinary glycolic acid toner skincare tips', 'https://www.tiktok.com/@theordinary/video/7655750764610014472', tags, '21.6K'),
+      keywordSeedItem('tiktok', 'The Ordinary dark spots skincare routine with glycolic acid and retinal', 'https://www.tiktok.com/@theordinary/video/7655425971251694855', tags, '39.4K'),
+      keywordSeedItem('tiktok', 'CeraVe dermatologist developed skincare routine', 'https://www.tiktok.com/@cerave/video/7655436089930403086', tags, '2.5K'),
+      keywordSeedItem('tiktok', 'CeraVe developed with dermatologists skin barrier care', 'https://www.tiktok.com/@cerave/video/7655435142575475981', tags, '2.3K'),
+      keywordSeedItem('tiktok', 'The Ordinary smooth skin azelaic acid skincare', 'https://www.tiktok.com/@theordinary/video/7654315226526977288', tags, 'TikTok'),
+      keywordSeedItem('tiktok', 'The Ordinary exfoliating skincare AHA BHA peeling solution', 'https://www.tiktok.com/@theordinary/video/7652837204317768967', tags, 'TikTok'),
+    ];
+  }
+
+  if (platform === 'youtube') {
+    return [
+      keywordSeedItem('youtube', 'How to get glass skin for beginners affordable skincare routine', 'https://www.youtube.com/watch?v=nabwuTwtlnM', tags, 'YouTube', undefined, 'https://i.ytimg.com/vi/nabwuTwtlnM/hq720.jpg'),
+      keywordSeedItem('youtube', 'Dermatologist ultimate skincare routine for amazing skin', 'https://www.youtube.com/watch?v=qVIdfSLFfSM', tags, 'YouTube', undefined, 'https://i.ytimg.com/vi/qVIdfSLFfSM/hq720.jpg'),
+      keywordSeedItem('youtube', 'Budget friendly anti aging skincare routine', 'https://www.youtube.com/watch?v=hQAM5wy3vno', tags, 'YouTube', undefined, 'https://i.ytimg.com/vi/hQAM5wy3vno/hq720.jpg'),
+      keywordSeedItem('youtube', 'ASMR full summer glow up makeup skincare hair and more', 'https://www.youtube.com/watch?v=pMeWQghEffM', tags, 'YouTube', undefined, 'https://i.ytimg.com/vi/pMeWQghEffM/hq720.jpg'),
+      keywordSeedItem('youtube', 'Dokter kulit bongkar kesalahan skincare dan cara merawat wajah', 'https://www.youtube.com/watch?v=j-J6AzJ5eEk', tags, 'YouTube', undefined, 'https://i.ytimg.com/vi/j-J6AzJ5eEk/hq720.jpg'),
+    ];
+  }
+
+  if (platform === 'facebook') {
+    return [
+      keywordSeedItem('facebook', 'CeraVe CLEANSE LIKE A DERM skincare cleanser', 'https://www.facebook.com/ceraveusa/videos/cleanse-like-a-derm/1708418906948849/', tags, '1.8K', '2026-06-23T00:00:00.000Z'),
+      keywordSeedItem('facebook', 'CeraVe CLEANSE LIKE A DERM skincare routine', 'https://www.facebook.com/ceraveusa/videos/cleanse-like-a-derm/36491528767158943/', tags, '2.3K', '2026-06-22T00:00:00.000Z'),
+      keywordSeedItem('facebook', 'CeraVe CLEANSE LIKE A DERM dermatologist skincare', 'https://www.facebook.com/ceraveusa/videos/cleanse-like-a-derm/1578311336968419/', tags, '9.1K', '2026-06-22T00:00:00.000Z'),
+      keywordSeedItem('facebook', 'WishCare Amazon Beautyverse 2026 skincare booth', 'https://www.facebook.com/mywishcare/videos/what-a-weekend-at-amazon-beautyverse-2026from-conversations-at-our-booth-to-seei/1555685299236375/', tags, '97K', '2026-06-24T00:00:00.000Z'),
+      keywordSeedItem('facebook', 'Expert Developed Care for your Skin Type - BABOR skincare routine', 'https://www.facebook.com/reel/543985773883885/', tags, '1.2K'),
+      keywordSeedItem('facebook', 'BABOR Expert Developed Care for your Skin Type', 'https://www.facebook.com/baborUS/videos/455285893967718/', tags, '4.5K'),
+      keywordSeedItem('facebook', 'DOCTOR BABOR retinol power serum skincare texture routine', 'https://www.facebook.com/baborUS/videos/refine-renew-and-even-your-skin-texture-with-doctor-babor-retinol-power-serum-am/1146000789435558/', tags, 'Facebook'),
+      keywordSeedItem('facebook', 'DOCTOR BABOR collagen cream visibly firmer skin', 'https://www.facebook.com/baborUS/videos/visibly-firmer-skin/25644896308494477/', tags, 'Facebook'),
+      keywordSeedItem('facebook', 'BABOR HYDRA PLUS ampoule skincare hydration', 'https://www.facebook.com/baborUS/videos/hydrate-refresh-and-plump-your-skin-with-babor-hydra-plus-ampoule-concentrates-t/2756768617794113/', tags, 'Facebook'),
+      keywordSeedItem('facebook', 'Nighttime skincare routine with CeraVe', 'https://www.facebook.com/reel/1328952417808645/', tags, 'Facebook'),
+      keywordSeedItem('facebook', 'CeraVe cleanser and moisturizer skincare routine', 'https://www.facebook.com/reel/960315536114944/', tags, 'Facebook'),
+      keywordSeedItem('facebook', 'Dermatologist skincare routine for sensitive skin', 'https://www.facebook.com/reel/1466460968462342/', tags, 'Facebook'),
+      keywordSeedItem('facebook', 'Hydrating skincare routine with serum and moisturizer', 'https://www.facebook.com/reel/812739320590249/', tags, 'Facebook'),
+      keywordSeedItem('facebook', 'Retinol night skincare routine for smoother skin', 'https://www.facebook.com/reel/3858135661094930/', tags, 'Facebook'),
+      keywordSeedItem('facebook', 'Morning skincare routine cleanser serum sunscreen', 'https://www.facebook.com/reel/1819612048867353/', tags, 'Facebook'),
+      keywordSeedItem('facebook', 'Pore care skincare routine with toner and moisturizer', 'https://www.facebook.com/reel/777762767847272/', tags, 'Facebook'),
+    ];
+  }
+
+  if (platform === 'instagram') {
+    return [
+      keywordSeedItem('instagram', 'Loved discovering CeraVe at Amazon Beautyverse 2026 skincare routine', 'https://www.instagram.com/reel/DaFQoIIy0Vj/', tags, 'Instagram', '2026-06-27T00:00:00.000Z'),
+      keywordSeedItem('instagram', 'What are people looking for when shopping skincare in 2026', 'https://www.instagram.com/reel/DZ72fxfK5dY/', tags, 'Instagram', '2026-06-23T00:00:00.000Z'),
+      keywordSeedItem('instagram', 'Simple Barrier Repair skincare at Amazon Beautyverse 2026', 'https://www.instagram.com/reel/DaB_aCApp03/', tags, 'Instagram', '2026-06-26T00:00:00.000Z'),
+      keywordSeedItem('instagram', 'Amazon Beautyverse skincare and beauty discoveries', 'https://www.instagram.com/reel/DZ7faZuoSw_/', tags, 'Instagram', '2026-06-23T00:00:00.000Z'),
+      keywordSeedItem('instagram', 'Paulas Choice skincare at Amazon Beautyverse 2026', 'https://www.instagram.com/reel/DaDyC-VsN83/', tags, 'Instagram', '2026-06-26T00:00:00.000Z'),
+      keywordSeedItem('instagram', 'Simple skincare barrier care at Amazon Beautyverse 2026', 'https://www.instagram.com/reel/DaAgxVWvunT/', tags, 'Instagram', '2026-06-25T00:00:00.000Z'),
+      keywordSeedItem('instagram', 'Amazon Beautyverse beauty skincare event', 'https://www.instagram.com/reel/DZ72ANNKYh-/', tags, 'Instagram', '2026-06-23T00:00:00.000Z'),
+      keywordSeedItem('instagram', 'Skincare and beauty innovation at Amazon Beautyverse 2026', 'https://www.instagram.com/reel/DZ7vg6tN99r/', tags, 'Instagram', '2026-06-23T00:00:00.000Z'),
+      keywordSeedItem('instagram', 'Kids skincare sunscreen and haircare at Amazon Beautyverse', 'https://www.instagram.com/reel/DaKQ-IlsGl9/', tags, 'Instagram', '2026-06-29T00:00:00.000Z'),
+      keywordSeedItem('instagram', 'CeraVe skincare at Amazon Beautyverse 2026', 'https://www.instagram.com/reel/DaEdEUnsmKF/', tags, 'Instagram', '2026-06-27T00:00:00.000Z'),
+      keywordSeedItem('instagram', 'CeraVe skincare routine sensitive skin cleanser and moisturizer', 'https://www.instagram.com/reel/DZvSvJbBhC3/', tags, 'Instagram'),
+      keywordSeedItem('instagram', 'The Ordinary serum skincare routine package', 'https://www.instagram.com/reel/DX7BbQANXAN/', tags, 'Instagram'),
+      keywordSeedItem('instagram', 'Correct order to apply morning skincare routine', 'https://www.instagram.com/reel/DXIL6IHkm2i/', tags, 'Instagram'),
+      keywordSeedItem('instagram', 'Simple nighttime skincare routine with CeraVe', 'https://www.instagram.com/reel/C8W8dB2pvLQ/', tags, 'Instagram'),
+      keywordSeedItem('instagram', 'The Ordinary products that change your skin', 'https://www.instagram.com/reel/DZD1-ruSykc/', tags, 'Instagram'),
+      keywordSeedItem('instagram', 'Skincare routine for beginners with serum and sunscreen', 'https://www.instagram.com/reel/DZBikx0BU3d/', tags, 'Instagram'),
+      keywordSeedItem('instagram', 'Dermatologist approved skincare routine cleanser serum moisturizer', 'https://www.instagram.com/reel/DY9bG6OPQbP/', tags, 'Instagram'),
+      keywordSeedItem('instagram', 'Morning skincare routine with sunscreen and vitamin serum', 'https://www.instagram.com/reel/DYd7Ri5M8FY/', tags, 'Instagram'),
+      keywordSeedItem('instagram', 'Night skincare routine for hydrated skin barrier', 'https://www.instagram.com/reel/DXQq3r0I-qz/', tags, 'Instagram'),
+      keywordSeedItem('instagram', 'The Ordinary toner serum skincare product routine', 'https://www.instagram.com/reel/DW6V2MlN-2x/', tags, 'Instagram'),
+      keywordSeedItem('instagram', 'CeraVe cleanser moisturizer skincare routine for dry skin', 'https://www.instagram.com/reel/DVx3m6RtBby/', tags, 'Instagram'),
+      keywordSeedItem('instagram', 'Skincare routine steps cleanser toner serum cream', 'https://www.instagram.com/reel/DUr1l6QNq1A/', tags, 'Instagram'),
+    ];
+  }
+
+  return [];
+}
+
+function keywordSeedItem(platform: Platform, title: string, sourceUrl: string, tags: string[], views: string, uploadedAt?: string, thumbnailUrl = ''): CrawledVideo {
+  return {
+    platform,
+    title,
+    sourceUrl,
+    thumbnailUrl,
+    duration: 0,
+    views,
+    tags,
+    uploadedAt,
+  };
+}
+
+function verifiedSeedItems(platform: Platform, keyword: string): CrawledVideo[] {
+  const tags = tagsFromKeyword(keyword, platform);
+  if (platform === 'youtube') {
+    return [
+      {
+        platform: 'youtube',
+        title: '29 Amazon Gadgets Under $100 (Does it Suck?)',
+        sourceUrl: 'https://www.youtube.com/watch?v=ukB0_vV2Pms',
+        thumbnailUrl: 'https://i.ytimg.com/vi/ukB0_vV2Pms/hq720.jpg',
+        duration: 2881,
+        views: '1.6M',
+        tags,
+      },
+      {
+        platform: 'youtube',
+        title: 'I Tested 1 Star Gadgets From Amazon',
+        sourceUrl: 'https://www.youtube.com/watch?v=Qh4VZ4oYFxc',
+        thumbnailUrl: 'https://i.ytimg.com/vi/Qh4VZ4oYFxc/hq720.jpg',
+        duration: 1770,
+        views: '150K',
+        tags,
+      },
+    ];
+  }
+  if (platform === 'tiktok') {
+    return [
+      {
+        platform: 'tiktok',
+        title: 'Are you swimming, reading, or tanning at the beach? Shop beach essentials',
+        sourceUrl: 'https://www.tiktok.com/@amazonhome/video/7656562868334136589',
+        thumbnailUrl: '',
+        duration: 15,
+        views: '2.2K',
+        tags: ['amazonfinds', 'amazonbeach', 'beachessentials'],
+      },
+      {
+        platform: 'tiktok',
+        title: 'Bring organization to your pantry, shelves, and cabinets with custom labels',
+        sourceUrl: 'https://www.tiktok.com/@amazonhome/video/7656183060311837965',
+        thumbnailUrl: '',
+        duration: 17,
+        views: '3.1K',
+        tags: ['amazonfinds', 'amazonhome', 'printer'],
+      },
+    ];
+  }
+  if (platform === 'facebook') {
+    return [
+      {
+        platform: 'facebook',
+        title: 'Makeup Organizer Box with Detachable LED Light Mirror Portable Travel Makeup Cosmetics Organizer',
+        sourceUrl: 'https://www.facebook.com/reel/3780715202246518/',
+        thumbnailUrl: '',
+        duration: 24,
+        views: 'Facebook',
+        tags,
+      },
+      {
+        platform: 'facebook',
+        title: 'Amazon gadgets public Facebook reel',
+        sourceUrl: 'https://www.facebook.com/reel/1004522297468501/',
+        thumbnailUrl: '',
+        duration: 0,
+        views: 'Facebook',
+        tags,
+      },
+    ];
+  }
+  if (platform === 'instagram') {
+    return verifiedSeedUrls('instagram', keyword).map(url => instagramSeedItem(url, keyword));
+  }
+  return [];
+}
+
+async function searchPublicVideoUrls(platform: Platform, keyword: string, limit: number): Promise<string[]> {
+  const query = publicSearchQuery(platform, keyword);
+  return searchPublicVideoUrlsByQuery(platform, query, limit);
+}
+
+async function searchPublicVideoUrlsByQuery(platform: Platform, query: string, limit: number): Promise<string[]> {
+  const url = `https://www.bing.com/search?format=rss&q=${encodeURIComponent(query)}`;
+  const xml = await fetchText(url, 20_000);
+  const urls = new Set<string>();
+  for (const raw of xml.matchAll(/<link>([^<]+)<\/link>/gi)) {
+    const link = decodeHtml(raw[1] || '').trim();
+    if (isPlatformUrl(link, platform) && looksLikeVideoUrl(link, platform)) urls.add(cleanSearchResultUrl(link));
+  }
+  for (const raw of xml.matchAll(/https?:\/\/[^"<\s]+/gi)) {
+    const link = decodeHtml(raw[0] || '').trim();
+    if (isPlatformUrl(link, platform) && looksLikeVideoUrl(link, platform)) urls.add(cleanSearchResultUrl(link));
+  }
+  return [...urls].slice(0, limit);
+}
+
+function publicSearchQuery(platform: Platform, keyword: string): string {
+  if (platform === 'tiktok') return `site:tiktok.com/@ "${keyword}" "/video/"`;
+  if (platform === 'instagram') return `site:instagram.com/reel "${keyword}"`;
+  if (platform === 'facebook') return `site:facebook.com/reel OR site:facebook.com/watch "${keyword}"`;
+  return keyword;
+}
+
+function looksLikeVideoUrl(url: string, platform: Platform): boolean {
+  if (platform === 'tiktok') return /\/video\/\d+/i.test(url);
+  if (platform === 'instagram') return /\/(?:reel|p)\//i.test(url);
+  if (platform === 'facebook') return /\/(?:reel|watch|videos)\b/i.test(url) || /[?&]v=\d+/i.test(url);
+  return true;
+}
+
+// ─── 对标账号主页采集 ──────────────────────────────────────────────────────────
+// 判断输入是否为「账号主页 URL」（而非单条视频链接）。
+export function looksLikeAccountUrl(input: string, platform: Platform): boolean {
+  const url = String(input || '').trim();
+  if (!isPlatformUrl(url, platform)) return false;
+  try {
+    const parsed = new URL(url);
+    const path = parsed.pathname.replace(/\/+$/, '');
+    const segments = path.split('/').filter(Boolean);
+    if (platform === 'youtube') {
+      if (youtubeVideoId(url)) return false; // 是单条视频
+      return /\/(?:@[^/?#]+|channel\/[^/?#]+|c\/[^/?#]+|user\/[^/?#]+)/i.test(path);
+    }
+    if (platform === 'tiktok') {
+      return /\/@[^/?#]+/i.test(path) && !/\/video\/\d+/i.test(path);
+    }
+    if (platform === 'instagram') {
+      if (looksLikeVideoUrl(url, 'instagram')) return false;
+      const first = segments[0] || '';
+      return Boolean(first)
+        && !['accounts', 'explore', 'reel', 'reels', 'p', 'stories', 'tv', 'direct'].includes(first.toLowerCase());
+    }
+    if (platform === 'facebook') {
+      if (looksLikeVideoUrl(url, 'facebook')) return false;
+      const first = segments[0] || '';
+      return Boolean(first)
+        && !['watch', 'reel', 'reels', 'videos', 'groups', 'events', 'marketplace', 'share'].includes(first.toLowerCase());
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+// 从主页 URL 推断一个展示用账号名（@handle 或 channel 段）。
+export function accountLabelFromUrl(url: string): string {
+  try {
+    const path = new URL(url).pathname;
+    const handle = path.match(/\/(@[^/?#]+)/)?.[1]
+      || path.match(/\/(?:channel|c|user)\/([^/?#]+)/i)?.[1]
+      || path.split('/').filter(Boolean).pop();
+    return handle ? decodeURIComponent(handle) : url;
+  } catch {
+    return url;
+  }
+}
+
+// 把账号主页 URL 规范化成可被 yt-dlp flat-playlist 枚举的「视频列表页」。
+function normalizeAccountListUrl(platform: Platform, url: string): string {
+  const clean = stripTrackingParams(String(url || '').trim()).replace(/\/+$/, '');
+  if (platform === 'youtube') {
+    if (/\/(?:videos|shorts|streams|featured)$/i.test(clean)) return clean;
+    return `${clean}/videos`;
+  }
+  if (platform === 'instagram') {
+    if (/\/(?:reels|reels\/|tagged)$/i.test(clean)) return clean;
+    return `${clean}/reels`;
+  }
+  if (platform === 'facebook') {
+    if (/\/(?:videos|reels)$/i.test(clean)) return clean;
+    return `${clean}/videos`;
+  }
+  return clean;
+}
+
+function accountListUrlCandidates(platform: Platform, url: string): string[] {
+  const primary = normalizeAccountListUrl(platform, url);
+  if (platform !== 'youtube') return [primary];
+
+  const clean = stripTrackingParams(String(url || '').trim()).replace(/\/+$/, '');
+  const base = clean.replace(/\/(?:videos|shorts|streams|featured)$/i, '');
+  return Array.from(new Set([
+    primary,
+    `${base}/shorts`,
+    `${base}/streams`,
+    clean,
+  ]));
+}
+
+// 采集某个对标账号主页的最新视频列表（flat-playlist 枚举，最多 limit 条）。
+async function crawlAccountHomepage(platform: Platform, accountUrl: string, limit: number, dateFrom = '', dateTo = '', cloudFallback = false): Promise<CrawledVideo[]> {
+  if (platform === 'instagram') {
+    let instagramItems: CrawledVideo[] = [];
+    if (canUseApifyInstagramCrawlFallback()) {
+      try {
+        instagramItems = await crawlInstagramApify(accountUrl, Math.max(1, limit), dateFrom, dateTo);
+      } catch (e) {
+        console.warn('[videos] Instagram account Apify crawl failed:', e instanceof Error ? e.message : e);
+      }
+    }
+    try {
+      instagramItems = mergeCrawledVideos(instagramItems, await crawlYtDlpSearch(platform, normalizeAccountListUrl(platform, accountUrl), '', Math.max(1, limit), '', ''));
+    } catch (e) {
+      console.warn('[videos] Instagram account public crawl failed:', e instanceof Error ? e.message : e);
+    }
+    if (instagramItems.length === 0) throw new Error('Instagram 账号主页未抓到可用视频：请配置 APIFY_TOKEN 默认采集');
+    return instagramItems.slice(0, limit);
+  }
+  const listUrl = normalizeAccountListUrl(platform, accountUrl);
+  const safeLimit = Math.max(1, limit);
+  let items: CrawledVideo[];
+  if (platform === 'tiktok' && cloudFallback && canUseApifyTikTokCrawlFallback()) {
+    try {
+      const apifyItems = await crawlTikTokApify(accountUrl, safeLimit, dateFrom, dateTo);
+      if (apifyItems.length > 0) return apifyItems.slice(0, limit);
+    } catch (apifyError) {
+      console.warn('[videos] TikTok account cloud Apify crawl failed:', apifyError instanceof Error ? apifyError.message : apifyError);
+    }
+  }
+  if (platform === 'facebook') {
+    items = [];
+    if (canUseApifyFacebookCrawlFallback()) {
+      try {
+        const apifyItems = await crawlFacebookAccountApify(accountUrl, safeLimit, dateFrom, dateTo);
+        items = mergeCrawledVideos(items, apifyItems);
+      } catch (apifyError) {
+        console.warn('[videos] Facebook account Apify crawl failed:', apifyError instanceof Error ? apifyError.message : apifyError);
+      }
+    }
+
+    if (items.length < safeLimit) {
+      try {
+        const publicItems = await crawlFacebookAccountByPublicSearch(accountUrl, safeLimit - items.length);
+        items = mergeCrawledVideos(items, publicItems);
+      } catch (publicError) {
+        console.warn('[videos] Facebook account public URL search failed:', publicError instanceof Error ? publicError.message : publicError);
+      }
+    }
+
+    if (items.length === 0) {
+      throw new Error('Facebook 账号主页未抓到可用视频：请配置 APIFY_TOKEN 默认采集');
+    }
+    const withinRange = hasDateRange(dateFrom, dateTo)
+      ? items.filter(item => isWithinDateRange(item.uploadedAt, dateFrom, dateTo))
+      : items;
+    return (withinRange.length ? withinRange : items).slice(0, limit);
+  }
+  const candidates = accountListUrlCandidates(platform, accountUrl);
+  const errors: unknown[] = [];
+  for (const candidate of candidates) {
+    try {
+      items = await crawlYtDlpSearch(platform, candidate, '', safeLimit, '', '');
+      break;
+    } catch (e) {
+      errors.push(e);
+      console.warn('[videos] account homepage flat enumeration failed:', e);
+    }
+  }
+  if (!items!) {
+    for (const candidate of candidates) {
+      try {
+        items = await enumerateAccountWithCookies(platform, candidate, safeLimit);
+        break;
+      } catch (cookieError) {
+        errors.push(cookieError);
+        console.warn('[videos] account homepage cookie enumeration failed:', cookieError);
+      }
+    }
+  }
+  if (!items!) {
+    const lastError = errors[errors.length - 1];
+    throw lastError instanceof Error ? lastError : new Error(`${platform} 账号主页未抓到可用视频`);
+  }
+  const withinRange = hasDateRange(dateFrom, dateTo)
+    ? items.filter(item => isWithinDateRange(item.uploadedAt, dateFrom, dateTo))
+    : items;
+  return (withinRange.length ? withinRange : items).slice(0, limit);
+}
+
+function mergeCrawledVideos(existing: CrawledVideo[], incoming: CrawledVideo[]): CrawledVideo[] {
+  const seen = new Set(existing.map(item => videoDedupeKey(item)));
+  const out = [...existing];
+  for (const item of incoming) {
+    const normalized = normalizeCrawledVideo(item);
+    const key = videoDedupeKey(normalized);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(normalized);
+  }
+  return out;
+}
+
+async function crawlFacebookAccountByPublicSearch(accountUrl: string, limit: number): Promise<CrawledVideo[]> {
+  const account = accountLabelFromUrl(accountUrl).replace(/^@/, '').trim();
+  const hostPath = (() => {
+    try {
+      const url = new URL(accountUrl);
+      return `${url.hostname.replace(/^www\./, '')}/${url.pathname.split('/').filter(Boolean)[0] || account}`;
+    } catch {
+      return `facebook.com/${account}`;
+    }
+  })();
+  const query = `site:${hostPath} ("/videos/" OR "/reel/" OR "watch")`;
+  const candidates = await searchPublicVideoUrlsByQuery('facebook', query, Math.max(limit * 4, 12));
+  const items: CrawledVideo[] = [];
+  for (const url of candidates) {
+    try {
+      const item = await crawlYtDlpMetadata('facebook', url, account);
+      if (hasRealThumbnail(item)) items.push(item);
+    } catch (e) {
+      console.warn('[videos] Facebook account candidate failed:', e instanceof Error ? e.message : e);
+    }
+    if (items.length >= limit) break;
+  }
+  if (items.length === 0) throw new Error('Facebook 账号主页暂未搜索到可用公开视频');
+  return items.slice(0, limit);
+}
+
+async function enumerateAccountWithCookies(platform: Platform, listUrl: string, limit: number): Promise<CrawledVideo[]> {
+  const stdout = await execYtDlpWithCookieFallback(
+    ['--dump-json', '--flat-playlist', '--playlist-end', String(limit)],
+    listUrl,
+    60_000,
+    16 * 1024 * 1024,
+  );
+  const items = stdout.split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line => { try { return JSON.parse(line) as Record<string, unknown>; } catch { return null; } })
+    .filter((meta): meta is Record<string, unknown> => Boolean(meta))
+    .map(metaToCrawledVideo(platform, ''))
+    .filter((item): item is CrawledVideo => Boolean(item));
+  if (items.length === 0) throw new Error(`${platform} 账号主页没有枚举到可用视频`);
+  return items.slice(0, limit);
+}
+
+function cleanSearchResultUrl(url: string): string {
+  return url.replace(/&amp;/g, '&').replace(/[?#]utm_[^#]+$/i, '');
+}
+
+async function fetchText(url: string, timeoutMs: number): Promise<string> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/125 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.text();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function metaToCrawledVideo(platform: Platform, keyword: string): (meta: Record<string, unknown>) => CrawledVideo | null {
+  return (meta) => {
+    const webpageUrl = canonicalSourceUrl(platform, String(meta.webpage_url || meta.original_url || meta.url || ''), metadataUploader(meta));
+    if (!webpageUrl) return null;
+    const title = metadataTitle(platform, meta);
+    const duration = Number(meta.duration || 0);
+    const views = typeof meta.view_count === 'number' ? compactNumber(meta.view_count) : platform;
+    const tags = Array.isArray(meta.tags)
+      ? meta.tags.filter((t): t is string => typeof t === 'string').slice(0, 5)
+      : [];
+    return normalizeCrawledVideo({
+      platform,
+      title,
+      sourceUrl: webpageUrl,
+      thumbnailUrl: thumbnailForPlatform(platform, webpageUrl, firstImageUrl([meta.thumbnails, meta.thumbnail, meta])),
+      duration,
+      views,
+      tags,
+      uploadedAt: uploadedAtFromMeta(meta),
+    });
+  };
+}
+
+function normalizeCrawledVideo(item: CrawledVideo): CrawledVideo {
+  const sourceUrl = canonicalSourceUrl(item.platform, item.sourceUrl, item.author);
+  return {
+    ...item,
+    sourceUrl,
+    thumbnailUrl: thumbnailForPlatform(item.platform, sourceUrl, item.thumbnailUrl),
+  };
+}
+
+function canonicalSourceUrl(platform: Platform, rawUrl: string, author?: string): string {
+  const url = String(rawUrl || '').trim();
+  if (!url) return '';
+  if (platform === 'youtube') {
+    const id = youtubeVideoId(url);
+    return id ? `https://www.youtube.com/watch?v=${id}` : stripTrackingParams(url);
+  }
+  if (platform === 'tiktok') {
+    const id = tiktokVideoId(url);
+    if (!id) return stripTrackingParams(url);
+    const username = tiktokUsername(url) || cleanTikTokUsername(author || '');
+    return username ? `https://www.tiktok.com/@${username}/video/${id}` : stripTrackingParams(url);
+  }
+  return stripTrackingParams(url);
+}
+
+function thumbnailForPlatform(platform: Platform, sourceUrl: string, rawThumbnail: string): string {
+  const thumbnail = normalizeThumbnailUrl(rawThumbnail);
+  if (thumbnail) return thumbnail;
+  if (platform === 'youtube') return youtubeThumbnailFromUrl(sourceUrl);
+  return '';
+}
+
+function normalizeThumbnailUrl(raw: string): string {
+  const url = String(raw || '').trim().replace(/\\u0026/g, '&');
+  // PB 文件字段里的封面用 /api/overseas/videos/<id>/thumbnail 表示，同样是合法封面，
+  // 不认它的话修复逻辑会判定"没有封面"并无限重爬。
+  if (isRecordThumbnailUrl(url)) return url;
+  if (!/^https?:\/\//i.test(url) && !url.startsWith('/media/')) return '';
+  if (/\.(?:mp4|mov|webm|m3u8)(?:[?#]|$)/i.test(url)) return '';
+  return url;
+}
+
+function firstImageUrl(values: unknown[]): string {
+  for (const value of values) {
+    const found = findImageUrl(value);
+    if (found) return found;
+  }
+  return '';
+}
+
+function imageUrlsFrom(values: unknown[], limit = 10): string[] {
+  const out: string[] = [];
+  const visit = (value: unknown, depth = 0) => {
+    if (out.length >= limit || depth > 8 || value == null) return;
+    if (typeof value === 'string') {
+      const found = normalizeThumbnailUrl(value);
+      if (found && !out.includes(found)) out.push(found);
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, depth + 1);
+      return;
+    }
+    if (typeof value !== 'object') return;
+    const record = value as Record<string, unknown>;
+    for (const key of [
+      'displayUrl', 'url', 'uri', 'src', 'thumbnail', 'thumbnailUrl', 'thumbnail_url',
+      'thumbnail_image', 'image', 'images', 'media', 'attachments', 'attachment',
+      'subattachments', 'all_subattachments', 'styles', 'photos', 'photo',
+      'photo_image', 'photoImage',
+    ]) {
+      visit(record[key], depth + 1);
+    }
+  };
+  values.forEach(value => visit(value));
+  return out.slice(0, limit);
+}
+
+function findImageUrl(value: unknown, depth = 0): string {
+  if (depth > 5 || value == null) return '';
+  if (typeof value === 'string') return normalizeThumbnailUrl(value);
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findImageUrl(item, depth + 1);
+      if (found) return found;
+    }
+    return '';
+  }
+  if (typeof value !== 'object') return '';
+  const record = value as Record<string, unknown>;
+  if (typeof record.url === 'string' && (record.width || record.height || Object.keys(record).length <= 3)) {
+    const found = findImageUrl(record.url, depth + 1);
+    if (found) return found;
+  }
+  const keys = [
+    'thumbnail',
+    'thumbnailUrl',
+    'thumbnail_url',
+    'coverUrl',
+    'cover_url',
+    'cover',
+    'covers',
+    'dynamicCover',
+    'originCover',
+    'displayImage',
+    'image',
+    'images',
+  ];
+  for (const key of keys) {
+    const found = findImageUrl(record[key], depth + 1);
+    if (found) return found;
+  }
+  return '';
+}
+
+function tiktokVideoId(url: string): string {
+  return String(url || '').match(/\/video\/(\d{8,})/i)?.[1]
+    || String(url || '').match(/[?&](?:item_id|video_id|aweme_id)=(\d{8,})/i)?.[1]
+    || '';
+}
+
+function tiktokUsername(url: string): string {
+  return cleanTikTokUsername(String(url || '').match(/tiktok\.com\/@([^/?#]+)/i)?.[1] || '');
+}
+
+function cleanTikTokUsername(input: string): string {
+  return String(input || '').replace(/^@/, '').trim().replace(/[^\w.-]/g, '');
+}
+
+function metadataUploader(meta: Record<string, unknown>): string {
+  return String(meta.uploader_id || meta.uploader || meta.channel_id || meta.channel || '').trim();
+}
+
+function stripTrackingParams(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (/^utm_/i.test(key) || ['si', 'feature', 'fbclid', 'gclid'].includes(key)) parsed.searchParams.delete(key);
+    }
+    parsed.hash = '';
+    return parsed.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
+function youtubeThumbnailFromUrl(url: string): string {
+  const id = youtubeVideoId(url);
+  return id ? `https://i.ytimg.com/vi/${id}/hqdefault.jpg` : '';
+}
+
+function youtubeVideoId(url: string): string {
+  const trimmed = String(url || '').trim();
+  // yt-dlp --flat-playlist returns the bare 11-character video id in `url`
+  // instead of a watch URL. Treat it as a real YouTube id before URL parsing;
+  // otherwise keyword-search candidates are normalized to non-HTTP strings and
+  // are all discarded by isPlatformUrl().
+  if (/^[A-Za-z0-9_-]{11}$/.test(trimmed)) return trimmed;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.hostname.includes('youtu.be')) return parsed.pathname.replace(/^\//, '');
+    return parsed.searchParams.get('v') || parsed.pathname.match(/\/(?:shorts|embed)\/([^/?#]+)/)?.[1] || '';
+  } catch {
+    return trimmed.match(/(?:v=|youtu\.be\/|\/shorts\/)([A-Za-z0-9_-]{6,})/)?.[1] || '';
+  }
+}
+
+function metadataTitle(platform: Platform, meta: Record<string, unknown>): string {
+  const rawTitle = String(meta.title || meta.fulltitle || '').trim();
+  const description = String(meta.description || '').trim();
+  const descriptionTitle = description
+    .split(/\n+/)
+    .map(line => line.trim())
+    .find(Boolean);
+  if (descriptionTitle && (platform === 'instagram' || /^Video by /i.test(rawTitle))) {
+    return descriptionTitle.slice(0, 180);
+  }
+  return rawTitle || descriptionTitle?.slice(0, 180) || `${platform} video`;
+}
+
+function isGenericSocialTitle(title: string, platform: Platform): boolean {
+  const normalized = normalizeSearchText(title);
+  if (!normalized) return true;
+  if (normalized === `${platform} video`) return true;
+  if (platform === 'facebook' && /^(facebook|watch|reel|video)( video)?$/.test(normalized)) return true;
+  if (platform === 'instagram' && /^(instagram|reel|post)( video)?$/.test(normalized)) return true;
+  return /^video by /.test(normalized);
+}
+
+function softDownloadFailure(platform: Platform, error: unknown): { status: string } | null {
+  const msg = error instanceof Error ? error.message : String(error);
+  if (platform === 'instagram' && /cookies|login|empty media response|Unable to extract data/i.test(msg)) {
+    return { status: 'needs_cookies' };
+  }
+  if (platform === 'tiktok' && /private|embedding disabled|cookies|login/i.test(msg)) {
+    return { status: 'needs_cookies' };
+  }
+  return null;
+}
+
+function isNonRetryableVideoFetch(platform: Platform, message: string): boolean {
+  const lower = message.toLowerCase();
+  if (lower.includes('incomplete_gemini_video_analysis')) return true;
+  if (lower.includes('yt-dlp did not produce an analysis video file')) return true;
+  if (platform === 'youtube' && lower.includes('requested format is not available')) return true;
+  if (platform === 'youtube' && lower.includes('sign in to confirm') && lower.includes('not a bot')) return true;
+  return false;
+}
+
+function isTikTokUnusableWithoutVideoFallback(platform: Platform, message: string, record?: Record<string, unknown> | null): boolean {
+  if (platform !== 'tiktok') return false;
+  if (canUseApifyVideoFallback(apifyTenantIdFromRecord(record))) return false;
+  return /0 Frames found|wrong video metadata|corrupted|INVALID_ARGUMENT|yt-dlp did not produce an analysis video file/i.test(message);
+}
+
+async function purgeLegacyFakeVideos(): Promise<void> {
+  if (process.env.NODE_ENV !== 'production' && process.env.PB_URL === undefined) return;
+  if (!legacyFakePurgePromise) {
+    legacyFakePurgePromise = (async () => {
+      let page = 1;
+      let removed = 0;
+      while (page < 50) {
+        const result = await store.list(COL, { page, perPage: 100 });
+        for (const record of result.items) {
+          const title = String(record.title || '');
+          const sourceUrl = String(record.sourceUrl || '');
+          if (isLegacyFakeVideo(title, sourceUrl)) {
+            if (await store.delete(COL, record.id)) removed += 1;
+          }
+        }
+        if (page >= result.totalPages || result.items.length === 0) break;
+        page += 1;
+      }
+      if (removed > 0) console.log(`[videos] purged ${removed} legacy fake crawl records`);
+    })().catch((e) => {
+      legacyFakePurgePromise = null;
+      console.warn('[videos] legacy fake purge failed:', e);
+    });
+  }
+  await legacyFakePurgePromise;
+}
+
+function isLegacyFakeVideo(title: string, sourceUrl: string): boolean {
+  return /auto-crawl sample/i.test(title)
+    || /#auto-crawl-\d+/i.test(sourceUrl)
+    || /\/search\/video\?q=.*#auto-crawl/i.test(sourceUrl)
+    || /explore\/search\/keyword\/\?q=.*#auto-crawl/i.test(sourceUrl);
+}
+
+async function crawlFacebook(keyword: string, limit: number, dateFrom = '', dateTo = ''): Promise<CrawledVideo[]> {
+  const input = keyword.trim();
+  if (/^https?:\/\/(?:www\.|m\.|mbasic\.)?facebook\.com\//i.test(input)) {
+    return [await crawlFacebookUrl(input, keyword)];
+  }
+  try {
+    const publicItems = await crawlPublicSearch('facebook', input, limit, dateFrom, dateTo);
+    if (publicItems.length > 0) return publicItems;
+  } catch (publicError) {
+    if (!canUseApifyFacebookCrawlFallback()) throw publicError;
+  }
+  if (!canUseApifyFacebookCrawlFallback()) throw new Error(`Facebook public search returned no videos for: ${input}`);
+  const pageUrl = await discoverFacebookPageUrl(input);
+  return crawlFacebookAccountApify(pageUrl, limit, dateFrom, dateTo);
+}
+
+async function crawlFacebookUrl(url: string, keyword: string): Promise<CrawledVideo> {
+  try {
+    return await crawlYtDlpMetadata('facebook', url, keyword);
+  } catch {
+    // Fall back to lightweight OG parsing for public pages where yt-dlp cannot parse.
+  }
+  const html = await fetchFacebookHtml(url);
+  const title = decodeHtml(extractMeta(html, 'og:title') || extractTitle(html) || 'Facebook video');
+  const sourceUrl = decodeHtml(extractMeta(html, 'og:url') || url);
+  const thumbnailUrl = decodeHtml(extractMeta(html, 'og:image') || '');
+  const views = extractFacebookViews(title) || 'Facebook';
+
+  return {
+    platform: 'facebook',
+    title: cleanupFacebookTitle(title),
+    sourceUrl,
+    thumbnailUrl,
+    duration: 0,
+    views,
+    tags: tagsFromKeyword(keyword, 'facebook'),
+  };
+}
+
+async function crawlFacebookSearch(keyword: string, limit: number): Promise<CrawledVideo[]> {
+  const url = `https://www.facebook.com/search/videos?q=${encodeURIComponent(keyword)}`;
+  const html = await fetchFacebookHtml(url);
+  const candidates = extractFacebookWatchUrls(html);
+
+  const out: CrawledVideo[] = [];
+  const tags = tagsFromKeyword(keyword, 'facebook');
+  for (const sourceUrl of candidates.slice(0, limit)) {
+    out.push({
+      platform: 'facebook',
+      title: `Facebook video result for ${keyword}`,
+      sourceUrl,
+      thumbnailUrl: '',
+      duration: 0,
+      views: 'Facebook',
+      tags,
+    });
+  }
+
+  if (out.length === 0) throw new Error('Facebook public search did not expose parseable video results without login');
+  return out;
+}
+
+async function fetchFacebookHtml(url: string): Promise<string> {
+  const proxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
+  const args = [
+    '-s',
+    '-L',
+    '--max-time',
+    '20',
+    '--noproxy',
+    '*',
+    '-A',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/125 Safari/537.36',
+  ];
+  if (proxy) args.push('-x', proxy);
+  args.push(url);
+  const { stdout } = await execFileAsync('curl', args, { maxBuffer: 4 * 1024 * 1024, env: crawlerExecEnv() });
+  if (!stdout || stdout.length < 500) throw new Error('Facebook returned an empty page');
+  return stdout;
+}
+
+function extractMeta(html: string, property: string): string {
+  const escaped = property.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return html.match(new RegExp(`<meta[^>]+property=["']${escaped}["'][^>]+content=["']([^"']+)["']`, 'i'))?.[1]
+    || html.match(new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+property=["']${escaped}["']`, 'i'))?.[1]
+    || '';
+}
+
+function extractTitle(html: string): string {
+  return html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1] || '';
+}
+
+function extractFacebookViews(title: string): string {
+  const decoded = decodeHtml(title);
+  const zh = decoded.match(/([\d,.]+)\s*(万|亿)?\s*次播放/);
+  if (zh) return `${zh[1]}${zh[2] ?? ''} 次播放`;
+  return decoded.match(/([\d,.]+)\s*([MK])?\s*views/i)?.[0] || '';
+}
+
+function cleanupFacebookTitle(title: string): string {
+  return decodeHtml(title)
+    .replace(/\s*\|\s*Facebook\s*$/i, '')
+    .replace(/^[\d,.]+\s*(?:万|亿)?\s*次播放\s*[·・]\s*/i, '')
+    .replace(/^[\d,.]+\s*(?:reactions?|个心情)\s*(?:[·・|]\s*)?/i, '')
+    .trim() || 'Facebook video';
+}
+
+function extractFacebookWatchUrls(html: string): string[] {
+  const decoded = decodeHtml(html.replace(/\\\//g, '/').replace(/\\u0025/g, '%'));
+  const urls = new Set<string>();
+  for (const match of decoded.matchAll(/https?:\/\/(?:www\.|m\.)?facebook\.com\/(?:watch|reel|[^"' <]+\/videos)[^"' <)]+/gi)) {
+    urls.add(match[0].replace(/\\+$/, ''));
+  }
+  for (const match of decoded.matchAll(/\/(?:watch|reel)\/(?:\?v=)?([0-9]{8,})/gi)) {
+    urls.add(`https://www.facebook.com/reel/${match[1]}/`);
+  }
+  return [...urls].filter(url => !url.includes('/watch/explore/')).slice(0, 30);
+}
+
+function extractYtInitialData(html: string): unknown {
+  const marker = 'ytInitialData';
+  const idx = html.indexOf(marker);
+  if (idx < 0) throw new Error('ytInitialData not found in YouTube page');
+  const start = html.indexOf('{', idx);
+  if (start < 0) throw new Error('ytInitialData JSON start not found');
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < html.length; i += 1) {
+    const ch = html[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return JSON.parse(html.slice(start, i + 1));
+    }
+  }
+  throw new Error('ytInitialData JSON end not found');
+}
+
+function findObjectsByKey(input: unknown, key: string, out: Record<string, unknown>[] = []): Record<string, unknown>[] {
+  if (!input || typeof input !== 'object') return out;
+  const obj = input as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(obj, key)) out.push(obj);
+  for (const value of Object.values(obj)) {
+    if (Array.isArray(value)) value.forEach(v => findObjectsByKey(v, key, out));
+    else if (value && typeof value === 'object') findObjectsByKey(value, key, out);
+  }
+  return out;
+}
+
+function textAt(obj: Record<string, unknown>, path: string[]): string {
+  let cur: unknown = obj;
+  for (const key of path) {
+    if (!cur || typeof cur !== 'object') return '';
+    cur = (cur as Record<string, unknown>)[key];
+  }
+  return typeof cur === 'string' ? cur : '';
+}
+
+function extractRunsText(value: unknown): string {
+  if (!value || typeof value !== 'object') return '';
+  const obj = value as Record<string, unknown>;
+  if (typeof obj.simpleText === 'string') return obj.simpleText;
+  if (Array.isArray(obj.runs)) {
+    return obj.runs.map(run => {
+      if (!run || typeof run !== 'object') return '';
+      const text = (run as Record<string, unknown>).text;
+      return typeof text === 'string' ? text : '';
+    }).join('').trim();
+  }
+  return '';
+}
+
+function extractBestThumbnail(value: unknown): string {
+  if (!value) return '';
+  const thumbs = Array.isArray(value) ? value : (typeof value === 'object' ? (value as Record<string, unknown>).thumbnails : null);
+  if (!Array.isArray(thumbs)) return '';
+  let best = '';
+  let bestWidth = 0;
+  for (const thumb of thumbs) {
+    if (!thumb || typeof thumb !== 'object') continue;
+    const obj = thumb as Record<string, unknown>;
+    const url = typeof obj.url === 'string' ? obj.url : '';
+    const width = typeof obj.width === 'number' ? obj.width : 0;
+    if (url && width >= bestWidth) {
+      best = url;
+      bestWidth = width;
+    }
+  }
+  return best;
+}
+
+function mimeFromPath(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === '.webm') return 'video/webm';
+  if (ext === '.mov') return 'video/quicktime';
+  if (ext === '.mkv') return 'video/x-matroska';
+  return 'video/mp4';
+}
+
+function safeVideoExtension(filename: string | undefined, mimeType: string): string {
+  const ext = path.extname(filename || '').replace(/^\./, '').toLowerCase();
+  if (['mp4', 'webm', 'mov', 'mkv'].includes(ext)) return ext;
+  if (/webm/i.test(mimeType)) return 'webm';
+  if (/quicktime|mov/i.test(mimeType)) return 'mov';
+  if (/matroska|mkv/i.test(mimeType)) return 'mkv';
+  return 'mp4';
+}
+
+function parseDuration(label: string): number {
+  const parts = label.split(':').map(n => Number(n));
+  if (parts.some(Number.isNaN)) return 0;
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  return parts[0] || 0;
+}
+
+function videoDedupeKey(item: CrawledVideo): string {
+  const urlKey = item.sourceUrl.trim().toLowerCase().replace(/\/+$/, '');
+  if (urlKey) return `${item.platform}:url:${urlKey}`;
+  return `${item.platform}:title:${item.title.toLowerCase().replace(/\s+/g, ' ').replace(/[^\p{L}\p{N} ]/gu, '').trim()}`;
+}
+
+function sortByHeat(items: CrawledVideo[]): CrawledVideo[] {
+  return [...items].sort((a, b) => heatValue(b.views) - heatValue(a.views));
+}
+
+function heatValue(views: string): number {
+  const raw = String(views || '').toLowerCase().replace(/,/g, '');
+  const n = Number(raw.replace(/[^\d.]/g, ''));
+  if (!Number.isFinite(n)) return 0;
+  if (raw.includes('亿') || raw.includes('b')) return n * 100000000;
+  if (raw.includes('万')) return n * 10000;
+  if (raw.includes('m') || raw.includes('百万')) return n * 1000000;
+  if (raw.includes('k') || raw.includes('千')) return n * 1000;
+  return n;
+}
+
+function ytdlpDateArgs(dateFrom = '', dateTo = ''): string[] {
+  const args: string[] = [];
+  const after = compactDate(dateFrom);
+  const before = compactDate(dateTo);
+  if (after) args.push('--dateafter', after);
+  if (before) args.push('--datebefore', before);
+  return args;
+}
+
+function compactDate(input: string): string {
+  const m = String(input || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  return m ? `${m[1]}${m[2]}${m[3]}` : '';
+}
+
+function hasDateRange(dateFrom = '', dateTo = ''): boolean {
+  return Boolean(compactDate(dateFrom) || compactDate(dateTo));
+}
+
+function uploadedAtFromMeta(meta: Record<string, unknown>): string | undefined {
+  const uploadDate = meta.upload_date ?? meta.release_date ?? meta.modified_date;
+  const compact = String(uploadDate || '').match(/^(\d{4})(\d{2})(\d{2})$/);
+  if (compact) return `${compact[1]}-${compact[2]}-${compact[3]}T00:00:00.000Z`;
+
+  const timestamp = Number(meta.timestamp || meta.release_timestamp || meta.modified_timestamp);
+  if (Number.isFinite(timestamp) && timestamp > 0) return new Date(timestamp * 1000).toISOString();
+
+  const iso = String(meta.uploaded_at || meta.created_at || meta.release_datetime || '').trim();
+  if (iso) {
+    const parsed = new Date(iso);
+    if (!Number.isNaN(parsed.getTime())) return parsed.toISOString();
+  }
+  return undefined;
+}
+
+function filterDateRangeItems(items: CrawledVideo[], dateFrom = '', dateTo = ''): CrawledVideo[] {
+  if (!hasDateRange(dateFrom, dateTo)) return items;
+  return items.filter(item => item.dateEvidence === 'youtube-upload-filter' || isWithinDateRange(item.uploadedAt, dateFrom, dateTo));
+}
+
+function isWithinDateRange(uploadedAt: string | undefined, dateFrom = '', dateTo = ''): boolean {
+  if (!hasDateRange(dateFrom, dateTo)) return true;
+  const uploaded = dateOnly(uploadedAt);
+  if (!uploaded) return false;
+  const from = compactDate(dateFrom);
+  const to = compactDate(dateTo);
+  return (!from || uploaded >= from) && (!to || uploaded <= to);
+}
+
+function dateOnly(input: string | undefined): string {
+  if (!input) return '';
+  const compact = String(input).match(/^(\d{4})(\d{2})(\d{2})$/);
+  if (compact) return `${compact[1]}${compact[2]}${compact[3]}`;
+  const dashed = String(input).match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (dashed) return `${dashed[1]}${dashed[2]}${dashed[3]}`;
+  const parsed = new Date(input);
+  if (Number.isNaN(parsed.getTime())) return '';
+  return parsed.toISOString().slice(0, 10).replace(/-/g, '');
+}
+
+function filterRealMediaItems(items: CrawledVideo[]): CrawledVideo[] {
+  return items.filter(hasRealThumbnail);
+}
+
+function hasRealThumbnail(item: CrawledVideo): boolean {
+  const thumbnail = item.thumbnailUrl.trim();
+  return /^https?:\/\//i.test(thumbnail)
+    || thumbnail.startsWith('/media/')
+    || /^\/api\/overseas\/videos\/[^/]+\/thumbnail(?:\?|$)/.test(thumbnail);
+}
+
+const PLATFORM_LABEL: Partial<Record<Platform, string>> = {
+  youtube: 'YouTube',
+  facebook: 'Facebook',
+  tiktok: 'TikTok',
+  instagram: 'Instagram',
+};
+
+function filterKeywordRelevantItems(items: CrawledVideo[], keyword: string): CrawledVideo[] {
+  const terms = keywordSearchTerms(keyword);
+  if (terms.length === 0) return items;
+  return items.filter(item => isKeywordRelevant(item, keyword));
+}
+
+function isKeywordRelevant(item: CrawledVideo, keyword: string): boolean {
+  const terms = keywordSearchTerms(keyword);
+  if (terms.length === 0) return true;
+  const haystack = normalizeSearchText(`${item.title} ${item.tags.join(' ')}`);
+  const requiredGroups = keywordRequiredTermGroups(keyword);
+  if (requiredGroups.length > 1) {
+    return requiredGroups.every(group => group.some(term => hasSearchTerm(haystack, term)));
+  }
+  return terms.some(term => hasSearchTerm(haystack, term));
+}
+
+function keywordSearchTerms(keyword: string): string[] {
+  const normalized = normalizeSearchText(keyword);
+  if (!normalized || /^https?:\/\//i.test(keyword.trim())) return [];
+  const words = normalized.split(/\s+/).filter(Boolean);
+  const terms = new Set(words);
+
+  const specificAliasGroups: string[][] = [
+    ['mask', 'face mask', 'facial mask', 'sheet mask', 'clay mask', 'masque', '面膜'],
+  ];
+  for (const group of specificAliasGroups) {
+    if (group.some(alias => hasSearchTerm(normalized, normalizeSearchText(alias)))) {
+      group.forEach(alias => terms.add(normalizeSearchText(alias)));
+    }
+  }
+
+  const aliasGroups: string[][] = [
+    ['skincare', 'skin care', 'skin', 'sunscreen', 'serum', 'moisturizer', 'cleanser', 'toner', 'pore', 'acne', 'anti aging', 'beauty', 'routine', '护肤', '保养', '防晒', '精华', '面霜', '洁面', '爽肤', '毛孔', '痘', '美白', '抗老', '皮肤'],
+    ['makeup', 'cosmetic', 'cosmetics', 'beauty', 'lipstick', 'foundation', 'mascara', 'blush', 'concealer', 'eyeliner', '美妆', '彩妆', '化妆', '口红', '粉底', '睫毛', '腮红', '遮瑕'],
+    ['haircare', 'hair care', 'hair', 'shampoo', 'conditioner', 'scalp', 'hairstyle', '护发', '洗发', '头发', '发型', '头皮'],
+  ];
+  for (const group of aliasGroups) {
+    if (group.some(alias => normalized.includes(normalizeSearchText(alias)))) {
+      group.forEach(alias => terms.add(normalizeSearchText(alias)));
+    }
+  }
+
+  return [...terms].filter(term => term.length >= 2);
+}
+
+function keywordRequiredTermGroups(keyword: string): string[][] {
+  const normalized = normalizeSearchText(keyword);
+  if (!normalized || /^https?:\/\//i.test(keyword.trim())) return [];
+  const words = normalized.split(/\s+/).filter(Boolean);
+  if (words.length <= 1) return [];
+  return words
+    .map(word => {
+      const aliases = new Set<string>([word]);
+      if (word === 'clean') ['cleanse', 'cleanser', 'cleansing', 'cleaning'].forEach(alias => aliases.add(alias));
+      if (word === 'mask') ['face mask', 'facial mask', 'sheet mask', 'clay mask', 'masque', 'masking', '面膜'].forEach(alias => aliases.add(alias));
+      if (word === 'skin') ['skincare', 'skin care'].forEach(alias => aliases.add(alias));
+      if (word === 'review') ['reviews', 'tested', 'testing', 'try', 'tried'].forEach(alias => aliases.add(alias));
+      if (word === 'gadget') ['gadgets'].forEach(alias => aliases.add(alias));
+      if (word === 'product') ['products'].forEach(alias => aliases.add(alias));
+      return [...aliases].map(normalizeSearchText).filter(term => term.length >= 2);
+    })
+    .filter(group => group.length > 0);
+}
+
+function keywordCategory(keyword: string): 'skincare' | 'makeup' | 'haircare' | 'general' {
+  const normalized = normalizeSearchText(keyword);
+  const hasAny = (terms: string[]) => terms.some(term => normalized.includes(normalizeSearchText(term)));
+  if (hasAny(['skincare', 'skin care', 'skin', 'sunscreen', 'serum', 'moisturizer', 'cleanser', 'toner', 'pore', 'acne', 'retinol', 'glycolic', 'niacinamide', 'cerave', 'the ordinary', 'derm', 'mask', 'face mask', 'facial mask', 'sheet mask', 'clay mask', 'masque', '护肤', '保养', '防晒', '精华', '面霜', '洁面', '爽肤', '毛孔', '抗老', '皮肤', '面膜'])) return 'skincare';
+  if (hasAny(['makeup', 'cosmetic', 'cosmetics', 'lipstick', 'foundation', 'mascara', 'blush', 'concealer', 'eyeliner', '美妆', '彩妆', '化妆', '口红', '粉底', '睫毛', '腮红', '遮瑕'])) return 'makeup';
+  if (hasAny(['haircare', 'hair care', 'hair', 'shampoo', 'conditioner', 'scalp', 'hairstyle', '护发', '洗发', '头发', '发型', '头皮'])) return 'haircare';
+  return 'general';
+}
+
+function normalizeSearchText(input: string): string {
+  return input
+    .toLowerCase()
+    .normalize('NFKC')
+    .replace(/[_-]+/g, ' ')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function hasSearchTerm(haystack: string, term: string): boolean {
+  if (!term) return false;
+  if (/[\u4e00-\u9fff]/.test(term)) return haystack.includes(term);
+  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+  return new RegExp(`(?:^|\\s)${escaped}(?:\\s|$)`, 'i').test(haystack);
+}
+
+function mergeExistingTags(existingRaw: unknown, nextTags: string[], keyword: string, platform: Platform): string[] {
+  const existing = parseJsonRecord<string[]>(existingRaw, []);
+  if (existing.length > 0) return existing;
+  const keywordTags = tagsFromKeyword(keyword, platform);
+  const nextKey = JSON.stringify([...nextTags].sort());
+  const keywordKey = JSON.stringify([...keywordTags].sort());
+  return nextKey === keywordKey ? [] : nextTags;
+}
+
+function tagsFromKeyword(keyword: string, platform?: Platform): string[] {
+  if (/^https?:\/\//i.test(keyword.trim())) return [platform ?? inferPlatformFromUrl(keyword), 'video'].filter(Boolean).slice(0, 5);
+  return keyword.split(/\s+/).map(s => s.replace(/^#/, '').trim()).filter(Boolean).slice(0, 5);
+}
+
+function isPlatformUrl(input: string, platform: Platform): boolean {
+  const trimmed = input.trim();
+  if (!/^https?:\/\//i.test(trimmed)) return false;
+  const host = new URL(trimmed).hostname;
+  if (platform === 'tiktok') return /(?:^|\.)tiktok\.com$/i.test(host);
+  if (platform === 'instagram') return /(?:^|\.)instagram\.com$/i.test(host);
+  if (platform === 'facebook') return /(?:^|\.)facebook\.com$/i.test(host);
+  if (platform === 'youtube') return /(?:^|\.)youtube\.com$|(?:^|\.)youtu\.be$/i.test(host);
+  return false;
+}
+
+export function inferPlatformFromUrl(input: string): Platform {
+  try {
+    const host = new URL(input).hostname;
+    if (/tiktok\.com$/i.test(host)) return 'tiktok';
+    if (/instagram\.com$/i.test(host)) return 'instagram';
+    if (/facebook\.com$/i.test(host)) return 'facebook';
+    if (/youtu\.be$|youtube\.com$/i.test(host)) return 'youtube';
+  } catch { /* ignore */ }
+  return 'tiktok';
+}
+
+function proxyUrl(): string {
+  return runtimeCrawlerProxy || process.env.CRAWLER_PROXY || firstCrawlerProxyFromPool();
+}
+
+function crawlerExecEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  delete env.NODE_USE_ENV_PROXY;
+  if (runtimeCrawlerProxy) {
+    env.CRAWLER_PROXY = runtimeCrawlerProxy;
+    env.HTTPS_PROXY = runtimeCrawlerProxy;
+    env.HTTP_PROXY = runtimeCrawlerProxy;
+    env.https_proxy = runtimeCrawlerProxy;
+    env.http_proxy = runtimeCrawlerProxy;
+  }
+  return env;
+}
+
+function cookiesBrowser(): string {
+  return process.env.YT_DLP_COOKIES_BROWSER || 'safari';
+}
+
+function cookieBrowsers(): string[] {
+  const configured = process.env.YT_DLP_COOKIES_BROWSER?.split(',').map(s => s.trim()).filter(Boolean) ?? [];
+  const candidates = [...new Set([...configured, cookiesBrowser(), 'safari', 'chrome', 'brave', 'edge', 'firefox'])];
+  return candidates.filter(browserCookiesLikelyAvailable);
+}
+
+function cookieFiles(): string[] {
+  return (process.env.YT_DLP_COOKIE_FILES || process.env.YT_DLP_COOKIES_FILE || '')
+    .split(',')
+    .map(file => file.trim())
+    .filter(file => file && fs.existsSync(file));
+}
+
+function usesServerCookiesForCrawl(platform: Platform): boolean {
+  return platform === 'youtube' || platform === 'tiktok';
+}
+
+function crawlerProxyPool(): string[] {
+  return (process.env.CRAWLER_PROXY_POOL || '')
+    .split(',')
+    .map(proxy => proxy.trim())
+    .filter(Boolean);
+}
+
+function firstCrawlerProxyFromPool(): string {
+  return crawlerProxyPool()[0] || '';
+}
+
+export function buildYtDlpArgs(extra: string[], url: string, withCookies: boolean): string[] {
+  const referer = platformReferer(url);
+  const args = [
+    '-m', 'yt_dlp',
+    '--ignore-config',
+    '--no-warnings',
+    '--user-agent', browserUserAgent(),
+    '--add-header', 'Accept-Language: en-US,en;q=0.9',
+  ];
+  // ytsearchN:<keyword> is an yt-dlp pseudo URL, not a valid HTTP referer.
+  // Always send a stable platform origin so Chinese keywords never become a
+  // header value or get interpreted as a second command argument.
+  if (referer) args.push('--referer', referer);
+  args.push(...extra);
+  if ((/^ytsearch\d*:/i.test(url) || /youtube\.com|youtu\.be/i.test(url)) && process.env.YT_DLP_YOUTUBE_EJS_ENABLED !== '0') {
+    args.push('--js-runtimes', `node:${process.execPath}`, '--remote-components', 'ejs:github');
+  }
+  const proxy = proxyUrl();
+  if (proxy) args.push('--proxy', proxy);
+  if (withCookies) args.push('--cookies-from-browser', cookiesBrowser());
+  args.push(url);
+  return args;
+}
+
+function browserUserAgent(): string {
+  return process.env.CRAWLER_USER_AGENT
+    || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+}
+
+export function platformReferer(url: string): string {
+  if (/^ytsearch\d*:/i.test(String(url || '').trim())) return 'https://www.youtube.com/';
+  try {
+    const host = new URL(url).hostname.replace(/^www\./, '');
+    if (host.includes('tiktok.com')) return 'https://www.tiktok.com/';
+    if (host.includes('instagram.com')) return 'https://www.instagram.com/';
+    if (host.includes('facebook.com')) return 'https://www.facebook.com/';
+    if (host.includes('youtube.com') || host.includes('youtu.be')) return 'https://www.youtube.com/';
+  } catch { /* ignore */ }
+  return '';
+}
+
+async function execYtDlpWithCookieFallback(extra: string[], url: string, timeout: number, maxBuffer: number, budget = new DownloadBudget(timeout)): Promise<string> {
+  let lastError: unknown = null;
+  for (const cookieFile of cookieFiles()) {
+    try {
+      const args = buildYtDlpArgs(extra, url, false);
+      const proxy = proxyUrl();
+      const insertAt = proxy ? args.indexOf('--proxy') : args.length - 1;
+      args.splice(insertAt, 0, '--cookies', cookieFile);
+      const { stdout } = await execFileAsync('python3', args, { maxBuffer, timeout: budget.remaining(), env: crawlerExecEnv() });
+      return stdout;
+    } catch (e) {
+      lastError = e;
+      budget.record('cookie-file', e);
+      if (terminalDownloadFailure(e)) throw budget.error();
+    }
+  }
+  const browsers = cookieBrowsers();
+  if (browsers.length === 0) {
+    if (lastError) throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    throw new Error('需要平台登录态，但本机没有可读取的浏览器 cookies。请先配置 YT_DLP_COOKIE_FILES，或在 Safari/Chrome 登录对应平台并设置 YT_DLP_COOKIES_BROWSER。');
+  }
+  for (const browser of browsers) {
+    try {
+      const args = buildYtDlpArgs(extra, url, false);
+      const proxy = proxyUrl();
+      const insertAt = proxy ? args.indexOf('--proxy') : args.length - 1;
+      args.splice(insertAt, 0, '--cookies-from-browser', browser);
+      const { stdout } = await execFileAsync('python3', args, { maxBuffer, timeout: budget.remaining(), env: crawlerExecEnv() });
+      return stdout;
+    } catch (e) {
+      lastError = e;
+      budget.record(browser, e);
+      if (terminalDownloadFailure(e)) throw budget.error();
+    }
+  }
+  throw budget.error('yt-dlp cookie fallback failed');
+}
+
+function browserCookiesLikelyAvailable(browser: string): boolean {
+  const home = process.env.HOME || '';
+  if (!home) return true;
+  const support = path.join(home, 'Library', 'Application Support');
+  const normalized = browser.toLowerCase();
+  if (normalized === 'safari') {
+    return fs.existsSync(path.join(home, 'Library', 'Cookies', 'Cookies.binarycookies'));
+  }
+  const roots: Record<string, string> = {
+    chrome: path.join(support, 'Google', 'Chrome'),
+    brave: path.join(support, 'BraveSoftware', 'Brave-Browser'),
+    edge: path.join(support, 'Microsoft Edge'),
+    firefox: path.join(support, 'Firefox', 'Profiles'),
+  };
+  const root = roots[normalized];
+  if (root) {
+    try {
+      return fs.readdirSync(root, { withFileTypes: true }).some(entry => entry.isDirectory() && (
+        fs.existsSync(path.join(root, entry.name, normalized === 'firefox' ? 'cookies.sqlite' : 'Cookies'))
+        || fs.existsSync(path.join(root, entry.name, 'Network', 'Cookies'))
+      ));
+    } catch { return false; }
+  }
+  return true;
+}
+
+function compactNumber(n: number): string {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(n);
+}
+
+function parseJsonRecord<T>(value: unknown, fallback: T): T {
+  try {
+    return typeof value === 'string' ? JSON.parse(value) as T : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function todayKey(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+type ApifyVideoUsageDay = {
+  total: number;
+  tenants: Record<string, number>;
+};
+
+type ApifyVideoUsageStore = Record<string, number | ApifyVideoUsageDay>;
+
+function loadApifyVideoUsage(): ApifyVideoUsageStore {
+  try {
+    return JSON.parse(fs.readFileSync(APIFY_USAGE_FILE, 'utf8')) as ApifyVideoUsageStore;
+  } catch {
+    return {};
+  }
+}
+
+function apifyVideoDailyLimit(): number {
+  return Math.max(0, Number(process.env.APIFY_TIKTOK_VIDEO_DAILY_LIMIT || 25));
+}
+
+function apifyVideoTenantDailyLimit(): number {
+  return Math.max(0, Number(process.env.APIFY_TIKTOK_VIDEO_TENANT_DAILY_LIMIT || 3));
+}
+
+function normalizeApifyUsageDay(raw: number | ApifyVideoUsageDay | undefined): ApifyVideoUsageDay {
+  if (typeof raw === 'number') {
+    return { total: raw, tenants: {} };
+  }
+  if (raw && typeof raw === 'object') {
+    return {
+      total: Math.max(0, Number(raw.total || 0)),
+      tenants: raw.tenants && typeof raw.tenants === 'object' ? raw.tenants : {},
+    };
+  }
+  return { total: 0, tenants: {} };
+}
+
+function apifyTenantKey(tenantId?: string): string {
+  return tenantId?.trim() || '__unknown__';
+}
+
+function apifyTenantIdFromRecord(record?: Record<string, unknown> | null): string | undefined {
+  const tenantId = String(record?.tenantId || '').trim();
+  return tenantId || undefined;
+}
+
+function apifyVideoUsageToday(tenantId?: string): { total: number; tenant: number } {
+  const usage = loadApifyVideoUsage();
+  const day = normalizeApifyUsageDay(usage[todayKey()]);
+  return {
+    total: day.total,
+    tenant: day.tenants[apifyTenantKey(tenantId)] || 0,
+  };
+}
+
+function canUseApifyVideoFallback(tenantId?: string, platform: Platform = 'tiktok'): boolean {
+  const enableEnv = platform === 'instagram'
+    ? 'APIFY_INSTAGRAM_VIDEO_FALLBACK_ENABLED'
+    : platform === 'facebook'
+      ? 'APIFY_FACEBOOK_VIDEO_FALLBACK_ENABLED'
+      : platform === 'youtube'
+        ? 'APIFY_YOUTUBE_VIDEO_FALLBACK_ENABLED'
+        : 'APIFY_TIKTOK_VIDEO_FALLBACK_ENABLED';
+  if (process.env[enableEnv] === '0') return false;
+  if (!process.env.APIFY_TOKEN?.trim()) return false;
+  // TikTok / Instagram 共用同一份 Apify 视频下载日额度（apify-video-usage.json）。
+  const globalLimit = apifyVideoDailyLimit();
+  const tenantLimit = apifyVideoTenantDailyLimit();
+  if (globalLimit <= 0 || tenantLimit <= 0) return false;
+  const usage = apifyVideoUsageToday(tenantId);
+  return usage.total < globalLimit && usage.tenant < tenantLimit;
+}
+
+function canUseApifyInstagramCrawlFallback(): boolean {
+  return process.env.APIFY_INSTAGRAM_CRAWL_FALLBACK_ENABLED !== '0' && Boolean(process.env.APIFY_TOKEN?.trim());
+}
+
+function canUseApifyFacebookCrawlFallback(): boolean {
+  return process.env.APIFY_FACEBOOK_CRAWL_FALLBACK_ENABLED !== '0' && Boolean(process.env.APIFY_TOKEN?.trim());
+}
+
+function canUseApifyTikTokCrawlFallback(): boolean {
+  return process.env.APIFY_TIKTOK_CRAWL_FALLBACK_ENABLED !== '0' && Boolean(process.env.APIFY_TOKEN?.trim());
+}
+
+function recordApifyVideoFallbackUse(tenantId?: string): void {
+  const usage = loadApifyVideoUsage();
+  const key = todayKey();
+  const day = normalizeApifyUsageDay(usage[key]);
+  const tenantKey = apifyTenantKey(tenantId);
+  day.total += 1;
+  day.tenants[tenantKey] = (day.tenants[tenantKey] || 0) + 1;
+  usage[key] = day;
+  fs.mkdirSync(path.dirname(APIFY_USAGE_FILE), { recursive: true });
+  fs.writeFileSync(APIFY_USAGE_FILE, JSON.stringify(usage, null, 2), 'utf8');
+}
+
+function loadCrawlerOpsTasks(): CrawlerOpsTask[] {
+  try {
+    return JSON.parse(fs.readFileSync(CRAWLER_OPS_FILE, 'utf8')) as CrawlerOpsTask[];
+  } catch {
+    return [];
+  }
+}
+
+export function filterCrawlerOpsTasksForRecordIds(
+  tasks: CrawlerOpsTask[],
+  visibleRecordIds?: Set<string>,
+): CrawlerOpsTask[] {
+  return visibleRecordIds ? tasks.filter(task => visibleRecordIds.has(task.recordId)) : tasks;
+}
+
+/**
+ * `attempts` counts attempts that were actually started. A process crash must
+ * not consume the in-flight attempt: return that single slot before queueing
+ * the task again. Once it is queued, another restart will not decrement it a
+ * second time.
+ */
+export function recoverInterruptedCrawlerOpsTask(task: CrawlerOpsTask, now = new Date().toISOString()): CrawlerOpsTask {
+  const legacyRecoveredZombie = task.status === 'queued'
+    && task.reason === 'recovered_after_restart'
+    && !task.recoveredAt;
+  if (task.status !== 'processing' && !legacyRecoveredZombie) return task;
+  return {
+    ...task,
+    status: 'queued',
+    attempts: Math.max(0, Number(task.attempts || 0) - 1),
+    reason: 'recovered_after_restart',
+    recoveryCount: Number(task.recoveryCount || 0) + 1,
+    recoveredAt: now,
+    updatedAt: now,
+  };
+}
+
+export function terminalizeExhaustedCrawlerOpsTask(
+  task: CrawlerOpsTask,
+  maxAttempts: number,
+  now = new Date().toISOString(),
+): CrawlerOpsTask {
+  if (task.status === 'resolved' || task.attempts < maxAttempts) return task;
+  return {
+    ...task,
+    status: 'failed',
+    reason: 'max_attempts_exhausted',
+    lastError: task.lastError || 'max_attempts_exhausted',
+    updatedAt: now,
+  };
+}
+
+export function resetCrawlerOpsTaskForExplicitRetryState(
+  task: CrawlerOpsTask,
+  input: { tenantId: string; userId: string; usesSourceQueue: boolean; now?: string },
+): CrawlerOpsTask {
+  const now = input.now || new Date().toISOString();
+  return {
+    ...task,
+    tenantId: task.tenantId || input.tenantId,
+    // The explicit request owns the immediate analysis attempt. Retire the old
+    // ops task so the background worker cannot run the same record in parallel;
+    // a retryable failure will enqueue a fresh task starting at attempt zero.
+    status: 'resolved',
+    attempts: 0,
+    reason: input.usesSourceQueue ? 'explicit_reanalyze_replaced_task' : 'explicit_reanalyze_uses_local_file',
+    lastError: undefined,
+    lastStrategy: input.usesSourceQueue ? 'explicit_reanalyze' : 'local_file',
+    retryResetCount: Number(task.retryResetCount || 0) + 1,
+    retryResetAt: now,
+    retryResetBy: input.userId,
+    updatedAt: now,
+  };
+}
+
+export function selectPendingCrawlerOpsTasks(
+  tasks: CrawlerOpsTask[],
+  maxAttempts: number,
+  visibleRecordIds?: Set<string>,
+  now = Date.now(),
+): CrawlerOpsTask[] {
+  return filterCrawlerOpsTasksForRecordIds(tasks, visibleRecordIds)
+    .filter(task => {
+      if (task.status === 'resolved') return false;
+      if (task.attempts >= maxAttempts) return false;
+      if (task.status === 'processing') {
+        const updatedAt = Date.parse(task.updatedAt);
+        return Number.isFinite(updatedAt) && now - updatedAt > 10 * 60 * 1000;
+      }
+      if (task.status === 'failed') return true;
+      return task.status === 'queued' || task.status === 'pushed';
+    })
+    .sort((a, b) => {
+      const ap = platformOpsPriority(a.platform);
+      const bp = platformOpsPriority(b.platform);
+      if (ap !== bp) return ap - bp;
+      return Date.parse(a.updatedAt) - Date.parse(b.updatedAt);
+    });
+}
+
+async function crawlerOpsRecordIdsForTenant(tenantId: string): Promise<Set<string>> {
+  const ids = new Set<string>();
+  let page = 1;
+  for (;;) {
+    const records = await store.list<Record<string, unknown>>(COL, {
+      where: { tenantId },
+      page,
+      perPage: 500,
+    });
+    for (const record of records.items) {
+      const id = String(record.id || '').trim();
+      if (id) ids.add(id);
+    }
+    if (page >= records.totalPages || records.items.length < 500 || page >= 20) break;
+    page += 1;
+  }
+  return ids;
+}
+
+function persistCrawlerOpsTasks(tasks: CrawlerOpsTask[]): void {
+  fs.mkdirSync(path.dirname(CRAWLER_OPS_FILE), { recursive: true });
+  fs.writeFileSync(CRAWLER_OPS_FILE, JSON.stringify(tasks, null, 2), 'utf8');
+}
+
+function updateCrawlerOpsTask(taskId: string, patch: Partial<CrawlerOpsTask>): CrawlerOpsTask | null {
+  if (!taskId) return null;
+  const tasks = loadCrawlerOpsTasks();
+  let updated: CrawlerOpsTask | null = null;
+  persistCrawlerOpsTasks(tasks.map(task => {
+    if (task.id !== taskId) return task;
+    updated = { ...task, ...patch, updatedAt: patch.updatedAt || new Date().toISOString() };
+    return updated;
+  }));
+  return updated;
+}
+
+function resetCrawlerOpsTaskForExplicitRetry(input: {
+  recordId: string;
+  tenantId: string;
+  userId: string;
+  usesSourceQueue: boolean;
+  now?: string;
+}): CrawlerOpsTask | null {
+  const tasks = loadCrawlerOpsTasks();
+  let updated: CrawlerOpsTask | null = null;
+  persistCrawlerOpsTasks(tasks.map(task => {
+    if (task.recordId !== input.recordId) return task;
+    if (task.tenantId && task.tenantId !== input.tenantId) return task;
+    updated = resetCrawlerOpsTaskForExplicitRetryState(task, input);
+    return updated;
+  }));
+  return updated;
+}
+
+function enqueueCrawlerOpsTask(input: {
+  recordId: string;
+  tenantId?: string;
+  platform: Platform;
+  sourceUrl: string;
+  title: string;
+  reason: string;
+  forceQueue?: boolean;
+}): CrawlerOpsTask {
+  const now = new Date().toISOString();
+  const tasks = loadCrawlerOpsTasks();
+  const existing = tasks.find(task =>
+    task.recordId === input.recordId &&
+    (!input.tenantId || !task.tenantId || task.tenantId === input.tenantId) &&
+    task.sourceUrl === input.sourceUrl &&
+    task.status !== 'resolved'
+  );
+  if (existing) {
+    // A periodic recovery scan may see the same persisted record many times.
+    // Merely rediscovering it is not another download attempt; attempts are
+    // incremented only when the worker actually picks the task.
+    const updated = {
+      ...existing,
+      tenantId: existing.tenantId || input.tenantId,
+      ...(input.forceQueue ? { status: 'queued' as const } : {}),
+      reason: input.reason,
+      updatedAt: now,
+    };
+    persistCrawlerOpsTasks(tasks.map(task => task.id === existing.id ? updated : task));
+    return updated;
+  }
+  const task: CrawlerOpsTask = {
+    id: randomUUID(),
+    recordId: input.recordId,
+    tenantId: input.tenantId,
+    platform: input.platform,
+    sourceUrl: input.sourceUrl,
+    title: input.title,
+    status: 'queued',
+    reason: input.reason,
+    attempts: 0,
+    createdAt: now,
+    updatedAt: now,
+  };
+  persistCrawlerOpsTasks([task, ...tasks].slice(0, 1000));
+  return task;
+}
+
+export function initCrawlerOpsWorker(): void {
+  const workerFlag = process.env.CRAWLER_OPS_WORKER_ENABLED;
+  const intervalMs = Math.max(5_000, Number(process.env.CRAWLER_OPS_WORKER_INTERVAL_MS || 30_000));
+  if (!stalledExactSweepTimer) {
+    const sweep = () => void releaseStalledExactAnalysisAcrossAuthorities().catch(error => {
+      console.warn('[videos] stalled exact-analysis sweep failed:', error instanceof Error ? error.message : error);
+    });
+    stalledExactSweepTimer = setInterval(sweep, intervalMs);
+    // Every requested exact analysis belongs to the previous process at this
+    // point. Clear those locks now; waiting for the age threshold creates a
+    // false permanent queue after deployments or crashes.
+    void releaseStalledExactAnalysisAcrossAuthorities(true).catch(error => {
+      console.warn('[videos] interrupted exact-analysis recovery failed:', error instanceof Error ? error.message : error);
+    });
+    console.log(`[videos] stalled exact-analysis sweep enabled, interval=${intervalMs}ms`);
+  }
+  if (crawlerOpsWorkerTimer || workerFlag === '0') return;
+  crawlerOpsWorkerTimer = setInterval(() => {
+    void runCrawlerOpsWorkerOnce().then(logCrawlerOpsWorkerResult).catch((e) => {
+      console.warn('[crawler-ops] worker tick failed:', e instanceof Error ? e.message : e);
+    });
+  }, intervalMs);
+  // No analysis job survives a process restart. Recover records persisted as
+  // downloading/analyzing immediately on the first tick instead of waiting for
+  // the normal active-job stall timeout.
+  void runCrawlerOpsWorkerOnce({ recoverInterrupted: true }).then(logCrawlerOpsWorkerResult).catch((e) => {
+    console.warn('[crawler-ops] initial tick failed:', e instanceof Error ? e.message : e);
+  });
+  console.log(`[crawler-ops] worker enabled, interval=${intervalMs}ms`);
+}
+
+function logCrawlerOpsWorkerResult(result: { picked: number; resolved: number; retried: number; failed: number; skipped: number }): void {
+  if (result.picked === 0) return;
+  console.log(`[crawler-ops] picked=${result.picked} resolved=${result.resolved} retried=${result.retried} failed=${result.failed} skipped=${result.skipped}`);
+}
+
+export async function runCrawlerOpsWorkerOnce(options: { recoverInterrupted?: boolean; tenantId?: string } = {}): Promise<{
+  ok: boolean;
+  picked: number;
+  resolved: number;
+  retried: number;
+  failed: number;
+  skipped: number;
+}> {
+  if (crawlerOpsWorkerActive) {
+    return { ok: true, picked: 0, resolved: 0, retried: 0, failed: 0, skipped: 0 };
+  }
+  crawlerOpsWorkerActive = true;
+  const previousProxy = runtimeCrawlerProxy;
+  const maxBatch = Math.max(1, Number(process.env.CRAWLER_OPS_WORKER_BATCH || 2));
+  const maxAttempts = Math.max(1, Number(process.env.CRAWLER_OPS_MAX_ATTEMPTS || 5));
+  let picked = 0;
+  let resolved = 0;
+  let retried = 0;
+  let failed = 0;
+  let skipped = 0;
+  try {
+    const tenantId = options.tenantId?.trim() || undefined;
+    await enqueueOpsTasksFromRecords(options.recoverInterrupted === true, tenantId, maxAttempts);
+    // 回收卡死的精确分析请求。失败不应连累队列本身，单独兜住。
+    await releaseStalledExactAnalysis(false, tenantId).catch(error => {
+      console.warn('[videos] stalled exact-analysis sweep failed:', error instanceof Error ? error.message : error);
+      return 0;
+    });
+    const visibleRecordIds = tenantId ? await crawlerOpsRecordIdsForTenant(tenantId) : undefined;
+    const candidates = pendingCrawlerOpsTasks(maxAttempts, visibleRecordIds).slice(0, maxBatch);
+    for (const task of candidates) {
+      picked += 1;
+      const record = await store.getById(COL, task.recordId);
+      if (!record) {
+        updateCrawlerOpsTask(task.id, { status: 'failed', lastError: 'record_not_found', reason: 'record_not_found' });
+        failed += 1;
+        continue;
+      }
+      if (tenantId && String(record.tenantId || '') !== tenantId) {
+        // A tenant-scoped HTTP run must never mutate a task whose backing
+        // record moved or was incorrectly associated with another tenant.
+        skipped += 1;
+        continue;
+      }
+      if (activeAnalysisRecords.has(task.recordId) || durableAnalysisRecords.has(task.recordId)) { skipped += 1; continue; }
+      const previous = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+      if (previous.analysisQuality === 'video' && previous.requestedAnalysisMode !== 'exact') {
+        updateCrawlerOpsTask(task.id, { status: 'resolved', lastStrategy: 'already_video' });
+        resolved += 1;
+        continue;
+      }
+
+      const attemptNo = task.attempts + 1;
+      runtimeCrawlerProxy = selectCrawlerProxy(attemptNo);
+      const strategy = [
+        runtimeCrawlerProxy ? `proxy:${redactProxy(runtimeCrawlerProxy)}` : 'proxy:direct',
+        cookieFiles().length ? `cookieFiles:${cookieFiles().length}` : '',
+        cookieBrowsers().length ? `browsers:${cookieBrowsers().join('|')}` : '',
+      ].filter(Boolean).join(' ');
+      updateCrawlerOpsTask(task.id, {
+        status: 'processing',
+        attempts: attemptNo,
+        lastStrategy: strategy,
+        updatedAt: new Date().toISOString(),
+      });
+      await store.update(COL, task.recordId, {
+        status: 'pending' as VideoStatus,
+        aiAnalysis: JSON.stringify({
+          ...previous,
+          downloadStatus: 'downloading',
+          videoFetchStatus: 'ops_processing',
+          geminiStatus: 'waiting_for_video',
+          crawlerOpsTaskId: task.id,
+          crawlerOpsStatus: 'processing',
+          crawlerOpsStrategy: strategy,
+          crawlerOpsAttempt: attemptNo,
+          crawlerOpsStartedAt: new Date().toISOString(),
+        }),
+      });
+
+      try {
+        await analyzeSourceVideoJob({
+          record,
+          sourceUrl: task.sourceUrl,
+          title: task.title,
+          platform: task.platform,
+          opsTaskId: task.id,
+          suppressOpsRequeue: true,
+        });
+        const completed = await store.getById(COL, task.recordId);
+        const evidence = parseJsonRecord<Record<string, unknown>>(completed?.aiAnalysis, {});
+        if (!['video', 'video_review_required'].includes(String(evidence.analysisQuality || '')) || !evidence.gemini) {
+          throw new Error(String(evidence.analysisError || evidence.downloadError || 'video_analysis_missing: metadata is not video-level analysis'));
+        }
+        updateCrawlerOpsTask(task.id, {
+          status: 'resolved',
+          lastStrategy: evidence.analysisQuality === 'video_review_required' ? `${strategy}; quality_review_required` : strategy,
+          updatedAt: new Date().toISOString(),
+        });
+        resolved += 1;
+      } catch (e) {
+        if (e instanceof AnalysisAlreadyRunningError) {
+          updateCrawlerOpsTask(task.id, { status: 'queued', attempts: task.attempts, lastError: 'analysis_already_running' });
+          skipped += 1;
+          continue;
+        }
+        const errorMessage = e instanceof Error ? e.message : String(e);
+        const compactError = compactVideoPipelineError(errorMessage);
+        const compactReason = compactVideoPipelineError(classifyCrawlerFailure(errorMessage), 360);
+        // Every platform fallback already ran under downloadVideoForAnalysis's
+        // single deadline and ownership lock. Do not start a second independent
+        // actor/download chain here after the attempt has exhausted its budget.
+        const canRetry = attemptNo < maxAttempts;
+        updateCrawlerOpsTask(task.id, {
+          status: canRetry ? 'queued' : 'failed',
+          reason: compactReason,
+          lastError: compactError,
+          lastStrategy: strategy,
+          updatedAt: new Date().toISOString(),
+        });
+        if (!canRetry) {
+          const fallback = metadataFallbackAnalysis({
+            platform: task.platform,
+            title: task.title,
+            duration: Number(record.duration || 0),
+            views: String(parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {}).views || task.platform),
+            tags: parseJsonRecord<string[]>(record.tags, []),
+          });
+          await persistManualVideoFailure({
+            record,
+            sourceUrl: task.sourceUrl,
+            title: task.title,
+            platform: task.platform,
+          }, compactError, compactReason, fallback);
+          failed += 1;
+          continue;
+        }
+        const latest = await store.getById(COL, task.recordId);
+        const latestAnalysis = parseJsonRecord<Record<string, unknown>>(latest?.aiAnalysis ?? record.aiAnalysis, {});
+        await store.update(COL, task.recordId, {
+          status: 'analyzed' as VideoStatus,
+          aiAnalysis: JSON.stringify({
+            ...latestAnalysis,
+            downloadStatus: 'ops_queued',
+            videoFetchStatus: canRetry ? 'ops_queued' : 'ops_failed',
+            geminiStatus: 'waiting_for_video',
+            crawlerOpsStatus: canRetry ? 'queued' : 'failed',
+            crawlerOpsReason: compactReason,
+            crawlerOpsLastError: compactError,
+            crawlerOpsNextRetryAt: canRetry ? new Date(Date.now() + crawlerRetryDelayMs(attemptNo)).toISOString() : undefined,
+          }),
+        });
+        retried += 1;
+      }
+    }
+  } finally {
+    runtimeCrawlerProxy = previousProxy;
+    crawlerOpsWorkerActive = false;
+  }
+  return { ok: true, picked, resolved, retried, failed, skipped };
+}
+
+function pendingCrawlerOpsTasks(maxAttempts: number, visibleRecordIds?: Set<string>): CrawlerOpsTask[] {
+  return selectPendingCrawlerOpsTasks(loadCrawlerOpsTasks(), maxAttempts, visibleRecordIds);
+}
+
+async function enqueueOpsTasksFromRecords(recoverInterrupted = false, tenantId?: string, maxAttempts = Math.max(1, Number(process.env.CRAWLER_OPS_MAX_ATTEMPTS || 5))): Promise<void> {
+  const maxScan = Math.max(50, Number(process.env.CRAWLER_OPS_SCAN_LIMIT || 300));
+  const records: Record<string, unknown>[] = [];
+  for (let page = 1; ; page += 1) {
+    const result = await store.list<Record<string, unknown>>(COL, { where: tenantId ? { tenantId } : undefined, sort: '-crawledAt', page, perPage: maxScan });
+    records.push(...result.items);
+    if (page >= result.totalPages || !result.items.length) break;
+  }
+  const now = Date.now();
+  for (const record of records) {
+    if (activeAnalysisRecords.has(String(record.id || '')) || durableAnalysisRecords.has(String(record.id || ''))) continue;
+    const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+    if (analysis.analysisQuality === 'video' && analysis.requestedAnalysisMode !== 'exact') continue;
+    const downloadStatus = String(analysis.downloadStatus || '');
+    const videoFetchStatus = String(analysis.videoFetchStatus || '');
+    const shouldEnqueue = downloadStatus === 'ops_queued' || videoFetchStatus === 'ops_queued';
+    const latestProgressAt = Math.max(
+      Date.parse(String(analysis.geminiStartedAt || '')) || 0,
+      Date.parse(String(analysis.downloadStartedAt || '')) || 0,
+      Date.parse(String(analysis.analysisQueuedAt || '')) || 0,
+      Date.parse(String(record.updated || '')) || 0,
+    );
+    // Queued work previously lived only in process memory. After a restart it
+    // could remain waiting forever. Recover never-started jobs quickly, while
+    // giving active downloads/Gemini calls a generous window to finish.
+    const staleQueued = downloadStatus === 'queued'
+      && latestProgressAt > 0
+      && now - latestProgressAt >= Math.max(60_000, Number(process.env.CRAWLER_QUEUED_RECOVERY_MS || 2 * 60_000));
+    const interruptedActive = recoverInterrupted && ['downloading', 'analyzing'].includes(downloadStatus);
+    const staleActive = ['downloading', 'analyzing'].includes(downloadStatus)
+      && latestProgressAt > 0
+      && now - latestProgressAt >= Math.max(5 * 60_000, Number(process.env.CRAWLER_ACTIVE_RECOVERY_MS || 30 * 60_000));
+    if (!shouldEnqueue && !staleQueued && !staleActive && !interruptedActive) continue;
+    const recordId = String(record.id || '');
+    const sourceUrl = String(record.sourceUrl || '').trim();
+    if (!recordId || !/^https?:\/\//i.test(sourceUrl)) continue;
+    const task = enqueueCrawlerOpsTask({
+      recordId,
+      tenantId: String(record.tenantId || '').trim() || tenantId,
+      platform: (record.platform || inferPlatformFromUrl(sourceUrl)) as Platform,
+      sourceUrl,
+      title: String(record.title || 'social-video'),
+      reason: String(analysis.downloadError || analysis.crawlerOpsReason || (interruptedActive ? 'recovered_after_restart' : staleQueued ? 'recovered_stale_queue' : staleActive ? 'recovered_stalled_analysis' : 'ops_queued')),
+    });
+    const legacyRecoveredZombie = interruptedActive
+      && task.status === 'queued'
+      && task.reason === 'recovered_after_restart'
+      && !task.recoveredAt;
+    if ((interruptedActive || staleActive) && (task.status === 'processing' || legacyRecoveredZombie)) {
+      const recoveredAt = new Date().toISOString();
+      const recovered = recoverInterruptedCrawlerOpsTask(task, recoveredAt);
+      updateCrawlerOpsTask(task.id, recovered);
+      await store.update(COL, recordId, {
+        status: 'analyzed' as VideoStatus,
+        aiAnalysis: JSON.stringify({
+          ...analysis,
+          downloadStatus: 'ops_queued',
+          videoFetchStatus: 'ops_queued',
+          geminiStatus: 'waiting_for_video',
+          crawlerOpsTaskId: task.id,
+          crawlerOpsStatus: 'queued',
+          crawlerOpsReason: interruptedActive ? 'recovered_after_restart' : 'recovered_stalled_attempt',
+          crawlerOpsAttempt: recovered.attempts,
+          crawlerOpsRecoveredAt: recoveredAt,
+          crawlerOpsNextRetryAt: recoveredAt,
+        }),
+      });
+      continue;
+    }
+    if (task.attempts >= maxAttempts && task.status !== 'resolved') {
+      const exhaustedAt = new Date().toISOString();
+      const exhausted = terminalizeExhaustedCrawlerOpsTask(task, maxAttempts, exhaustedAt);
+      updateCrawlerOpsTask(task.id, exhausted);
+      await store.update(COL, recordId, {
+        status: 'analyzed' as VideoStatus,
+        aiAnalysis: JSON.stringify({
+          ...analysis,
+          requestedAnalysisMode: undefined,
+          downloadStatus: 'manual_required',
+          videoFetchStatus: 'ops_failed',
+          geminiStatus: 'video_failed',
+          crawlerOpsTaskId: task.id,
+          crawlerOpsStatus: 'failed',
+          crawlerOpsReason: 'max_attempts_exhausted',
+          crawlerOpsLastError: exhausted.lastError,
+          crawlerOpsNextRetryAt: undefined,
+          analysisRetryable: true,
+          videoLevelFailureStatus: '视频获取重试已达上限，可点击重新分析重置重试次数',
+          analysisError: exhausted.lastError || 'crawler_ops_max_attempts_exhausted',
+        }),
+      });
+    }
+  }
+}
+
+function crawlerOpsStats(tenantId?: string, visibleRecordIds?: Set<string>): Record<string, unknown> {
+  const tasks = filterCrawlerOpsTasksForRecordIds(loadCrawlerOpsTasks(), visibleRecordIds);
+  const byStatus = tasks.reduce<Record<string, number>>((acc, task) => {
+    acc[task.status] = (acc[task.status] || 0) + 1;
+    return acc;
+  }, {});
+  const byPlatform = tasks.reduce<Record<string, number>>((acc, task) => {
+    acc[task.platform] = (acc[task.platform] || 0) + 1;
+    return acc;
+  }, {});
+  const apifyUsage = apifyVideoUsageToday(tenantId);
+  return {
+    total: tasks.length,
+    byStatus,
+    byPlatform,
+    workerEnabled: process.env.CRAWLER_OPS_WORKER_ENABLED !== '0',
+    workerActive: crawlerOpsWorkerActive,
+    maxAttempts: Math.max(1, Number(process.env.CRAWLER_OPS_MAX_ATTEMPTS || 5)),
+    proxyPoolSize: crawlerProxyPool().length,
+    cookieFileCount: cookieFiles().length,
+    cookieBrowserCount: cookieBrowsers().length,
+    apifyVideoFallback: {
+      enabled: process.env.APIFY_TIKTOK_VIDEO_FALLBACK_ENABLED !== '0' || process.env.APIFY_INSTAGRAM_VIDEO_FALLBACK_ENABLED !== '0',
+      tiktokEnabled: process.env.APIFY_TIKTOK_VIDEO_FALLBACK_ENABLED !== '0',
+      instagramEnabled: process.env.APIFY_INSTAGRAM_VIDEO_FALLBACK_ENABLED !== '0',
+      usedToday: tenantId ? apifyUsage.tenant : apifyUsage.total,
+      dailyLimit: apifyVideoDailyLimit(),
+      ...(tenantId ? {} : { globalUsedToday: apifyUsage.total }),
+      globalDailyLimit: apifyVideoDailyLimit(),
+      tenantUsedToday: apifyUsage.tenant,
+      tenantDailyLimit: apifyVideoTenantDailyLimit(),
+      afterAttempts: Math.max(1, Number(process.env.APIFY_TIKTOK_VIDEO_AFTER_ATTEMPTS || 2)),
+    },
+  };
+}
+
+export async function getVideoPipelineStats(tenantId?: string): Promise<Record<string, unknown>> {
+  const records: Record<string, unknown>[] = [];
+  let page = 1;
+  let totalPages = 1;
+  while (page <= totalPages && page <= 50) {
+    const result = await store.list<Record<string, unknown>>(COL, {
+      where: tenantId ? { tenantId } : undefined,
+      page,
+      perPage: 100,
+      sort: '-crawledAt',
+    });
+    records.push(...result.items);
+    totalPages = result.items.length >= 100 ? Math.max(result.totalPages || 0, page + 1) : page;
+    if (result.items.length === 0) break;
+    page += 1;
+  }
+
+  const visibleRecords = tenantId && await isTestTenantId(tenantId)
+    ? records.filter(record => isPublicTestTenantVideo(record) || isVisibleVideoPipelineRecord(record))
+    : records;
+  const analysisQueueRecords = tenantId && await isTestTenantId(tenantId)
+    ? records.filter(record => {
+        if (isPublicTestTenantVideo(record) || isVisibleVideoPipelineRecord(record)) return true;
+        const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+        return Boolean(analysis.requestedAnalysisMode || analysis.analysisPausedAt)
+          || ['queued', 'analyzing', 'paused', 'waiting_for_video'].includes(String(analysis.geminiStatus || ''));
+      })
+    : records;
+  const now = Date.now();
+  const today = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const byPlatform = visibleRecords.reduce<Record<string, number>>((acc, record) => {
+    const platform = String(record.platform || 'unknown');
+    acc[platform] = (acc[platform] || 0) + 1;
+    return acc;
+  }, {});
+  const statusCounts = visibleRecords.reduce<Record<string, number>>((acc, record) => {
+    const status = String(record.status || 'unknown');
+    acc[status] = (acc[status] || 0) + 1;
+    return acc;
+  }, {});
+  const downloadStatus = visibleRecords.reduce<Record<string, number>>((acc, record) => {
+    const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+    const status = String(analysis.downloadStatus || analysis.videoFetchStatus || 'none');
+    acc[status] = (acc[status] || 0) + 1;
+    return acc;
+  }, {});
+  const geminiStatus = visibleRecords.reduce<Record<string, number>>((acc, record) => {
+    const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+    const status = String(analysis.geminiStatus || analysis.analysisQuality || 'none');
+    acc[status] = (acc[status] || 0) + 1;
+    return acc;
+  }, {});
+  const fetchQueueCount = visibleRecords.filter(record => {
+    const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+    const status = String(analysis.downloadStatus || analysis.videoFetchStatus || '');
+    return ['queued', 'downloading', 'download_retrying', 'ops_queued', 'ops_processing'].includes(status);
+  }).length;
+  const analysisQueueCount = visibleRecords.filter(record => {
+    const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+    const status = String(analysis.geminiStatus || analysis.downloadStatus || '');
+    return ['queued', 'analyzing'].includes(status);
+  }).length;
+  const recentRecords = visibleRecords.filter(record => {
+    const crawledAt = Date.parse(String(record.crawledAt || ''));
+    return Number.isFinite(crawledAt) && now - crawledAt <= 24 * 60 * 60 * 1000;
+  });
+  const refinementItems = visibleRecords
+    .map(record => {
+      const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+      const syncedAt = String(analysis.refinementQueuedAt || '');
+      if (!syncedAt) return null;
+      return {
+        id: String(record.id || ''),
+        title: String(record.title || '未命名视频'),
+        platform: String(record.platform || 'unknown'),
+        thumbnailUrl: String(record.thumbnailUrl || ''),
+        duration: Number(record.duration || 0),
+        status: String(analysis.refinementStatus || 'ready'),
+        analysisMode: String(analysis.analysisMode || ''),
+        analysisQuality: String(analysis.analysisQuality || ''),
+        syncedAt,
+        analyzedAt: String(analysis.exactAnalyzedAt || analysis.analyzedAt || ''),
+      };
+    })
+    .filter((item): item is NonNullable<typeof item> => Boolean(item))
+    .sort((a, b) => Date.parse(b.syncedAt) - Date.parse(a.syncedAt))
+    .slice(0, 50);
+  const analysisItems = analysisQueueRecords.slice(0, 100).map(record => {
+    const analysis = parseJsonRecord<Record<string, unknown>>(record.aiAnalysis, {});
+    const gemini = String(analysis.geminiStatus || '');
+    const fetchStatus = String(analysis.downloadStatus || analysis.videoFetchStatus || '');
+    const paused = Boolean(analysis.analysisPausedAt) || gemini === 'paused';
+    const failed = String(record.status || '') === 'failed'
+      || Boolean(analysis.analysisError || analysis.videoLevelFailureStatus)
+      || ['video_failed', 'analysis_retryable', 'ops_failed', 'url_failed', 'unavailable'].includes(gemini)
+      || ['ops_failed', 'url_failed', 'unavailable'].includes(fetchStatus);
+    const analyzing = Boolean(analysis.requestedAnalysisMode)
+      || ['queued', 'analyzing', 'waiting_for_video', 'downloading', 'download_retrying'].includes(gemini)
+      || ['queued', 'downloading', 'download_retrying', 'ops_queued', 'ops_processing'].includes(fetchStatus);
+    const itemStatus = paused ? 'paused' : failed ? 'failed' : analyzing ? 'analyzing' : 'analyzed';
+    const recovery = describeVideoAnalysisRecovery(analysis, String(record.status || ''));
+    return {
+      id: String(record.id || ''),
+      title: String(record.title || '未命名视频'),
+      platform: String(record.platform || 'unknown'),
+      thumbnailUrl: recordThumbnailUrl(String(record.id || '')),
+      duration: Number(record.duration || 0),
+      status: itemStatus,
+      analysisMode: String(analysis.requestedAnalysisMode || analysis.analysisMode || 'strategy'),
+      updatedAt: String(record.updated || record.crawledAt || ''),
+      error: failed ? publicVideoPipelineError(analysis.analysisError || analysis.videoLevelFailureStatus) : '',
+      statusReason: recovery.reason,
+      recoveryAction: recovery.recoveryAction,
+      failureCode: recovery.code,
+      provider: recovery.provider,
+      visibility: recovery.hidden ? 'hidden' : 'visible',
+    };
+  });
+
+  return {
+    updatedAt: new Date().toISOString(),
+    crawl: {
+      total: visibleRecords.length,
+      today: visibleRecords.filter(record => {
+        const crawledAt = Date.parse(String(record.crawledAt || ''));
+        return Number.isFinite(crawledAt) && new Date(crawledAt + 8 * 60 * 60 * 1000).toISOString().startsWith(today);
+      }).length,
+      last24h: recentRecords.length,
+      byPlatform,
+      latestAt: String(visibleRecords[0]?.crawledAt || ''),
+      statusCounts,
+    },
+    fetchQueue: {
+      queued: fetchQueueCount,
+      byStatus: downloadStatus,
+      ops: crawlerOpsStats(tenantId, new Set(visibleRecords.map(record => String(record.id || '')).filter(Boolean))),
+    },
+    analysisQueue: {
+      queued: analysisItems.filter(item => item.status === 'analyzing').length,
+      byStatus: analysisItems.reduce<Record<string, number>>((acc, item) => {
+        acc[item.status] = (acc[item.status] || 0) + 1;
+        return acc;
+      }, {}),
+      pendingRecords: analysisItems.filter(item => item.status === 'analyzing' || item.status === 'paused').length,
+      analyzedRecords: analysisItems.filter(item => item.status === 'analyzed').length,
+      failedRecords: analysisItems.filter(item => item.status === 'failed').length,
+      hiddenRecords: analysisItems.filter(item => item.visibility === 'hidden').length,
+      providerStatus: {
+        gemini: {
+          configured: isGeminiConfigured(),
+          reason: isGeminiConfigured() ? '' : 'Gemini 未配置，不会启动 Gemini 视频分析。',
+          recoveryAction: isGeminiConfigured() ? '' : '请管理员配置 GEMINI_API_KEY，或确认已切换到 Qwen。',
+        },
+        qwen: {
+          configured: isQwenConfigured(),
+          reason: isQwenConfigured() ? '' : 'Qwen 未配置，Gemini 失败时无法使用 Qwen 兜底。',
+          recoveryAction: isQwenConfigured() ? '' : '请管理员配置 DASHSCOPE_API_KEY。',
+        },
+      },
+      items: analysisItems,
+      refinementItems,
+    },
+  };
+}
+
+function selectCrawlerProxy(attemptNo: number): string {
+  const pool = crawlerProxyPool();
+  if (pool.length === 0) return process.env.CRAWLER_PROXY || '';
+  return pool[(attemptNo - 1) % pool.length] || '';
+}
+
+function redactProxy(proxy: string): string {
+  try {
+    const parsed = new URL(proxy);
+    if (parsed.username || parsed.password) {
+      parsed.username = '***';
+      parsed.password = '***';
+    }
+    return parsed.toString();
+  } catch {
+    return proxy.replace(/\/\/[^@]+@/, '//***@');
+  }
+}
+
+function platformOpsPriority(platform: Platform): number {
+  if (platform === 'youtube') return 0;
+  if (platform === 'tiktok') return 1;
+  if (platform === 'instagram') return 2;
+  if (platform === 'facebook') return 3;
+  return 9;
+}
+
+function crawlerRetryDelayMs(attemptNo: number): number {
+  return Math.min(30 * 60_000, Math.max(30_000, attemptNo * attemptNo * 30_000));
+}
+
+function classifyCrawlerFailure(message: string): string {
+  const lower = message.toLowerCase();
+  if (lower.includes('incomplete_gemini_video_analysis')) return 'incomplete_gemini_video_analysis';
+  if (lower.includes('requested format is not available')) return 'format_unavailable';
+  if (lower.includes('timed out') || lower.includes('timeout')) return 'network_timeout';
+  if (lower.includes('cookies') || lower.includes('login') || lower.includes('sign in')) return 'login_required';
+  if (lower.includes('private') || lower.includes('permission')) return 'permission_required';
+  if (lower.includes('429') || lower.includes('rate')) return 'rate_limited';
+  if (lower.includes('gemini') || lower.includes('api_key')) return 'gemini_failed';
+  return 'download_failed';
+}
+
+async function pushCrawlerOpsTask(task: CrawlerOpsTask): Promise<void> {
+  const endpoint = process.env.CRAWLER_CONTROL_URL?.trim();
+  if (!endpoint) return;
+  const r = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(process.env.CRAWLER_CONTROL_TOKEN ? { Authorization: `Bearer ${process.env.CRAWLER_CONTROL_TOKEN}` } : {}),
+    },
+    body: JSON.stringify({
+      ...task,
+      callback: `/api/overseas/videos/ops/${task.id}/resolve`,
+      requestedCapability: 'browser-like public video fetch',
+    }),
+  });
+  if (!r.ok) throw new Error(`Crawler control HTTP ${r.status}`);
+  persistCrawlerOpsTasks(loadCrawlerOpsTasks().map(item =>
+    item.id === task.id ? { ...item, status: 'pushed', updatedAt: new Date().toISOString() } : item
+  ));
+}
+
+async function analyzeOpsVideo(task: CrawlerOpsTask, videoBase64: string, mimeType: string): Promise<void> {
+  if (!fs.existsSync(ANALYSIS_DIR)) fs.mkdirSync(ANALYSIS_DIR, { recursive: true });
+  const tempExt = mimeType.includes('webm') ? 'webm' : mimeType.includes('quicktime') ? 'mov' : 'mp4';
+  let tempPath = path.join(ANALYSIS_DIR, `ops-${task.id}-${Date.now()}.${tempExt}`);
+  try {
+    fs.writeFileSync(tempPath, Buffer.from(videoBase64.replace(/^data:[^,]+,/, ''), 'base64'));
+    const record = await store.getById(COL, task.recordId);
+    const previous = parseJsonRecord<Record<string, unknown>>(record?.aiAnalysis, {});
+    const analysisMode = previous.requestedAnalysisMode === 'strategy' ? 'strategy' : 'exact';
+    const videoAnalysis = await analyzeDownloadedVideoWithFallback({
+      filePath: tempPath,
+      mimeType,
+      title: task.title,
+      platform: task.platform,
+      duration: Number(record?.duration || 0),
+      sourceLabel: 'crawler-ops-video',
+      analysisMode,
+    });
+    if (analysisMode === 'exact') {
+      videoAnalysis.analysis = await persistExactShotEvidence(task.recordId, tempPath, videoAnalysis.analysis);
+    }
+    cleanupTempVideo(tempPath);
+    tempPath = '';
+    await store.update(COL, task.recordId, {
+      status: 'analyzed' as VideoStatus,
+      aiAnalysis: JSON.stringify({
+        ...previous,
+        ...videoLevelSuccessPatch({
+          analysis: videoAnalysis.analysis,
+          source: videoAnalysis.source,
+          videoFetchStatus: 'fetched',
+          extra: {
+            crawlerOpsTaskId: task.id,
+            crawlerOpsStatus: 'resolved',
+            analysisMode,
+            requestedAnalysisMode: undefined,
+          },
+        }),
+      }),
+    });
+  } catch (e) {
+    if (tempPath) cleanupTempVideo(tempPath);
+    const record = await store.getById(COL, task.recordId);
+    const fallback = metadataFallbackAnalysis({
+      platform: task.platform,
+      title: task.title,
+      duration: Number(record?.duration || 0),
+      views: String(parseJsonRecord<Record<string, unknown>>(record?.aiAnalysis, {}).views || task.platform),
+      tags: parseJsonRecord<string[]>(record?.tags, []),
+    });
+    if (record) {
+      await persistManualVideoFailure({
+        record,
+        sourceUrl: task.sourceUrl,
+        title: task.title,
+        platform: task.platform,
+      }, e instanceof Error ? e.message : 'Crawler ops video analysis failed', classifyCrawlerFailure(e instanceof Error ? e.message : String(e)), fallback);
+    }
+    throw e;
+  }
+}
+
+function loadMaterials(): Material[] {
+  try {
+    return JSON.parse(fs.readFileSync(MATERIALS_FILE, 'utf8')) as Material[];
+  } catch {
+    return [];
+  }
+}
+
+function persistMaterials(list: Material[]): void {
+  fs.writeFileSync(MATERIALS_FILE, JSON.stringify(list, null, 2), 'utf8');
+}
+
+function humanSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function safeMaterialName(title: string, platform: Platform): string {
+  const base = title.replace(/[\\/:*?"<>|\n\r]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80) || `${platform}-video`;
+  return `爆款·${PLATFORM_LABEL[platform] ?? platform}·${base}.mp4`;
+}
+
+function runFfmpeg(args: string[]): Promise<boolean> {
+  return new Promise(resolve => {
+    if (!ffmpegBin) { resolve(false); return; }
+    const p = spawn(ffmpegBin, ['-hide_banner', '-loglevel', 'error', '-nostdin', ...args], { stdio: ['ignore', 'ignore', 'ignore'] });
+    p.on('error', () => resolve(false));
+    p.on('close', code => resolve(code === 0));
+  });
+}
+
+async function extractPoster(videoPath: string, outPath: string, atSec = 1): Promise<boolean> {
+  const ok = await runFfmpeg(['-ss', String(atSec), '-i', videoPath, '-frames:v', '1', '-q:v', '3', '-y', outPath]);
+  return ok && fs.existsSync(outPath);
+}
+
+async function probeDuration(videoPath: string): Promise<number> {
+  return new Promise(resolve => {
+    if (!ffmpegBin) { resolve(0); return; }
+    const p = spawn(ffmpegBin, ['-hide_banner', '-i', videoPath, '-f', 'null', '-'], { stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    p.stderr.on('data', chunk => { stderr += chunk.toString(); });
+    p.on('error', () => resolve(0));
+    p.on('close', () => {
+      const m = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+      if (!m) { resolve(0); return; }
+      resolve(Math.round(Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3])));
+    });
+  });
+}
+
+function decodeHtml(input: string): string {
+  return input
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, num: string) => String.fromCodePoint(Number(num)))
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&nbsp;/g, ' ');
+}

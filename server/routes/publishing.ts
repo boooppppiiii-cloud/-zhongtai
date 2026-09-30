@@ -1,0 +1,783 @@
+import { publishingMutationBlocked, assertNoUnresolvedPublishing } from '../publishing/pendingPublishGuard.js';
+import { Router } from 'express';
+import fs from 'node:fs';
+import path from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { pipeline } from 'node:stream/promises';
+import { callLLM } from '../agents/llm.js';
+import { requireAuth, type AuthLocals } from '../middleware/auth.js';
+import { assetIdentity, signAssetUrl, verifyAssetToken } from '../lib/assetAccess.js';
+import { getBestTimeScores } from '../publishing/bestTime.js';
+import {
+  PUBLISH_COPY_PLATFORMS,
+  sanitizePublishCopyPlatforms,
+  type PlatformCopy,
+  type PublishCopyPlatform,
+} from '../publishing/copyAdaptation.js';
+import { generateAuditedPlatformCopies } from '../publishing/auditedCopyAdaptation.js';
+import {
+  freezePublishSourceClaim,
+  localPublishingVideo,
+  PUBLISH_VIDEO_EXTENSIONS,
+  publishingUploadDir,
+  PublishSourceVerificationError,
+} from '../publishing/publishSourceClaim.js';
+import { createTrackedPostDraft, type PostRecord } from '../publishing/waLink.js';
+import { store } from '../storage/index.js';
+import { realPublishingCapabilities } from '../publishing/weeklyLineage.js';
+import { PUBLICATION_ASSIGNMENTS, PUBLICATION_ATTEMPTS, type DurablePublicationAttempt, type StoredPublicationAssignment } from '../publishing/weeklyLineage.js';
+import { listTenantCapabilityEvidence } from '../publishing/platformCapabilities.js';
+import { fallbackQueueSuggestion, normalizeScheduleSlots } from './publishingSuggestions.js';
+import { externalVideoApprovalsRouter } from './externalVideoApprovals.js';
+
+export const publishingRouter = Router();
+
+interface RecycleListRecord {
+  id: string;
+  tenant_id: string;
+  name: string;
+  enabled?: boolean;
+  items?: Array<{ contentId: string; paused?: boolean; title?: string; coverUrl?: string }>;
+  slots?: Array<{ weekday: number; time: string; platforms: string[] }>;
+  refresh_mode?: 'copy' | 'copy_cover' | 'copy_cover_hook';
+  cursor?: number;
+  created?: string;
+  updated?: string;
+}
+
+interface PostingScheduleRecord {
+  id: string;
+  tenant_id: string;
+  platform: string;
+  market: string;
+  time_zone: string;
+  utc_offset: number;
+  preset: 'light' | 'standard' | 'high';
+  slots: Array<{ weekday: number; time: string }>;
+  created?: string;
+  updated?: string;
+}
+
+function text(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function numberValue(value: unknown): number {
+  const next = Number(value || 0);
+  return Number.isFinite(next) ? next : 0;
+}
+
+function parseJson<T>(value: unknown, fallback: T): T {
+  if (value && typeof value === 'object') return value as T;
+  if (typeof value === 'string') {
+    try {
+      return JSON.parse(value) as T;
+    } catch {
+      return fallback;
+    }
+  }
+  return fallback;
+}
+
+interface WorkflowTaskAttributionRecord {
+  id: string;
+  tenant_id: string;
+  run_id: string;
+  task_key: string;
+}
+
+async function verifiedWorkflowAttribution(
+  tenantId: string,
+  body: Record<string, unknown>,
+): Promise<{ runId: string; taskId: string; taskKey: string } | null> {
+  const runId = text(body.workflowRunId);
+  const taskId = text(body.workflowTaskId);
+  const requestedTaskKey = text(body.workflowTaskKey);
+  if (!runId && !taskId && !requestedTaskKey) return { runId: '', taskId: '', taskKey: '' };
+  if (!runId || !taskId) return null;
+  try {
+    const task = await store.getById<WorkflowTaskAttributionRecord>('workflow_tasks', taskId);
+    if (
+      !task ||
+      task.tenant_id !== tenantId ||
+      text(task.run_id) !== runId ||
+      (requestedTaskKey && text(task.task_key) !== requestedTaskKey)
+    ) return null;
+    return { runId, taskId, taskKey: text(task.task_key) };
+  } catch {
+    return null;
+  }
+}
+
+function publishingPreviewUrl(tenantId: string, videoPath: unknown): string {
+  const localVideo = localPublishingVideo(tenantId, videoPath);
+  if (!localVideo) return '';
+  const route = `/api/overseas/publishing/local-videos/${encodeURIComponent(path.basename(localVideo))}`;
+  return signAssetUrl(route, tenantId, 24 * 60 * 60 * 1000);
+}
+
+function publicPost(post: PostRecord) {
+  const stats = parseJson<Record<string, unknown>>(post.stats, {});
+  return {
+    id: post.id,
+    tenantId: post.tenant_id,
+    contentId: text(post.content_id),
+    platform: text(post.platform),
+    platformPostId: text(post.platform_post_id),
+    title: text(post.title) || text(post.track_code),
+    description: text(stats.description),
+    publishedAt: text(post.published_at || post.created),
+    trackCode: text(post.track_code),
+    waLink: text(post.wa_link),
+    stats,
+    status: text(stats.status) || (post.platform_post_id ? 'published' : 'scheduled'),
+    coverUrl: text(stats.coverUrl),
+    videoUrl: text(stats.videoUrl || stats.mediaUrl || stats.url),
+    duration: numberValue(stats.duration),
+    firstComment: text(stats.firstComment),
+    videoPath: text(stats.videoPath),
+    videoPreviewUrl: publishingPreviewUrl(post.tenant_id, stats.videoPath) || text(stats.videoPreviewUrl),
+    trackWaLink: stats.trackWaLink !== false,
+    scheduleLocked: Boolean(stats.scheduleLocked),
+    targetAccountIds: Array.isArray(stats.targetAccountIds) ? stats.targetAccountIds.map(String).map(text).filter(Boolean) : [],
+    targetAccountLabels: Array.isArray(stats.targetAccountLabels) ? stats.targetAccountLabels.map(String).map(text).filter(Boolean) : [],
+    warnings: Array.isArray(stats.warnings) ? stats.warnings : [],
+    publishError: text(stats.publishError),
+    publishAttempts: numberValue(stats.publishAttempts),
+    nextPublishAttemptAt: text(stats.nextPublishAttemptAt),
+    workflowRunId: text(stats.workflowRunId),
+    workflowTaskId: text(stats.workflowTaskId),
+    workflowTaskKey: text(stats.workflowTaskKey),
+    isRecycle: Boolean(stats.isRecycle),
+    inquiries: numberValue(post.inquiries),
+    deals: numberValue(post.deals),
+  };
+}
+
+function hasPublishedTargets(post: PostRecord): boolean {
+  if (text(post.platform_post_id)) return true;
+  const stats = parseJson<Record<string, unknown>>(post.stats, {});
+  const results = stats.publishResults;
+  if (!results || typeof results !== 'object' || Array.isArray(results)) return false;
+  return Object.values(results).some(result => {
+    return Boolean(result && typeof result === 'object' && text((result as Record<string, unknown>).status) === 'published');
+  });
+}
+
+function isPublishingPost(post: PostRecord): boolean {
+  const stats = parseJson<Record<string, unknown>>(post.stats, {});
+  return publishingMutationBlocked(post);
+}
+
+publishingRouter.get('/local-videos/:filename', async (req, res) => {
+  const identity = await assetIdentity(req);
+  const signed = identity ? null : verifyAssetToken(req.query.assetToken, `${req.baseUrl}${req.path}`);
+  const tenantId = identity?.tenantId || signed?.tenantId || '';
+  if (!tenantId) {
+    res.status(401).end();
+    return;
+  }
+  const filename = path.basename(String(req.params.filename || ''));
+  const filePath = localPublishingVideo(tenantId, path.join(publishingUploadDir(tenantId), filename));
+  if (!filePath || !fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+    res.status(404).json({ error: 'video_not_found' });
+    return;
+  }
+  res.setHeader('Cache-Control', 'private, max-age=300');
+  res.sendFile(filePath);
+});
+
+publishingRouter.use(requireAuth);
+
+publishingRouter.get('/capabilities', async (_req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  res.json({ items: realPublishingCapabilities(await listTenantCapabilityEvidence(tenantId)) });
+});
+
+publishingRouter.get('/weekly-assignments', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const where: Record<string, string> = { tenant_id: tenantId };
+  if (text(req.query.packageId)) where.operating_package_id = text(req.query.packageId);
+  if (text(req.query.status)) where.status = text(req.query.status);
+  const result = await store.list<StoredPublicationAssignment>(PUBLICATION_ASSIGNMENTS, { where, sort: '-created_at', page: 1, perPage: 200 });
+  res.json({ items: result.items, total: result.totalItems });
+});
+
+publishingRouter.get('/weekly-assignments/:assignmentId/attempts', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const assignmentId = text(req.params.assignmentId);
+  const assignment = await store.list<StoredPublicationAssignment>(PUBLICATION_ASSIGNMENTS, {
+    where: { tenant_id: tenantId, assignment_id: assignmentId }, page: 1, perPage: 2,
+  });
+  if (assignment.totalItems !== 1 || !assignment.items[0]) { res.status(404).json({ error: 'publication_assignment_not_found' }); return; }
+  const attempts = await store.list<DurablePublicationAttempt>(PUBLICATION_ATTEMPTS, {
+    where: { tenant_id: tenantId, assignment_id: assignmentId }, sort: '-started_at', page: 1, perPage: 100,
+  });
+  res.json({ items: attempts.items, total: attempts.totalItems });
+});
+
+publishingRouter.post('/local-videos/manifest', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const requestedPath = text(req.body?.videoPath);
+  const filePath = localPublishingVideo(tenantId, requestedPath);
+  if (!filePath || !fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+    res.status(404).json({ error: 'video_not_found', message: '视频文件不存在或不属于当前租户' });
+    return;
+  }
+  const hash = createHash('sha256');
+  try {
+    for await (const chunk of fs.createReadStream(filePath)) hash.update(chunk as Buffer);
+    const stat = fs.statSync(filePath);
+    const ext = path.extname(filePath).toLowerCase();
+    const mediaType = ext === '.mov' ? 'video/quicktime'
+      : ext === '.webm' ? 'video/webm'
+        : ext === '.mkv' ? 'video/x-matroska'
+          : ext === '.avi' ? 'video/x-msvideo'
+            : 'video/mp4';
+    res.json({
+      asset: {
+        kind: 'video',
+        fileName: path.basename(filePath),
+        downloadUrl: publishingPreviewUrl(tenantId, filePath),
+        contentHash: hash.digest('hex'),
+        mediaType,
+        byteSize: stat.size,
+      },
+    });
+  } catch {
+    res.status(503).json({ error: 'video_manifest_unavailable', message: '暂时无法生成发布包文件校验值' });
+  }
+});
+
+publishingRouter.post('/local-videos', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const encodedName = text(req.headers['x-file-name']);
+  let originalName = 'video.mp4';
+  try {
+    originalName = decodeURIComponent(encodedName || originalName);
+  } catch {
+    originalName = encodedName || originalName;
+  }
+  originalName = path.basename(originalName).replace(/[^\w.\-\u4e00-\u9fff]+/g, '-');
+  const ext = path.extname(originalName).toLowerCase();
+  if (!PUBLISH_VIDEO_EXTENSIONS.has(ext)) {
+    res.status(400).json({ error: '仅支持 mp4、mov、webm、mkv、avi 视频文件' });
+    return;
+  }
+  const maxBytes = Math.max(50, Number(process.env.PUBLISH_UPLOAD_MAX_MB || 2048)) * 1024 * 1024;
+  const declaredBytes = Number(req.headers['content-length'] || 0);
+  if (declaredBytes > maxBytes) {
+    res.status(413).json({ error: `视频不能超过 ${Math.round(maxBytes / 1024 / 1024)}MB` });
+    return;
+  }
+  const outputDir = publishingUploadDir(tenantId);
+  const outputPath = path.join(outputDir, `manual-${randomUUID()}-${originalName}`);
+  fs.mkdirSync(outputDir, { recursive: true });
+  let receivedBytes = 0;
+  const limiter = async function* (source: AsyncIterable<Buffer>) {
+    for await (const chunk of source) {
+      receivedBytes += chunk.length;
+      if (receivedBytes > maxBytes) throw Object.assign(new Error('video_too_large'), { statusCode: 413 });
+      yield chunk;
+    }
+  };
+  try {
+    await pipeline(req, limiter, fs.createWriteStream(outputPath));
+    if (!receivedBytes) throw new Error('empty_video');
+    res.status(201).json({
+      ok: true,
+      video: {
+        name: originalName,
+        videoPath: outputPath,
+        previewUrl: publishingPreviewUrl(tenantId, outputPath),
+        size: receivedBytes,
+        sourceKind: 'manual_upload',
+      },
+    });
+  } catch (error: any) {
+    try { fs.rmSync(outputPath, { force: true }); } catch { /* ignore */ }
+    const status = Number(error?.statusCode) || 400;
+    res.status(status).json({ error: error?.message === 'empty_video' ? '视频文件为空' : error?.message === 'video_too_large' ? '视频文件过大' : '视频接收失败' });
+  }
+});
+
+publishingRouter.post('/local-videos/import-rendered', (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const sourceRoot = path.resolve('/root/Downloads/lingshu-ai-exports');
+  const outputDir = publishingUploadDir(tenantId);
+  fs.mkdirSync(outputDir, { recursive: true });
+  const requestedPaths: string[] = Array.isArray(req.body?.videoPaths) ? req.body.videoPaths.map(text).filter(Boolean).slice(0, 200) : [];
+  const videos = requestedPaths.map(sourcePath => {
+    const filename = path.basename(sourcePath);
+    const ext = path.extname(filename).toLowerCase();
+    if (!PUBLISH_VIDEO_EXTENSIONS.has(ext)) return { sourcePath, error: 'unsupported_video' };
+    const targetPath = path.join(outputDir, `project-${randomUUID()}-${filename}`);
+    const resolvedSource = path.resolve(sourcePath);
+    if (!resolvedSource.startsWith(`${sourceRoot}${path.sep}`) || !fs.existsSync(resolvedSource) || !fs.statSync(resolvedSource).isFile()) {
+      return { sourcePath, error: 'video_not_found' };
+    }
+    fs.copyFileSync(resolvedSource, targetPath);
+    return {
+      sourcePath,
+      videoPath: targetPath,
+      previewUrl: publishingPreviewUrl(tenantId, targetPath),
+    };
+  });
+  res.json({ ok: true, videos });
+});
+
+publishingRouter.get('/best-time', (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const platform = text(req.query.platform) || 'tiktok';
+  const weekday = Math.max(0, Math.min(6, Number(req.query.weekday ?? new Date().getDay()) || 0));
+  const offsetValue = text(req.query.utcOffset);
+  const parsedOffset = offsetValue ? Number(offsetValue) : Number.NaN;
+  const utcOffset = Number.isFinite(parsedOffset) ? Math.max(-12, Math.min(14, parsedOffset)) : undefined;
+  res.json({
+    platform,
+    weekday,
+    scores: getBestTimeScores(tenantId, platform, weekday, utcOffset),
+    source: 'platform_reference',
+    confidence: 'reference',
+    utcOffset: utcOffset ?? null,
+  });
+});
+
+publishingRouter.get('/posting-schedule', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const platform = text(req.query.platform) || 'tiktok';
+  const result = await store.list<PostingScheduleRecord>('publishing_schedules', {
+    where: { tenant_id: tenantId, platform },
+    perPage: 1,
+    sort: '-updated',
+  });
+  const item = result.items[0];
+  res.json({
+    item: item || {
+      id: '',
+      tenant_id: tenantId,
+      platform,
+      market: 'global',
+      time_zone: 'UTC',
+      utc_offset: 0,
+      preset: 'standard',
+      slots: normalizeScheduleSlots(undefined, 'standard'),
+    },
+  });
+});
+
+publishingRouter.put('/posting-schedule', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const platform = text(req.body?.platform) || 'tiktok';
+  const requestedPreset = text(req.body?.preset);
+  const preset: PostingScheduleRecord['preset'] = requestedPreset === 'light' || requestedPreset === 'high' ? requestedPreset : 'standard';
+  const next = {
+    tenant_id: tenantId,
+    platform,
+    market: text(req.body?.market) || 'global',
+    time_zone: text(req.body?.timeZone || req.body?.time_zone) || 'UTC',
+    utc_offset: Math.max(-12, Math.min(14, numberValue(req.body?.utcOffset ?? req.body?.utc_offset))),
+    preset,
+    slots: normalizeScheduleSlots(req.body?.slots, preset),
+  };
+  const result = await store.list<PostingScheduleRecord>('publishing_schedules', {
+    where: { tenant_id: tenantId, platform },
+    perPage: 1,
+    sort: '-updated',
+  });
+  const existing = result.items[0];
+  if (existing) {
+    await store.update('publishing_schedules', existing.id, next);
+    const item = await store.getById<PostingScheduleRecord>('publishing_schedules', existing.id);
+    res.json({ item: item || { ...existing, ...next } });
+    return;
+  }
+  const item = await store.create<PostingScheduleRecord>('publishing_schedules', next);
+  res.status(201).json({ item: item || { id: '', ...next } });
+});
+
+publishingRouter.use('/external-video-approvals', externalVideoApprovalsRouter);
+
+publishingRouter.get('/calendar', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const from = Date.parse(text(req.query.from)) || Date.now() - 7 * 86_400_000;
+  const to = Date.parse(text(req.query.to)) || Date.now() + 35 * 86_400_000;
+  const result = await store.list<PostRecord>('posts', { where: { tenant_id: tenantId }, perPage: 500, sort: 'published_at' });
+  const items = result.items
+    .map(publicPost)
+    .filter(item => {
+      const time = Date.parse(item.publishedAt || '');
+      return Number.isFinite(time) && time >= from && time <= to;
+    });
+  res.json({ items });
+});
+
+publishingRouter.post('/calendar', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const scheduledAt = text(req.body?.scheduledAt);
+  const platform = text(req.body?.platform) || 'tiktok';
+  const title = text(req.body?.title) || 'Untitled content';
+  if (!scheduledAt) {
+    res.status(400).json({ error: 'scheduled_at_required' });
+    return;
+  }
+  const workflowAttribution = await verifiedWorkflowAttribution(
+    tenantId,
+    (req.body || {}) as Record<string, unknown>,
+  );
+  if (!workflowAttribution) {
+    res.status(400).json({
+      error: 'invalid_workflow_context',
+      message: '数字员工任务归属已失效，请从执行中心重新进入该任务。',
+    });
+    return;
+  }
+  try {
+    await assertNoUnresolvedPublishing({ tenantId, platform, accountIds: Array.isArray(req.body?.targetAccountIds) ? req.body.targetAccountIds.map(String) : [], contentId: text(req.body?.contentId), videoPath: text(req.body?.videoPath), videoUrl: text(req.body?.videoUrl) });
+  } catch (error) { res.status(409).json({ error: error instanceof Error ? error.message : '已有待核对发布' }); return; }
+  let publishSourceClaim;
+  try {
+    publishSourceClaim = await freezePublishSourceClaim(tenantId, {
+      sourceKind: req.body?.sourceKind,
+      projectId: text(req.body?.projectId || req.body?.contentId),
+      videoPath: text(req.body?.videoPath),
+      videoUrl: text(req.body?.videoUrl),
+      sourceVideoPath: text(req.body?.sourceVideoPath),
+      generationKind: req.body?.generationKind,
+      generationProvenance: text(req.body?.generationProvenance),
+      qualityStatus: text(req.body?.qualityStatus),
+      publishable: req.body?.publishable === true,
+      generationRecordId: text(req.body?.generationRecordId),
+    });
+  } catch (error) {
+    const status = error instanceof PublishSourceVerificationError ? error.statusCode : 500;
+    res.status(status).json({ error: error instanceof PublishSourceVerificationError ? error.code : 'publish_source_verification_failed', message: error instanceof Error ? error.message : '发布来源校验失败' });
+    return;
+  }
+  const tracked = await createTrackedPostDraft(tenantId, {
+    contentId: publishSourceClaim.projectId,
+    platform,
+    title,
+    language: text(req.body?.language),
+    enabled: req.body?.trackWaLink !== false,
+  });
+  await store.update('posts', tracked.id, {
+    published_at: scheduledAt,
+    stats: {
+      status: 'scheduled',
+      coverUrl: text(req.body?.coverUrl),
+      description: text(req.body?.description),
+      firstComment: text(req.body?.firstComment),
+      videoPath: text(req.body?.videoPath),
+      sourceProjectId: publishSourceClaim.projectId,
+      publishSourceClaim,
+      trackWaLink: req.body?.trackWaLink !== false,
+      scheduleLocked: req.body?.scheduleLocked === true,
+      targetAccountIds: Array.isArray(req.body?.targetAccountIds)
+        ? req.body.targetAccountIds.map(String).map(text).filter(Boolean)
+        : [],
+      targetAccountLabels: Array.isArray(req.body?.targetAccountLabels)
+        ? req.body.targetAccountLabels.map(String).map(text).filter(Boolean)
+        : [],
+      publishAttempts: 0,
+      publishResults: {},
+      publishError: '',
+      nextPublishAttemptAt: '',
+      warnings: [],
+      workflowRunId: workflowAttribution.runId,
+      workflowTaskId: workflowAttribution.taskId,
+      workflowTaskKey: workflowAttribution.taskKey,
+    },
+  });
+  const saved = await store.getById<PostRecord>('posts', tracked.id);
+  res.status(201).json({ item: saved ? publicPost(saved) : publicPost(tracked) });
+});
+
+publishingRouter.post('/calendar/:id/retry', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const post = await store.getById<PostRecord>('posts', String(req.params.id));
+  if (!post || post.tenant_id !== tenantId) {
+    res.status(404).json({ error: 'post_not_found' });
+    return;
+  }
+  const stats = parseJson<Record<string, unknown>>(post.stats, {});
+  if (publishingMutationBlocked(post)) { res.status(409).json({ error: '平台结果待核对，不能重新发布' }); return; }
+  if (!['failed', 'partial'].includes(text(stats.status))) {
+    res.status(409).json({ error: 'post_is_not_retryable' });
+    return;
+  }
+  await store.update('posts', post.id, {
+    stats: {
+      ...stats,
+      status: 'failed',
+      publishAttempts: 0,
+      publishError: '',
+      nextPublishAttemptAt: new Date().toISOString(),
+      warnings: [],
+    },
+  });
+  const saved = await store.getById<PostRecord>('posts', post.id);
+  res.json({ item: saved ? publicPost(saved) : null });
+});
+
+publishingRouter.delete('/calendar/:id', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const post = await store.getById<PostRecord>('posts', String(req.params.id));
+  if (!post || post.tenant_id !== tenantId) {
+    res.status(404).json({ error: 'post_not_found' });
+    return;
+  }
+  if (hasPublishedTargets(post)) {
+    res.status(409).json({ error: 'published_post_cannot_be_removed' });
+    return;
+  }
+  if (isPublishingPost(post)) {
+    res.status(409).json({ error: 'publishing_post_cannot_be_removed' });
+    return;
+  }
+  await store.delete('posts', post.id);
+  res.status(204).end();
+});
+
+publishingRouter.patch('/calendar/:id', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const post = await store.getById<PostRecord>('posts', String(req.params.id));
+  if (!post || post.tenant_id !== tenantId) {
+    res.status(404).json({ error: 'post_not_found' });
+    return;
+  }
+  if (hasPublishedTargets(post)) {
+    res.status(409).json({ error: 'published_post_cannot_be_rescheduled' });
+    return;
+  }
+  if (isPublishingPost(post)) {
+    res.status(409).json({ error: 'publishing_post_cannot_be_rescheduled' });
+    return;
+  }
+  const currentStats = parseJson<Record<string, unknown>>(post.stats, {});
+  if (currentStats.origin === 'authorized_external_video') {
+    res.status(409).json({ error: 'external_video_approval_immutable', message: '获授权外部素材的审批快照不可修改；请重新上传并审批。' });
+    return;
+  }
+  const update: Record<string, unknown> = {};
+  const stats = { ...currentStats };
+  let changed = false;
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'scheduledAt')) {
+    if (currentStats.scheduleLocked === true && req.body?.overrideScheduleLock !== true) {
+      res.status(409).json({ error: '定点排期时间已锁定，请先取消原排期再重新设置。' });
+      return;
+    }
+    const scheduledAt = text(req.body?.scheduledAt);
+    if (!scheduledAt || !Number.isFinite(Date.parse(scheduledAt))) {
+      res.status(400).json({ error: 'valid_scheduled_at_required' });
+      return;
+    }
+    update.published_at = scheduledAt;
+    changed = true;
+  }
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'title')) {
+    const title = text(req.body?.title);
+    if (!title) {
+      res.status(400).json({ error: 'title_required' });
+      return;
+    }
+    update.title = title;
+    changed = true;
+  }
+  for (const field of ['description', 'firstComment', 'coverUrl', 'videoPath'] as const) {
+    if (!Object.prototype.hasOwnProperty.call(req.body || {}, field)) continue;
+    stats[field] = text(req.body?.[field]);
+    changed = true;
+  }
+  for (const field of ['targetAccountIds', 'targetAccountLabels'] as const) {
+    if (!Object.prototype.hasOwnProperty.call(req.body || {}, field)) continue;
+    stats[field] = Array.isArray(req.body?.[field])
+      ? req.body[field].map(String).map(text).filter(Boolean)
+      : [];
+    changed = true;
+  }
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'trackWaLink')) {
+    stats.trackWaLink = req.body?.trackWaLink !== false;
+    changed = true;
+  }
+  if (!changed) {
+    res.status(400).json({ error: 'calendar_update_required' });
+    return;
+  }
+  stats.status = 'scheduled';
+  const workflowRunId = text(currentStats.workflowRunId);
+  const workflowApprovalId = text(currentStats.approvalId);
+  const workflowApprovalTaskId = text(currentStats.workflowTaskId);
+  if (workflowRunId && workflowApprovalId && workflowApprovalTaskId) {
+    stats.status = 'awaiting_reapproval';
+    stats.approvedContentHash = '';
+    stats.realPublishingAuthorized = false;
+    const invalidatedAt = new Date().toISOString();
+    const approval = await store.getById<any>('approval_requests', workflowApprovalId);
+    if (approval?.tenant_id === tenantId && approval.status !== 'superseded') {
+      await store.update('approval_requests', workflowApprovalId, {
+        status: 'superseded',
+        decision_note: '发布内容、账号或排期已修改，原审批自动失效。',
+        decided_at: invalidatedAt,
+      });
+    }
+    const approvalTask = await store.getById<any>('workflow_tasks', workflowApprovalTaskId);
+    if (approvalTask?.tenant_id === tenantId && approvalTask.run_id === workflowRunId) {
+      await store.update('workflow_tasks', workflowApprovalTaskId, {
+        status: 'waiting_external',
+        task_version: Number(approvalTask.task_version || 1) + 1,
+        blocked_reason: '发布内容已修改，需要重新完成质量检查并发起审批。',
+        updated_at: invalidatedAt,
+      });
+      const run = await store.getById<any>('workflow_runs', workflowRunId);
+      if (run?.tenant_id === tenantId) {
+        await store.update('workflow_runs', workflowRunId, {
+          status: 'waiting_external',
+          current_controller: 'human',
+          pause_reason: '发布内容已修改，等待重新审批。',
+        });
+      }
+    }
+  }
+  stats.publishAttempts = 0;
+  stats.publishResults = {};
+  stats.publishError = '';
+  stats.nextPublishAttemptAt = '';
+  stats.warnings = [];
+  update.stats = stats;
+  await store.update('posts', post.id, update);
+  const saved = await store.getById<PostRecord>('posts', post.id);
+  res.json({ item: saved ? publicPost(saved) : null });
+});
+
+publishingRouter.post('/adapt-copy', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const title = text(req.body?.title);
+  const description = text(req.body?.description);
+  const language = text(req.body?.language) || 'English';
+  const requestedPlatforms = sanitizePublishCopyPlatforms(req.body?.platforms);
+  const single = sanitizePublishCopyPlatforms([req.body?.platform])[0];
+  const targetPlatforms = single
+    ? [single]
+    : requestedPlatforms.length ? requestedPlatforms : [...PUBLISH_COPY_PLATFORMS];
+  const mode = text(req.body?.mode) === 'regenerate' ? 'regenerate' : 'generate';
+  const rawCurrentCopy = req.body?.currentCopy && typeof req.body.currentCopy === 'object' && !Array.isArray(req.body.currentCopy)
+    ? req.body.currentCopy as Record<string, PlatformCopy>
+    : {};
+  const currentCopy = Object.fromEntries(
+    targetPlatforms
+      .filter(platform => rawCurrentCopy[platform] && typeof rawCurrentCopy[platform] === 'object')
+      .map(platform => [platform, rawCurrentCopy[platform]]),
+  ) as Partial<Record<PublishCopyPlatform, PlatformCopy>>;
+  const requireAlternative = mode === 'regenerate';
+
+  const result = await generateAuditedPlatformCopies({
+    tenantId, title, description, language, targetPlatforms, currentCopy, requireAlternative,
+    projectId: text(req.body?.projectId) || undefined,
+  });
+  res.status(result.status).json(result.body);
+});
+
+publishingRouter.post('/queue/suggestions/regenerate', async (req, res) => {
+  const platform = text(req.body?.platform) || 'tiktok';
+  const market = text(req.body?.market) || '综合市场';
+  const scheduledAt = text(req.body?.scheduledAt);
+  const festival = text(req.body?.festival);
+  const feedback = text(req.body?.feedback);
+  const currentTitle = text(req.body?.currentTitle);
+  const fallback = fallbackQueueSuggestion({ currentTitle, feedback, festival });
+  const prompt = [
+    '你是 B2B 外贸社媒内容排产助手。请只返回严格 JSON。',
+    `平台：${platform}`,
+    `目标市场：${market}`,
+    `建议发布时间：${scheduledAt}`,
+    festival ? `关联节庆：${festival}` : '',
+    currentTitle ? `当前选题：${currentTitle}` : '',
+    feedback ? `老板修改意见：${feedback}` : '',
+    '输出字段：title（20字以内）、brief（60字以内）、tags（2个短标签）。',
+    '不得虚构企业产品参数、认证、价格、库存、客户案例或优惠；缺失事实用内容结构表达。',
+    '选题要适合短视频并自然引导采购商询盘。',
+  ].filter(Boolean).join('\n');
+  try {
+    const raw = await callLLM(prompt);
+    const parsed = JSON.parse(raw.match(/\{[\s\S]*\}/)?.[0] || raw);
+    res.json({
+      suggestion: {
+        title: text(parsed?.title) || fallback.title,
+        brief: text(parsed?.brief) || fallback.brief,
+        tags: Array.isArray(parsed?.tags) ? parsed.tags.map(String).map(text).filter(Boolean).slice(0, 3) : fallback.tags,
+      },
+    });
+  } catch {
+    res.json({ suggestion: fallback });
+  }
+});
+
+publishingRouter.get('/posts/effects', async (_req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const result = await store.list<PostRecord>('posts', { where: { tenant_id: tenantId }, perPage: 200, sort: '-published_at' });
+  const items = result.items.map(publicPost)
+    .sort((a, b) => b.inquiries - a.inquiries || Date.parse(b.publishedAt || '') - Date.parse(a.publishedAt || ''));
+  const cutoff = Date.now() - 30 * 86_400_000;
+  const recent = items.filter(item => {
+    const time = Date.parse(item.publishedAt || '');
+    return Number.isFinite(time) && time >= cutoff;
+  });
+  res.json({
+    items,
+    summary: {
+      posts30d: recent.length,
+      inquiries30d: recent.reduce((sum, item) => sum + item.inquiries, 0),
+      deals30d: recent.reduce((sum, item) => sum + item.deals, 0),
+    },
+  });
+});
+
+publishingRouter.get('/briefing', async (_req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const result = await store.list<PostRecord>('posts', { where: { tenant_id: tenantId }, perPage: 50, sort: '-updated' });
+  const top = result.items
+    .map(publicPost)
+    .filter(item => item.inquiries > 0)
+    .sort((a, b) => b.inquiries - a.inquiries)[0];
+  res.json({ item: top || null });
+});
+
+publishingRouter.get('/recycle-lists', async (_req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const result = await store.list<RecycleListRecord>('recycle_lists', { where: { tenant_id: tenantId }, perPage: 100, sort: '-updated' });
+  res.json({ items: result.items });
+});
+
+publishingRouter.post('/recycle-lists', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const created = await store.create<RecycleListRecord>('recycle_lists', {
+    tenant_id: tenantId,
+    name: text(req.body?.name) || 'Recycle list',
+    enabled: Boolean(req.body?.enabled),
+    items: Array.isArray(req.body?.items) ? req.body.items.slice(0, 60) : [],
+    slots: Array.isArray(req.body?.slots) ? req.body.slots : [],
+    refresh_mode: text(req.body?.refreshMode || req.body?.refresh_mode) || 'copy',
+    cursor: Number(req.body?.cursor || 0) || 0,
+  });
+  res.status(201).json({ item: created });
+});
+
+publishingRouter.patch('/recycle-lists/:id', async (req, res) => {
+  const { tenantId } = res.locals as AuthLocals;
+  const existing = await store.getById<RecycleListRecord>('recycle_lists', String(req.params.id));
+  if (!existing || existing.tenant_id !== tenantId) {
+    res.status(404).json({ error: 'recycle_list_not_found' });
+    return;
+  }
+  const patch: Record<string, unknown> = {};
+  if (req.body?.name !== undefined) patch.name = text(req.body.name);
+  if (req.body?.enabled !== undefined) patch.enabled = Boolean(req.body.enabled);
+  if (req.body?.items !== undefined) patch.items = Array.isArray(req.body.items) ? req.body.items.slice(0, 60) : [];
+  if (req.body?.slots !== undefined) patch.slots = Array.isArray(req.body.slots) ? req.body.slots : [];
+  if (req.body?.refreshMode !== undefined || req.body?.refresh_mode !== undefined) patch.refresh_mode = text(req.body.refreshMode || req.body.refresh_mode);
+  if (req.body?.cursor !== undefined) patch.cursor = Number(req.body.cursor || 0) || 0;
+  await store.update('recycle_lists', existing.id, patch);
+  const item = await store.getById<RecycleListRecord>('recycle_lists', existing.id);
+  res.json({ item });
+});

@@ -1,0 +1,143 @@
+import { useMemo, useState } from 'react';
+import { AlertCircle, Info, RefreshCw, TrendingUp, UserCheck } from 'lucide-react';
+import { useCustomers } from '../hooks/useCustomers';
+import type { CustomerProfile } from '../types/customer';
+import { SocialPlatformIcon } from './SocialPlatformIcon';
+
+const STAGE_LABEL: Record<CustomerProfile['stage'], string> = {
+  lead: '潜客',
+  inquiry: '询盘中',
+  quoted: '已报价',
+  won: '已成交',
+  silent30: '沉默30天',
+  silent60: '沉默60天',
+};
+
+function usd(value: string): number {
+  return Number(value.replace(/[^0-9.-]/g, '')) || 0;
+}
+
+function latestWhatsApp(customer: CustomerProfile) {
+  return [...customer.timeline].reverse().find(item => item.type === 'whatsapp');
+}
+
+function isWhatsAppInquiry(customer: CustomerProfile) {
+  return String(customer.source).startsWith('whatsapp');
+}
+
+export default function InquiryDataBoard({ includeMockCustomers = false, mockCustomerScope = 'admin', demoCustomers }: { windowDays?: number; includeMockCustomers?: boolean; mockCustomerScope?: string; demoCustomers?: CustomerProfile[] }) {
+  const [refreshKey, setRefreshKey] = useState(0);
+  const { customers, loading } = useCustomers(refreshKey, includeMockCustomers, mockCustomerScope);
+  const effectiveCustomers = demoCustomers ?? customers;
+
+  const inquiries = useMemo(() => [...effectiveCustomers]
+    .filter(isWhatsAppInquiry)
+    .sort((a, b) => b.priority - a.priority || b.intentScore - a.intentScore), [effectiveCustomers]);
+
+  const summary = useMemo(() => {
+    const highIntent = inquiries.filter(item => item.intentScore >= 80).length;
+    const needsHuman = inquiries.filter(item => item.handlingMode !== 'ai_auto' || item.inboxReason).length;
+    const quoted = inquiries.filter(item => item.stage === 'quoted' || item.stage === 'won').length;
+    const estimated = inquiries.reduce((sum, item) => sum + usd(item.estimatedValue), 0);
+    return { highIntent, needsHuman, quoted, estimated };
+  }, [inquiries]);
+
+  return (
+    <div className="secondary-data-board h-full overflow-y-auto px-4 py-6 sm:px-6">
+      <div className="mb-4 flex items-center justify-between">
+        <div>
+          <p className="text-sm font-bold text-text-primary">询盘经营数据</p>
+          <p className="mt-1 text-xs text-text-muted">与「我的会话」使用同一套 WhatsApp 客户记录。</p>
+        </div>
+        <button type="button" onClick={() => setRefreshKey(v => v + 1)} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-text-secondary hover:text-text-primary">
+          <RefreshCw size={12} />刷新
+        </button>
+      </div>
+
+      {demoCustomers && <div className="mb-4 border-l-4 border-amber-400 bg-amber-50 px-4 py-3 text-xs text-amber-950"><strong>演示数据：</strong>客户、消息、阶段与商机估值均为模拟，不代表真实询盘。</div>}
+
+      {loading && !demoCustomers ? (
+        <div className="secondary-empty border-l-2 border-border bg-surface p-5 text-sm text-text-muted">正在读取 WhatsApp 客户会话...</div>
+      ) : inquiries.length === 0 ? (
+        <EmptyState text="暂无 WhatsApp 客户会话。" />
+      ) : (
+        <>
+          <div className="secondary-stat-strip mb-5">
+            <StatCard label="WhatsApp询盘" value={String(inquiries.length)} icon={<SocialPlatformIcon platform="whatsapp" size={15} />} />
+            <StatCard label="高意向客户" value={String(summary.highIntent)} icon={<TrendingUp size={14} />} />
+            <StatCard label="需人工跟进" value={String(summary.needsHuman)} icon={<UserCheck size={14} />} />
+            <StatCard label="预估金额" value={`$${summary.estimated.toLocaleString('en-US')}`} icon={<Info size={14} />} />
+          </div>
+
+          <section className="secondary-panel border border-border bg-white">
+            <div className="border-b border-border px-4 py-3">
+              <p className="text-sm font-bold text-text-primary">WhatsApp 询盘明细</p>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead className="bg-surface-2 text-text-secondary">
+                  <tr>
+                    {['客户', '产品/需求', '阶段', '商机判断', '预估金额', '最近消息', '下一步'].map(head => (
+                      <th key={head} className="px-3 py-2 text-left font-semibold">{head}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {inquiries.map(customer => {
+                    const message = latestWhatsApp(customer);
+                    return (
+                      <tr key={customer.id} className="border-t border-border align-top">
+                        <td className="px-3 py-2">
+                          <p className="font-semibold text-text-primary">{customer.name}</p>
+                          <p className="mt-0.5 text-text-muted">{customer.countryName} · {customer.lastActive}</p>
+                        </td>
+                        <td className="px-3 py-2 text-text-secondary">{customer.product}</td>
+                        <td className="px-3 py-2">
+                          <span className="rounded bg-green-50 px-2 py-0.5 font-semibold text-green-700">{STAGE_LABEL[customer.stage]}</span>
+                        </td>
+                        <td className="px-3 py-2 font-semibold text-text-primary">
+                          {customer.bant?.band === 'black'
+                            ? '信息待核实'
+                            : customer.bant?.level === 'hot' || customer.intentScore >= 75
+                            ? '高价值'
+                            : customer.bant?.level === 'qualified' || customer.intentScore >= 50
+                            ? '重点跟进'
+                            : '继续了解'}
+                        </td>
+                        <td className="px-3 py-2 font-semibold text-text-primary">{customer.estimatedValue}</td>
+                        <td className="max-w-[300px] px-3 py-2 text-text-secondary">{message?.body || customer.summary}</td>
+                        <td className="max-w-[260px] px-3 py-2 text-text-secondary">{customer.nextStep}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          {summary.quoted > 0 && (
+            <p className="mt-3 text-xs font-semibold text-green-700">已有 {summary.quoted} 个 WhatsApp 询盘推进到报价或成交阶段。</p>
+          )}
+        </>
+      )}
+
+    </div>
+  );
+}
+
+function StatCard({ label, value, icon }: { label: string; value: string; icon: React.ReactNode }) {
+  return (
+    <div className="secondary-stat-item bg-transparent p-4">
+      <div className="flex items-center gap-2 text-green-700">{icon}<span className="text-xs font-semibold text-text-secondary">{label}</span></div>
+      <p className="mt-2 text-2xl font-bold leading-none text-text-primary">{value}</p>
+    </div>
+  );
+}
+
+function EmptyState({ text }: { text: string }) {
+  return (
+    <div className="secondary-empty border-l-2 border-border bg-surface p-5 text-sm text-text-muted">
+      <div className="flex items-start gap-2"><AlertCircle size={16} className="mt-0.5 text-text-muted" /><p>{text}</p></div>
+    </div>
+  );
+}

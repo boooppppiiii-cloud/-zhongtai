@@ -1,0 +1,50 @@
+import { Component, type ErrorInfo, type ReactNode } from 'react';
+import ChannelsPage from './ChannelsPage';
+
+class IntegrationTabBoundary extends Component<
+  { children: ReactNode },
+  { hasError: boolean }
+> {
+  state = { hasError: false };
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('[IntegrationsPage]', error, info);
+  }
+
+  render() {
+    if (!this.state.hasError) return this.props.children;
+    return (
+      <div className="flex h-full items-center justify-center bg-white px-6">
+        <div className="w-full max-w-md rounded-xl border border-gray-100 bg-gray-50 p-5 text-center">
+          <p className="text-sm font-semibold text-gray-900">当前模块暂时无法显示</p>
+          <p className="mt-2 text-xs leading-relaxed text-gray-500">
+            这不会影响其他页面。请刷新后重试账号授权配置。
+          </p>
+          <button
+            type="button"
+            onClick={() => this.setState({ hasError: false })}
+            className="mt-4 rounded-lg bg-gray-900 px-4 py-2 text-xs font-semibold text-white"
+          >
+            重新加载
+          </button>
+        </div>
+      </div>
+    );
+  }
+}
+
+export default function IntegrationsPage() {
+  return (
+    <div className="flex flex-col h-full bg-white">
+      <div className="min-h-0 flex-1">
+        <IntegrationTabBoundary>
+          <ChannelsPage />
+        </IntegrationTabBoundary>
+      </div>
+    </div>
+  );
+}

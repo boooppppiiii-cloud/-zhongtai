@@ -1,0 +1,2303 @@
+import { useState, useEffect, useId, useRef } from 'react';
+import EnterprisePresenters from './enterprise/EnterprisePresenters';
+import { motion } from 'motion/react';
+import { Building2, Package, Megaphone, BookOpen, Save, CheckCircle2, Loader2, Compass, Zap, MessageSquare, RotateCcw, Plus, Upload, X, Image, FileText, FileSpreadsheet, Bell, ChevronDown, ChevronLeft, ChevronRight, Globe2, ShieldCheck, type LucideIcon } from 'lucide-react';
+import { authHeader } from '../lib/auth';
+import { completeDemoStep } from '../lib/demoProgress';
+import {
+  heuristicProductMapping,
+  mapRowToProduct,
+  parseWorkbook,
+  prepareSheet,
+} from '../lib/productImport';
+import SupportAccessControl from './SupportAccessControl';
+import EnterpriseProductImportCard, { type ProductApiStatus } from './EnterpriseProductImportCard';
+import type { AppliedProfile } from './enterprise/KnowledgeIntakePanel';
+
+interface ProductAsset {
+  name: string;
+  type: string;
+  size: number;
+  updatedAt: string;
+  url?: string;
+}
+
+interface ProductItem {
+  id?: string;
+  productId?: string;
+  sku?: string;
+  name: string;
+  category?: string;
+  color?: string;
+  size?: string;
+  tagPrice?: string;
+  retailPrice?: string;
+  brand?: string;
+  material?: string;
+  imageUrl?: string;
+  priceRange?: string;
+  moq?: string;
+  certifications?: string;
+  highlights?: string;
+  images?: ProductAsset[];
+  videos?: ProductAsset[];
+  documents?: ProductAsset[];
+  factoryImages?: ProductAsset[];
+  packagingImages?: ProductAsset[];
+  certificateImages?: ProductAsset[];
+  sceneImages?: ProductAsset[];
+  brandAssets?: ProductAsset[];
+}
+
+type AutonomyLevel = 'remind' | 'draft' | 'auto';
+type QuoteMode = '' | 'range' | 'human_only';
+type BargainPolicy = '' | 'no' | 'limited' | 'open';
+type NotificationChannel = 'wecom' | 'dingtalk' | 'feishu' | 'sms';
+
+interface BizRules {
+  quoteMode: QuoteMode;
+  priceRange?: string;
+  bargainPolicy: BargainPolicy;
+  bargainFloor?: string;
+  moq: string;
+  samplePolicy: string;
+  paymentTerms: string;
+  leadTime: string;
+}
+
+interface FaqItem {
+  id: string;
+  question: string;
+  answer: string;
+  approvedForAuto: boolean;
+  source?: 'manual' | 'pack' | 'learned';
+}
+
+interface FaqPackItem {
+  q: string;
+  a: string;
+  vars: string[];
+  missingVars: string[];
+  ready: boolean;
+  exists?: boolean;
+}
+
+interface FaqPack {
+  id: string;
+  industry: 'apparel' | 'home' | 'general';
+  industryLabel: string;
+  scenario: 'presales' | 'shipping' | 'aftersales' | 'credentials';
+  scenarioLabel: string;
+  count: number;
+  preview: FaqPackItem[];
+  items: FaqPackItem[];
+}
+
+interface NotificationReceiver {
+  name: string;
+  channel: NotificationChannel;
+  target: string;
+}
+
+interface NotificationSettings {
+  receivers: NotificationReceiver[];
+  workHours: { start: string; end: string };
+  quietOutsideHours: boolean;
+  nightMode: { enabled: boolean; autoCategories: 'approved' };
+  lastTestAt?: string;
+}
+
+interface HandoffRules {
+  keywords: string[];
+  missStreakToDraft: 1 | 2 | 3;
+  negativeSentiment: boolean;
+}
+
+interface SalesStyleProfile {
+  learnedFromCount: number;
+  lastDistilledAt?: string;
+  greeting_style?: { value: string; evidence: string; manual?: boolean };
+  quoting_stance?: { value: string; evidence: string; manual?: boolean };
+  followup_rhythm?: { value: string; evidence: string; manual?: boolean };
+  taboo_phrases?: { value: string[]; evidence: string; manual?: boolean };
+  sample_pairs?: Array<{ trigger: string; final: string; evidence?: string }>;
+}
+
+interface CustomerServiceSettings {
+  enabled: boolean;
+  enabledAt?: string;
+  disabledAt?: string;
+  partialAutoReplyEnabled: boolean;
+  partialAutoReplyDecision: 'pending' | 'enabled' | 'declined';
+  partialAutoReplyDecisionAt?: string;
+}
+
+type CooperationRoute = 'oem_odm' | 'wholesale_distribution' | 'consumer_retail';
+type SocialStrategy = { enabledRoutes: CooperationRoute[]; routeStrategies: Partial<Record<CooperationRoute, { targetBuyerRoles: string[]; primaryCta: string }>>; manuallyEditedFields?: string[] };
+
+interface Profile {
+  company: { name: string; industry: string; companyType?: string; mainMarkets: string; primaryLanguages?: string; socialPlatformExperience?: string; founded: string; description: string };
+  socialStrategy?: SocialStrategy;
+  products: { categories: string; searchKeywords?: string; priceRange: string; moq: string; certifications: string; highlights: string; items?: ProductItem[] };
+  brand: { tone: string; style: string; taboos: string; usp: string; preferredLanguages?: string };
+  strategy?: { currentGoal?: string; focusProducts?: string; focusMarkets?: string; excludedMarkets?: string; pricingStrategy?: string; minMargin?: string; agentAutonomy?: string; aiAutonomy?: AutonomyLevel };
+  customers?: { targetProfiles?: string; highValueSignals?: string; lowQualitySignals?: string; commonQuestions?: string; followupStyle?: string };
+  operations?: { leadTime?: string; customization?: string; logistics?: string; paymentTerms?: string; riskNotes?: string };
+  agentLearning?: { provenAngles?: string; weakAngles?: string; pendingAssumptions?: string; userCorrections?: string };
+  bizRules?: BizRules;
+  faq?: FaqItem[];
+  notifications?: NotificationSettings;
+  handoffRules?: HandoffRules;
+  customerService?: CustomerServiceSettings;
+  salesStyleProfile?: SalesStyleProfile;
+  knowledgeIntake?: { lastExtractedAt?: string; source?: 'history' | 'products' | 'interview'; extractedMessages?: number; confirmedSections?: string[] };
+  dataGovernance?: { aiAccessEnabled: boolean; lastSavedAt?: string; lastSavedSource?: 'diagnosis' | 'enterprise_center' | 'knowledge_intake' | 'system' | 'template' };
+  knowledge: string;
+}
+
+const DEFAULT: Profile = {
+  company: { name: '', industry: '', companyType: '', mainMarkets: '', primaryLanguages: '', socialPlatformExperience: '', founded: '', description: '' },
+  socialStrategy: { enabledRoutes: [], routeStrategies: {}, manuallyEditedFields: [] },
+  products: {
+    categories: '',
+    priceRange: '',
+    moq: '',
+    certifications: '',
+    highlights: '',
+    items: [],
+  },
+  brand: { tone: '', style: '', taboos: '', usp: '', preferredLanguages: '' },
+  strategy: { currentGoal: '', focusProducts: '', focusMarkets: '', excludedMarkets: '', pricingStrategy: '', minMargin: '', agentAutonomy: '', aiAutonomy: 'draft' },
+  customers: { targetProfiles: '', highValueSignals: '', lowQualitySignals: '', commonQuestions: '', followupStyle: '' },
+  operations: { leadTime: '', customization: '', logistics: '', paymentTerms: '', riskNotes: '' },
+  agentLearning: { provenAngles: '', weakAngles: '', pendingAssumptions: '', userCorrections: '' },
+  bizRules: { quoteMode: 'human_only', priceRange: '', bargainPolicy: 'no', bargainFloor: '', moq: '', samplePolicy: '', paymentTerms: '', leadTime: '' },
+  faq: [],
+  notifications: { receivers: [], workHours: { start: '09:00', end: '22:00' }, quietOutsideHours: true, nightMode: { enabled: false, autoCategories: 'approved' }, lastTestAt: '' },
+  handoffRules: { keywords: ['人工', '老板', 'manager', 'complaint', 'refund'], missStreakToDraft: 2, negativeSentiment: true },
+  customerService: { enabled: false, enabledAt: '', disabledAt: '', partialAutoReplyEnabled: false, partialAutoReplyDecision: 'pending', partialAutoReplyDecisionAt: '' },
+  salesStyleProfile: { learnedFromCount: 0, sample_pairs: [] },
+  knowledge: '',
+};
+
+const AGENTS = [
+  { icon: Compass, label: '首页', color: '#4f46e5' },
+  { icon: Zap, label: '我的社媒', color: '#d97706' },
+  { icon: MessageSquare, label: '我的客户', color: '#0891b2' },
+];
+
+const AUTONOMY_OPTIONS: Array<{ value: AutonomyLevel; title: string; desc: string; detail: string }> = [
+  { value: 'remind', title: '只提醒我', desc: 'AI 只判断优先级并提醒', detail: '不生成草稿，不自动发送' },
+  { value: 'draft', title: '草稿需确认（推荐）', desc: 'AI 结合当前对话写草稿', detail: '由你检查后发送' },
+  { value: 'auto', title: '已审批问答自动回', desc: '高置信命中标准问答时直发', detail: '其他情况仍转草稿或人工' },
+];
+
+const AUTO_REPLY_SCOPE = ['当前问题与已审批 FAQ 语义一致', '语境判定置信度不低于 90%', '回答原文通过价格与承诺红线检查'];
+const MARKET_OPTIONS = ['中东', '东南亚', '中亚', '南亚', '东亚', '欧洲', '北美', '拉美', '非洲', '大洋洲', '俄罗斯及独联体'];
+const LANGUAGE_OPTIONS = ['英语', '阿拉伯语', '西班牙语', '法语', '俄语', '葡萄牙语', '德语', '日语', '韩语', '土耳其语', '印地语', '印尼语', '泰语', '越南语'];
+const CATEGORY_OPTIONS = ['服装', '家居', '饰品', '五金', '美妆个护', '玩具', '消费电子', '汽摩配件', '机械设备', '工业自动化与智能装备', '包装印刷', '食品饮料', '宠物用品'];
+const COMPANY_TYPE_OPTIONS = ['工厂', '工贸一体', '贸易商', '出口型企业', '品牌商', '跨境电商'];
+const COOPERATION_ROUTE_OPTIONS: Array<{ value: CooperationRoute; label: string; buyers: string[] }> = [
+  { value: 'oem_odm', label: 'OEM / ODM（品牌定制与开发）', buyers: ['品牌创始人', '产品经理', '采购'] },
+  { value: 'wholesale_distribution', label: '现货批发 / 经销', buyers: ['进口商', '经销商', '渠道采购'] },
+  { value: 'consumer_retail', label: 'C 端零售', buyers: ['终端消费者'] },
+];
+const CERTIFICATION_OPTIONS = ['CE', 'FDA', 'SGS', 'RoHS', 'FCC', 'MSDS', 'ISO', 'BSCI', 'GOTS', 'OEKO-TEX'];
+const BRAND_TONE_OPTIONS = ['专业可靠', '亲切自然', '简洁直接', '高端克制', '热情主动', '务实高效'];
+const COMMUNICATION_STYLE_OPTIONS = ['专业', '轻松', '亲切', '正式'];
+const PAGE_SIZE = 5;
+const SERVICE_INTAKE_AUTO_OPEN_KEY = 'lingshu:enterprise:service-intake-auto-opened';
+
+type KnowledgeView = 'products' | 'bizRules' | 'faq' | 'company' | 'socialStrategy' | 'materials' | 'salesStyle' | 'advanced';
+type EnterpriseArea = 'facts' | 'social' | 'service';
+
+function advisorInitialEnterpriseView(): KnowledgeView {
+  try {
+    const value = localStorage.getItem('lingshu:enterprise:initial-view') as KnowledgeView | null;
+    if (value === 'materials') return 'products';
+    if (value && ['products', 'bizRules', 'faq', 'company', 'socialStrategy', 'materials', 'salesStyle', 'advanced'].includes(value)) return value;
+  } catch { /* ignore */ }
+  return 'company';
+}
+
+const FACT_VIEWS: Array<{ id: KnowledgeView; label: string; hint: string }> = [
+  { id: 'company', label: '公司与市场', hint: '你是谁' },
+  { id: 'products', label: '产品资料', hint: '你卖什么' },
+];
+
+const SERVICE_VIEWS: Array<{ id: KnowledgeView; label: string; hint: string }> = [
+  { id: 'bizRules', label: '报价与业务规则', hint: '询价转人工' },
+  { id: 'faq', label: '常见问答', hint: '允许怎么答' },
+  { id: 'salesStyle', label: '销售风格', hint: '持续学习' },
+  { id: 'advanced', label: '接待与转人工', hint: '权限和提醒' },
+];
+
+function enterpriseAreaForView(view: KnowledgeView): EnterpriseArea {
+  if (view === 'socialStrategy') return 'social';
+  if (['bizRules', 'faq', 'salesStyle', 'advanced'].includes(view)) return 'service';
+  return 'facts';
+}
+
+const KNOWLEDGE_VIEW_ICONS: Record<KnowledgeView, LucideIcon> = {
+  company: Globe2,
+  socialStrategy: Megaphone,
+  products: Package,
+  materials: Image,
+  bizRules: ShieldCheck,
+  faq: BookOpen,
+  salesStyle: Megaphone,
+  advanced: Bell,
+};
+const CHANNEL_OPTIONS: Array<{ value: NotificationChannel; label: string }> = [
+  { value: 'wecom', label: '企业微信' },
+  { value: 'dingtalk', label: '钉钉' },
+  { value: 'feishu', label: '飞书' },
+  { value: 'sms', label: '短信' },
+];
+
+type SectionKey = 'products' | 'materials' | 'bizRules' | 'faq' | 'market' | 'company';
+
+function splitTokens(value?: string): string[] {
+  return String(value ?? '').split(/[、,，;；\n]+/).map(item => item.trim()).filter(Boolean);
+}
+
+function joinTokens(items: string[]): string {
+  return Array.from(new Set(items.map(item => item.trim()).filter(Boolean))).join('、');
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function includesKnownValue(raw: string, candidate: string): boolean {
+  const source = raw.toLocaleLowerCase();
+  const target = candidate.trim().toLocaleLowerCase();
+  if (!target) return false;
+  // 英文缩写必须是完整词，避免把 service 之类的描述文字误判成 CE 认证。
+  if (/^[a-z0-9][a-z0-9 ._\-/]*$/i.test(target)) {
+    return new RegExp(`(^|[^a-z0-9])${escapeRegExp(target)}([^a-z0-9]|$)`, 'i').test(source);
+  }
+  return source.includes(target);
+}
+
+function isConciseLegacyOption(value: string): boolean {
+  const token = value.trim();
+  if (!token || token === '/' || token.length > 20) return false;
+  if (/[\u3002！？!?]/.test(token)) return false;
+  if (/[a-z]/.test(token) && /\s/.test(token) && token !== token.toLocaleUpperCase()) return false;
+  return !/(我们|本公司|主要|主营|专注|面向|覆盖|客户|业务|产品|平台|经验|市场为|销售至|出口到)/.test(token);
+}
+
+function normalizeKnownMulti(value: string | undefined, options: string[], aliases: Record<string, string> = {}, preserveCustom = false): string {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  const canonical: string[] = [];
+  for (const option of options) {
+    if (includesKnownValue(raw, option)) canonical.push(option);
+  }
+  for (const [legacy, replacement] of Object.entries(aliases)) {
+    if (includesKnownValue(raw, legacy)) canonical.push(replacement);
+  }
+  const custom = preserveCustom
+    ? splitTokens(raw).filter(token => {
+      const hasKnownValue = options.some(option => includesKnownValue(token, option))
+        || Object.keys(aliases).some(alias => includesKnownValue(token, alias));
+      return !hasKnownValue && isConciseLegacyOption(token);
+    })
+    : [];
+  return joinTokens([...canonical, ...custom]);
+}
+
+function normalizeKnownSingle(value: string | undefined, options: string[], aliases: Record<string, string> = {}, preserveCustom = false): string {
+  const raw = String(value ?? '').trim();
+  if (!raw || raw === '/') return '';
+  const alias = Object.entries(aliases).find(([legacy]) => includesKnownValue(raw, legacy));
+  if (alias) return alias[1];
+  const option = options.find(item => includesKnownValue(raw, item));
+  if (option) return option;
+  return preserveCustom && isConciseLegacyOption(raw) ? raw : '';
+}
+
+function normalizeSocialExperience(value?: string): string {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  if (/没做过|未做过|没有|no experience/i.test(raw)) return '没做过';
+  if (/准备|筹备|planning/i.test(raw)) return '正在准备';
+  if (/做过|youtube|tiktok|facebook|instagram|whatsapp|linkedin/i.test(raw)) return '做过';
+  return '';
+}
+
+export function normalizeEnterpriseProfile(profile: Profile): Profile {
+  const items = normalizeProductItems(profile.products).map(item => ({
+    ...item,
+    category: normalizeKnownSingle(item.category, CATEGORY_OPTIONS, {
+      工业自动化: '工业自动化与智能装备',
+      自动化设备: '工业自动化与智能装备',
+      工业设备: '机械设备',
+      'industrial automation': '工业自动化与智能装备',
+      machinery: '机械设备',
+    }, true),
+    certifications: normalizeKnownMulti(item.certifications, CERTIFICATION_OPTIONS, { 'iso 9001': 'ISO', iso9001: 'ISO' }, true),
+  }));
+  return {
+    ...profile,
+    company: {
+      ...profile.company,
+      industry: normalizeKnownMulti(profile.company.industry, CATEGORY_OPTIONS, {
+        工业自动化: '工业自动化与智能装备',
+        自动化设备: '工业自动化与智能装备',
+        工业设备: '机械设备',
+        'industrial automation': '工业自动化与智能装备',
+        machinery: '机械设备',
+      }, true),
+      companyType: normalizeKnownSingle(profile.company.companyType, COMPANY_TYPE_OPTIONS, { 出口型: '出口型企业' }, true),
+      mainMarkets: normalizeKnownMulti(profile.company.mainMarkets, MARKET_OPTIONS, {
+        拉丁美洲: '拉美',
+        'latin america': '拉美',
+        'north america': '北美',
+        'middle east': '中东',
+        europe: '欧洲',
+        africa: '非洲',
+      }, true),
+      primaryLanguages: normalizeKnownMulti(profile.company.primaryLanguages, LANGUAGE_OPTIONS, {
+        english: '英语',
+        spanish: '西班牙语',
+        arabic: '阿拉伯语',
+        french: '法语',
+        russian: '俄语',
+        portuguese: '葡萄牙语',
+        german: '德语',
+      }, true),
+      socialPlatformExperience: normalizeSocialExperience(profile.company.socialPlatformExperience),
+    },
+    products: {
+      ...profile.products,
+      categories: normalizeKnownMulti(profile.products.categories, CATEGORY_OPTIONS, {
+        工业自动化: '工业自动化与智能装备',
+        自动化设备: '工业自动化与智能装备',
+        工业设备: '机械设备',
+        'industrial automation': '工业自动化与智能装备',
+        machinery: '机械设备',
+      }, true),
+      certifications: normalizeKnownMulti(profile.products.certifications, CERTIFICATION_OPTIONS, { 'iso 9001': 'ISO', iso9001: 'ISO' }, true),
+      items,
+    },
+  };
+}
+
+export function profileSnapshot(profile: Profile): string {
+  const stable = JSON.parse(JSON.stringify(profile)) as Profile;
+  const enabledRoutes = Array.from(new Set(stable.socialStrategy?.enabledRoutes ?? [])).sort() as CooperationRoute[];
+  const routeStrategies = Object.fromEntries(
+    enabledRoutes
+      .filter(route => Boolean(stable.socialStrategy?.routeStrategies?.[route]))
+      .map(route => [route, stable.socialStrategy!.routeStrategies[route]]),
+  ) as SocialStrategy['routeStrategies'];
+  stable.socialStrategy = { ...(stable.socialStrategy ?? DEFAULT.socialStrategy!), enabledRoutes, routeStrategies };
+  return JSON.stringify(stable);
+}
+
+function productCreativeMaterialCount(product: ProductItem): number {
+  const assets = [
+    ...(product.images ?? []),
+    ...(product.videos ?? []),
+    ...(product.factoryImages ?? []),
+    ...(product.packagingImages ?? []),
+    ...(product.sceneImages ?? []),
+    ...(product.brandAssets ?? []),
+  ];
+  const signatures = new Set(assets.map(asset => asset.url || `${asset.name}:${asset.size}:${asset.updatedAt}`));
+  if (product.imageUrl) signatures.add(product.imageUrl);
+  return signatures.size;
+}
+
+function productAssetStats(items: ProductItem[]) {
+  return items.reduce((acc, product) => {
+    acc.creative += productCreativeMaterialCount(product);
+    acc.documents += product.documents?.length ?? 0;
+    return acc;
+  }, { creative: 0, documents: 0 });
+}
+
+export function sectionCompletion(profile: Profile): Record<SectionKey, boolean> {
+  const items = normalizeProductItems(profile.products);
+  const namedProducts = items.filter((item, index) => Boolean(item.name.trim() && item.name.trim() !== `产品${index + 1}`));
+  return {
+    products: namedProducts.length > 0,
+    // 创作素材在“我的素材”独立维护，不再作为企业事实资料的完成门槛。
+    materials: true,
+    bizRules: Boolean(profile.bizRules?.quoteMode && profile.bizRules?.samplePolicy?.trim() && profile.bizRules?.paymentTerms?.trim()),
+    faq: (profile.faq ?? []).length >= 5,
+    market: Boolean(profile.company.mainMarkets.trim() && profile.company.primaryLanguages?.trim()),
+    company: profile.company.description.trim().length >= 50,
+  };
+}
+
+function Toggle({ checked, onChange, disabled }: { checked: boolean; onChange: (checked: boolean) => void; disabled?: boolean }) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      disabled={disabled}
+      onClick={() => onChange(!checked)}
+      className={`relative h-6 w-11 shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60 ${checked ? 'bg-emerald-500' : 'bg-slate-300'}`}
+    >
+      <span className={`absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform ${checked ? 'translate-x-5' : 'translate-x-0'}`} />
+    </button>
+  );
+}
+
+function OptionSelector({ value, options, onChange, multiple = true, placeholder = '请选择' }: {
+  value: string;
+  options: string[];
+  onChange: (value: string) => void;
+  multiple?: boolean;
+  placeholder?: string;
+}) {
+  const selectorId = useId();
+  const menuId = `${selectorId}-menu`;
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
+  const tokens = splitTokens(value);
+  const customTokens = tokens.filter(item => !options.includes(item));
+  const toggleOpen = () => setOpen(current => !current);
+
+  const choose = (option: string) => {
+    if (!multiple) {
+      onChange(option);
+      return;
+    }
+    const next = tokens.includes(option) ? tokens.filter(item => item !== option) : [...tokens, option];
+    onChange(joinTokens(next));
+  };
+
+  const removeCustom = (option: string) => onChange(joinTokens(tokens.filter(item => item !== option)));
+
+  useEffect(() => {
+    if (!multiple) return;
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener('pointerdown', closeOnOutsideClick);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsideClick);
+    };
+  }, [multiple]);
+
+  if (!multiple) {
+    return (
+      <select className={inputCls} value={value} onChange={event => onChange(event.target.value)}>
+        <option value="">{placeholder}</option>
+        {options.map(option => <option key={option} value={option}>{option}</option>)}
+        {customTokens.map(option => <option key={option} value={option}>{option}（历史自定义）</option>)}
+      </select>
+    );
+  }
+
+  return (
+    <div ref={rootRef} className="group relative">
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls={menuId}
+        onPointerDown={toggleOpen}
+        onClick={event => {
+          if (event.detail === 0) toggleOpen();
+        }}
+        onKeyDown={event => {
+          if (event.key === 'Escape') {
+            setOpen(false);
+            event.currentTarget.focus();
+          }
+        }}
+        className={`${inputCls} flex min-h-10 w-full cursor-pointer items-center justify-between gap-3 text-left`}
+      >
+        <span className={tokens.length ? 'truncate text-text-primary' : 'text-text-muted'}>{tokens.length ? tokens.join('、') : `${placeholder}（可多选）`}</span>
+        <ChevronDown size={15} className={`shrink-0 text-text-muted transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open && <div id={menuId} className="mt-1 max-h-64 w-full overflow-y-auto rounded-lg border border-border bg-white p-2 shadow-lg">
+        {options.map(option => (
+          <label key={option} className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-2 text-xs text-text-primary hover:bg-surface-2">
+            <input type="checkbox" aria-label={option} className="h-3.5 w-3.5 accent-emerald-600" checked={tokens.includes(option)} onChange={() => choose(option)} />
+            {option}
+          </label>
+        ))}
+        {customTokens.length > 0 && <div className="mt-1 border-t border-border pt-1">
+          <p className="px-2 py-1 text-[10px] font-bold text-text-muted">历史自定义值</p>
+          {customTokens.map(option => <button type="button" key={option} onClick={() => removeCustom(option)} className="flex w-full items-center justify-between rounded-md px-2 py-2 text-left text-xs text-text-secondary hover:bg-surface-2">{option}<X size={12} /></button>)}
+        </div>}
+      </div>}
+    </div>
+  );
+}
+
+function PaginationControls({ page, total, pageSize, onChange }: { page: number; total: number; pageSize: number; onChange: (page: number) => void }) {
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  if (pageCount <= 1) return null;
+  return (
+    <div className="mt-4 flex items-center justify-between border-t border-border pt-3">
+      <span className="text-[11px] text-text-muted">共 {total} 条 · 第 {page}/{pageCount} 页</span>
+      <div className="flex items-center gap-2">
+        <button type="button" disabled={page <= 1} onClick={() => onChange(page - 1)} className="flex h-8 w-8 items-center justify-center rounded-lg border border-border bg-white text-text-secondary disabled:opacity-40" title="上一页"><ChevronLeft size={14} /></button>
+        <button type="button" disabled={page >= pageCount} onClick={() => onChange(page + 1)} className="flex h-8 w-8 items-center justify-center rounded-lg border border-border bg-white text-text-secondary disabled:opacity-40" title="下一页"><ChevronRight size={14} /></button>
+      </div>
+    </div>
+  );
+}
+
+function KnowledgeCard({
+  icon: Icon,
+  title,
+  purpose,
+  completed,
+  stat,
+  children,
+  id,
+  highlight,
+}: {
+  icon: React.ComponentType<{ size?: number; className?: string }>;
+  title: string;
+  purpose: string;
+  completed: boolean;
+  stat?: string;
+  children: React.ReactNode;
+  id?: string;
+  highlight?: boolean;
+}) {
+  return (
+    <section id={id} className={`rounded-lg border border-border bg-white p-5 shadow-sm transition-all ${highlight ? 'ring-2 ring-sky-300' : ''}`}>
+      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+        <div className="flex min-w-0 items-start gap-3">
+          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-sky-50 text-sky-700">
+            <Icon size={16} />
+          </span>
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="text-sm font-black text-text-primary">{title}</h3>
+              <span className={`rounded-full px-2 py-0.5 text-[11px] font-black ${completed ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'}`}>
+                {completed ? '已完成' : '未完成'}
+              </span>
+            </div>
+            <p className="mt-1 text-[11px] leading-relaxed text-text-muted">{purpose}</p>
+          </div>
+        </div>
+        {stat && <span className="rounded-full bg-surface-2 px-2.5 py-1 text-[11px] font-bold text-text-secondary">{stat}</span>}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <label className="block text-xs font-semibold text-text-secondary mb-1.5">{label}</label>
+      {hint && <p className="text-[11px] text-text-muted mb-1.5">{hint}</p>}
+      {children}
+    </div>
+  );
+}
+
+const inputCls = 'w-full px-3 py-2 text-sm bg-white border border-border rounded-lg outline-none focus:border-accent focus:ring-2 focus:ring-accent/10 transition-all placeholder:text-text-muted text-text-primary';
+const textareaCls = `${inputCls} resize-none`;
+
+const MAX_PRODUCT_DOCUMENTS = 3;
+
+export function productMaterialLibraryParams(product: Pick<ProductItem, 'id' | 'productId' | 'sku' | 'name'>): { productId: string; productRef: string } {
+  return {
+    productId: String(product.id || product.productId || product.sku || '').trim(),
+    productRef: String(product.name || '').trim(),
+  };
+}
+
+function emptyProduct(index: number): ProductItem {
+  return {
+    id: typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `product-${Date.now()}-${index}`,
+    name: `产品${index + 1}`,
+    images: [],
+    videos: [],
+    documents: [],
+    factoryImages: [],
+    packagingImages: [],
+    certificateImages: [],
+    sceneImages: [],
+    brandAssets: [],
+  };
+}
+
+function normalizeProductItems(products: Profile['products']): ProductItem[] {
+  const existing = Array.isArray(products.items) ? products.items : [];
+  if (existing.length) {
+    // 编辑中的空白产品也是有效草稿；仅“删除产品”按钮可以移除产品项。
+    return existing.map((item, index) => ({
+      ...emptyProduct(index),
+      ...item,
+      name: typeof item.name === 'string' ? item.name : `产品${index + 1}`,
+      images: Array.isArray(item.images) ? item.images : [],
+      videos: Array.isArray(item.videos) ? item.videos : [],
+      documents: Array.isArray(item.documents) ? item.documents : [],
+      factoryImages: Array.isArray(item.factoryImages) && item.factoryImages.length ? item.factoryImages : (Array.isArray(item.videos) ? item.videos : []),
+      packagingImages: Array.isArray(item.packagingImages) ? item.packagingImages : [],
+      certificateImages: Array.isArray(item.certificateImages) && item.certificateImages.length ? item.certificateImages : (Array.isArray(item.documents) ? item.documents : []),
+      sceneImages: Array.isArray(item.sceneImages) ? item.sceneImages : [],
+      brandAssets: Array.isArray(item.brandAssets) ? item.brandAssets : [],
+    }));
+  }
+  return [];
+}
+
+function formatSize(size: number): string {
+  if (size >= 1024 * 1024) return `${(size / 1024 / 1024).toFixed(1)}MB`;
+  if (size >= 1024) return `${Math.round(size / 1024)}KB`;
+  return `${size}B`;
+}
+
+function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+async function uploadProductEvidence(file: File): Promise<ProductAsset> {
+  const dataUrl = await fileToDataUrl(file);
+  const response = await fetch('/api/overseas/enterprise/assets', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeader() },
+    body: JSON.stringify({ name: file.name, type: file.type, dataUrl }),
+  });
+  if (!response.ok) throw new Error('asset upload failed');
+  return response.json();
+}
+
+export default function EnterprisePage() {
+  const [profile, setProfile] = useState<Profile>(DEFAULT);
+  const [saving, setSaving] = useState(false);
+  const [, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [profileLoaded, setProfileLoaded] = useState(false);
+  const [apiStatus, setApiStatus] = useState<ProductApiStatus>({ count: 0 });
+  const [orderImporting, setOrderImporting] = useState(false);
+  const [orderImportMessage, setOrderImportMessage] = useState('');
+  const [autonomyHighlight, setAutonomyHighlight] = useState(false);
+  const [productImporting, setProductImporting] = useState(false);
+  const [productImportMessage, setProductImportMessage] = useState('');
+  const [faqPreview, setFaqPreview] = useState<FaqItem[]>([]);
+  const [faqStructuring, setFaqStructuring] = useState(false);
+  const [faqPacks, setFaqPacks] = useState<FaqPack[]>([]);
+  const [recommendedPackIndustry, setRecommendedPackIndustry] = useState('general');
+  const [faqPacksOpen, setFaqPacksOpen] = useState(false);
+  const [openPackId, setOpenPackId] = useState('');
+  const [selectedPackQuestions, setSelectedPackQuestions] = useState<Record<string, string[]>>({});
+  const [packImporting, setPackImporting] = useState('');
+  const [notificationTesting, setNotificationTesting] = useState('');
+  const [notificationMessage, setNotificationMessage] = useState('');
+  const [notificationMessageError, setNotificationMessageError] = useState(false);
+  const [knowledgeView, setKnowledgeView] = useState<KnowledgeView>(advisorInitialEnterpriseView);
+  const [enterpriseArea, setEnterpriseArea] = useState<EnterpriseArea>(() => enterpriseAreaForView(advisorInitialEnterpriseView()));
+  const [languageSettingsHighlight, setLanguageSettingsHighlight] = useState(false);
+  const [productPage, setProductPage] = useState(1);
+  const [expandedProductIndexes, setExpandedProductIndexes] = useState<Set<number>>(() => new Set([0]));
+  const [faqPage, setFaqPage] = useState(1);
+  const [notificationsHighlight, setNotificationsHighlight] = useState(false);
+  const [bizRulesHighlight, setBizRulesHighlight] = useState(false);
+  const [handoffKeywordInput, setHandoffKeywordInput] = useState('');
+  const [styleDistilling, setStyleDistilling] = useState(false);
+  const [styleMessage, setStyleMessage] = useState('');
+  const persistedProfileRef = useRef('');
+  const productStatusAbortRef = useRef<AbortController | null>(null);
+  const hasUnsavedChanges = profileLoaded && !loading && persistedProfileRef.current !== profileSnapshot(profile);
+
+  useEffect(() => {
+    if (window.sessionStorage.getItem('lingshu:enterprise-focus') !== 'language-settings') return;
+    window.sessionStorage.removeItem('lingshu:enterprise-focus');
+    setEnterpriseArea('facts');
+    setKnowledgeView('company');
+    setLanguageSettingsHighlight(true);
+    const scrollTimer = window.setTimeout(() => {
+      document.getElementById('enterprise-language-settings')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 120);
+    const highlightTimer = window.setTimeout(() => setLanguageSettingsHighlight(false), 3000);
+    return () => {
+      window.clearTimeout(scrollTimer);
+      window.clearTimeout(highlightTimer);
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 15_000);
+    const requestInit = { headers: authHeader(), signal: controller.signal };
+    Promise.all([
+      fetch('/api/overseas/enterprise/profile', requestInit).then(r => r.ok ? r.json() : Promise.reject(new Error(`企业资料加载失败（${r.status}）`))),
+      fetch('/api/overseas/enterprise/product-api/status', requestInit).then(r => r.json()).catch(() => ({ count: 0 })),
+      fetch('/api/overseas/enterprise/faq/packs', requestInit).then(r => r.json()).catch(() => ({ packs: [], recommendedIndustry: 'general' })),
+    ])
+      .then(([data, productApiStatus, packData]: [Partial<Profile>, ProductApiStatus, { packs?: FaqPack[]; recommendedIndustry?: string }]) => {
+        if (!active) return;
+        const rawNext: Profile = {
+          ...DEFAULT,
+          ...data,
+          company: { ...DEFAULT.company, ...data.company },
+          socialStrategy: {
+            ...DEFAULT.socialStrategy!,
+            ...data.socialStrategy,
+            routeStrategies: { ...DEFAULT.socialStrategy!.routeStrategies, ...data.socialStrategy?.routeStrategies },
+          },
+          products: { ...DEFAULT.products, ...data.products, items: normalizeProductItems({ ...DEFAULT.products, ...data.products }) },
+          brand: { ...DEFAULT.brand, ...data.brand },
+          strategy: { ...DEFAULT.strategy, ...data.strategy },
+          customers: { ...DEFAULT.customers, ...data.customers },
+          operations: { ...DEFAULT.operations, ...data.operations },
+          agentLearning: { ...DEFAULT.agentLearning, ...data.agentLearning },
+          bizRules: {
+            ...DEFAULT.bizRules,
+            ...data.bizRules,
+            quoteMode: data.bizRules?.quoteMode ?? DEFAULT.bizRules!.quoteMode,
+            bargainPolicy: data.bizRules?.bargainPolicy ?? DEFAULT.bizRules!.bargainPolicy,
+            priceRange: data.bizRules?.priceRange || data.products?.priceRange || '',
+            moq: data.bizRules?.moq || data.products?.moq || '',
+            samplePolicy: data.bizRules?.samplePolicy ?? '',
+            paymentTerms: data.bizRules?.paymentTerms || data.operations?.paymentTerms || '',
+            leadTime: data.bizRules?.leadTime || data.operations?.leadTime || '',
+          },
+          faq: Array.isArray(data.faq) ? data.faq : [],
+          notifications: {
+            ...DEFAULT.notifications!,
+            ...data.notifications,
+            workHours: { ...DEFAULT.notifications!.workHours, ...data.notifications?.workHours },
+            nightMode: {
+              enabled: Boolean(data.notifications?.nightMode?.enabled),
+              autoCategories: 'approved',
+            },
+            receivers: Array.isArray(data.notifications?.receivers) ? data.notifications!.receivers : [],
+          },
+          handoffRules: {
+            ...DEFAULT.handoffRules!,
+            ...data.handoffRules,
+            keywords: Array.isArray(data.handoffRules?.keywords) && data.handoffRules.keywords.length
+              ? data.handoffRules.keywords
+              : DEFAULT.handoffRules!.keywords,
+            missStreakToDraft: [1, 2, 3].includes(Number(data.handoffRules?.missStreakToDraft))
+              ? data.handoffRules!.missStreakToDraft
+              : DEFAULT.handoffRules!.missStreakToDraft,
+            negativeSentiment: data.handoffRules?.negativeSentiment !== false,
+          },
+          customerService: {
+            ...DEFAULT.customerService!,
+            ...data.customerService,
+            enabled: data.customerService?.enabled === true,
+            partialAutoReplyEnabled: data.customerService?.partialAutoReplyEnabled === true,
+            partialAutoReplyDecision: data.customerService?.partialAutoReplyDecision === 'enabled' || data.customerService?.partialAutoReplyDecision === 'declined'
+              ? data.customerService.partialAutoReplyDecision
+              : 'pending',
+          },
+          salesStyleProfile: {
+            ...DEFAULT.salesStyleProfile!,
+            ...data.salesStyleProfile,
+            sample_pairs: Array.isArray(data.salesStyleProfile?.sample_pairs) ? data.salesStyleProfile.sample_pairs : [],
+          },
+          knowledge: data.knowledge ?? '',
+        };
+        const next = normalizeEnterpriseProfile(rawNext);
+        persistedProfileRef.current = profileSnapshot(next);
+        setProfile(next);
+        setProfileLoaded(true);
+        setSaveError('');
+        setApiStatus(productApiStatus);
+        const packs = Array.isArray(packData.packs) ? packData.packs : [];
+        setFaqPacks(packs);
+        setRecommendedPackIndustry(packData.recommendedIndustry || 'general');
+        setOpenPackId(packs.find(pack => pack.industry === packData.recommendedIndustry)?.id || packs[0]?.id || '');
+      })
+      .catch(error => {
+        if (!active) return;
+        setProfileLoaded(false);
+        setSaveError(error instanceof Error && error.name === 'AbortError'
+          ? '企业资料加载超时，请刷新后重试'
+          : error instanceof Error ? error.message : '企业资料加载失败，请刷新后重试');
+      })
+      .finally(() => {
+        window.clearTimeout(timeout);
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+      window.clearTimeout(timeout);
+      controller.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!profileLoaded) return;
+    let disposed = false;
+    let inFlight = false;
+    const poll = async () => {
+      if (disposed || inFlight || document.visibilityState !== 'visible') return;
+      inFlight = true;
+      const controller = new AbortController();
+      productStatusAbortRef.current = controller;
+      const timeout = window.setTimeout(() => controller.abort(), 12_000);
+      try {
+        const response = await fetch('/api/overseas/enterprise/product-api/status', {
+          headers: authHeader(),
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(`产品接口状态查询失败（${response.status}）`);
+        const status = await response.json() as ProductApiStatus;
+        if (!disposed) setApiStatus(status);
+      } catch {
+        // Keep the last successful status; the next bounded poll can recover.
+      } finally {
+        window.clearTimeout(timeout);
+        if (productStatusAbortRef.current === controller) productStatusAbortRef.current = null;
+        inFlight = false;
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') void poll();
+      else productStatusAbortRef.current?.abort();
+    };
+    const timer = window.setInterval(() => void poll(), 5000);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      productStatusAbortRef.current?.abort();
+      productStatusAbortRef.current = null;
+    };
+  }, [profileLoaded]);
+
+  useEffect(() => {
+    if (loading) return;
+    const raw = localStorage.getItem('lingshu:enterprise:prefill-faq');
+    if (!raw) return;
+    localStorage.removeItem('lingshu:enterprise:prefill-faq');
+    try {
+      const parsed = JSON.parse(raw) as Partial<FaqItem>;
+      const question = String(parsed.question || '').trim();
+      if (!question) return;
+      setProfile(prev => ({
+        ...prev,
+        faq: [
+          ...(prev.faq ?? []),
+          {
+            id: crypto.randomUUID(),
+            question,
+            answer: String(parsed.answer || ''),
+            approvedForAuto: false,
+            source: 'learned',
+          },
+        ],
+      }));
+      setEnterpriseArea('service');
+      setKnowledgeView('faq');
+      window.setTimeout(() => {
+        document.querySelector('[data-enterprise-faq]')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }, 100);
+    } catch {
+      // Ignore malformed prefill payload.
+    }
+  }, [loading]);
+
+
+  const set = <K extends keyof Profile>(section: K) =>
+    (field: string, value: string) =>
+      setProfile(prev => ({ ...prev, [section]: { ...(prev[section] as object), [field]: value } }));
+
+  const products = normalizeProductItems(profile.products);
+  const visibleProducts = products.slice((productPage - 1) * PAGE_SIZE, productPage * PAGE_SIZE);
+  const faqItems = profile.faq ?? [];
+  const visibleFaqs = faqItems.slice((faqPage - 1) * PAGE_SIZE, faqPage * PAGE_SIZE);
+  const assetStats = productAssetStats(products);
+  const completions = sectionCompletion(profile);
+  const notificationCompleted = Boolean((profile.notifications?.receivers ?? []).length >= 1 && profile.notifications?.lastTestAt);
+  const approvedFaqCount = (profile.faq ?? []).filter(item => item.approvedForAuto && item.question.trim() && item.answer.trim()).length;
+  const customerServiceEnabled = profile.customerService?.enabled === true;
+  const customerServiceEnabledAt = Date.parse(profile.customerService?.enabledAt || '');
+  const customerServiceObservationFinished = customerServiceEnabled
+    && Number.isFinite(customerServiceEnabledAt)
+    && Date.now() - customerServiceEnabledAt >= 3 * 24 * 60 * 60 * 1000;
+  const partialAutoReplyAuthorized = customerServiceObservationFinished && profile.customerService?.partialAutoReplyEnabled === true;
+  const canAutoReply = partialAutoReplyAuthorized && approvedFaqCount >= 5;
+  const autoReplyBlockReason = !customerServiceEnabled
+    ? '先在“我的客户”开启智能客服总开关'
+    : !customerServiceObservationFinished
+      ? '建议模式运行满 3 天后，才可开放部分直接回复'
+      : !partialAutoReplyAuthorized
+        ? '请先在“我的客户”确认是否开放部分直接回复'
+        : approvedFaqCount < 5
+          ? '需要先录入并审批至少 5 条常见问答'
+          : '';
+  const configuredAutonomy = profile.strategy?.aiAutonomy ?? 'draft';
+  const effectiveAutonomy: AutonomyLevel = configuredAutonomy === 'auto' && !canAutoReply ? 'draft' : configuredAutonomy;
+
+  useEffect(() => { setProductPage(page => Math.min(page, Math.max(1, Math.ceil(products.length / PAGE_SIZE)))); }, [products.length]);
+  useEffect(() => { setFaqPage(page => Math.min(page, Math.max(1, Math.ceil(faqItems.length / PAGE_SIZE)))); }, [faqItems.length]);
+
+  const applyKnowledgeProfile = (updated: AppliedProfile) => {
+    setProfile(previous => {
+      const next = {
+        ...previous,
+        company: { ...previous.company, ...(updated.company ?? {}) } as Profile['company'],
+        bizRules: { ...(previous.bizRules ?? DEFAULT.bizRules!), ...(updated.bizRules ?? {}) } as BizRules,
+        faq: Array.isArray(updated.faq) ? updated.faq as unknown as FaqItem[] : previous.faq,
+        notifications: updated.notifications
+          ? { ...(previous.notifications ?? DEFAULT.notifications!), ...updated.notifications } as NotificationSettings
+          : previous.notifications,
+        knowledgeIntake: updated.knowledgeIntake as Profile['knowledgeIntake'] ?? previous.knowledgeIntake,
+      };
+      return next;
+    });
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  };
+
+  const openKnowledgeIntake = () => {
+    window.dispatchEvent(new CustomEvent('lingshu-assistant-open', {
+      detail: {
+        tool: 'knowledge-intake',
+        context: {
+          agent: 'strategy',
+          label: '智能客服规范',
+          summary: '当前在企业中心的智能客服规范页，正在通过快速采集完善企业知识与接待边界。',
+          suggestions: ['根据产品生成接待初稿', '从历史聊天整理真实话术', '回答 4 个接待问题'],
+        },
+      },
+    }));
+  };
+
+  const openKnowledgeIntakeOnce = () => {
+    try {
+      if (localStorage.getItem(SERVICE_INTAKE_AUTO_OPEN_KEY) === 'true') return;
+      localStorage.setItem(SERVICE_INTAKE_AUTO_OPEN_KEY, 'true');
+    } catch { /* 浏览器禁用存储时，本次仍正常打开。 */ }
+    openKnowledgeIntake();
+  };
+
+  useEffect(() => {
+    try { localStorage.removeItem('lingshu:enterprise:initial-view'); } catch { /* ignore */ }
+  }, []);
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<{ profile?: AppliedProfile }>).detail;
+      if (detail?.profile) applyKnowledgeProfile(detail.profile);
+    };
+    window.addEventListener('lingshu:knowledge-intake-applied', handler);
+    return () => window.removeEventListener('lingshu:knowledge-intake-applied', handler);
+  }, []);
+
+  const setBizRule = (field: keyof BizRules, value: string) => {
+    setProfile(prev => ({ ...prev, bizRules: { ...(prev.bizRules ?? DEFAULT.bizRules!), [field]: value } }));
+  };
+
+  const addFaq = () => {
+    setFaqPage(Math.max(1, Math.ceil((faqItems.length + 1) / PAGE_SIZE)));
+    setProfile(prev => ({ ...prev, faq: [...(prev.faq ?? []), { id: crypto.randomUUID(), question: '', answer: '', approvedForAuto: false }] }));
+  };
+
+  const updateFaq = (id: string, patch: Partial<FaqItem>) => {
+    setProfile(prev => ({ ...prev, faq: (prev.faq ?? []).map(item => item.id === id ? { ...item, ...patch } : item) }));
+  };
+
+  const removeFaq = (id: string) => {
+    setProfile(prev => ({ ...prev, faq: (prev.faq ?? []).filter(item => item.id !== id) }));
+  };
+
+  const structureLegacyFaq = async () => {
+    const source = profile.customers?.commonQuestions?.trim();
+    if (!source) return;
+    setFaqStructuring(true);
+    try {
+      const result = await fetch('/api/overseas/enterprise/faq/structure', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeader() },
+        body: JSON.stringify({ text: source }),
+      }).then(r => r.json());
+      setFaqPreview(Array.isArray(result.items) ? result.items : []);
+    } finally {
+      setFaqStructuring(false);
+    }
+  };
+
+  const importFaqPreview = () => {
+    setFaqPage(Math.max(1, Math.ceil((faqItems.length + faqPreview.length) / PAGE_SIZE)));
+    setProfile(prev => ({ ...prev, faq: [...(prev.faq ?? []), ...faqPreview] }));
+    setFaqPreview([]);
+  };
+
+  const reloadFaqPacks = async () => {
+    const data = await fetch('/api/overseas/enterprise/faq/packs', { headers: authHeader() }).then(r => r.json()).catch(() => ({ packs: [], recommendedIndustry: 'general' }));
+    const packs = Array.isArray(data.packs) ? data.packs : [];
+    setFaqPacks(packs);
+    setRecommendedPackIndustry(data.recommendedIndustry || 'general');
+  };
+
+  const selectedQuestionsForPack = (pack: FaqPack) => selectedPackQuestions[pack.id] ?? pack.items.filter(item => item.ready && !item.exists).map(item => item.q);
+
+  const togglePackQuestion = (pack: FaqPack, question: string) => {
+    setSelectedPackQuestions(prev => {
+      const current = selectedQuestionsForPack(pack);
+      const next = current.includes(question) ? current.filter(item => item !== question) : [...current, question];
+      return { ...prev, [pack.id]: next };
+    });
+  };
+
+  const importFaqPack = async (pack: FaqPack) => {
+    setPackImporting(pack.id);
+    setSaveError('');
+    try {
+      const response = await fetch('/api/overseas/enterprise/faq/packs/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeader() },
+        body: JSON.stringify({
+          industry: pack.industry,
+          scenario: pack.scenario,
+          questions: selectedQuestionsForPack(pack),
+        }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.message || result.error || '知识包导入失败');
+      if (result.profile?.faq) {
+        setFaqPage(Math.max(1, Math.ceil(result.profile.faq.length / PAGE_SIZE)));
+        setProfile(prev => ({ ...prev, faq: result.profile.faq }));
+      }
+      await reloadFaqPacks();
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : '知识包导入失败');
+    } finally {
+      setPackImporting('');
+    }
+  };
+
+  const addReceiver = () => {
+    setProfile(prev => ({
+      ...prev,
+      notifications: {
+        ...(prev.notifications ?? DEFAULT.notifications!),
+        receivers: [...(prev.notifications?.receivers ?? []), { name: '', channel: 'wecom', target: '' }],
+      },
+    }));
+  };
+
+  const updateReceiver = (index: number, patch: Partial<NotificationReceiver>) => {
+    setProfile(prev => {
+      const notifications = prev.notifications ?? DEFAULT.notifications!;
+      const receivers = notifications.receivers.map((item, i) => i === index ? { ...item, ...patch } : item);
+      return { ...prev, notifications: { ...notifications, receivers } };
+    });
+  };
+
+  const removeReceiver = (index: number) => {
+    setProfile(prev => {
+      const notifications = prev.notifications ?? DEFAULT.notifications!;
+      return { ...prev, notifications: { ...notifications, receivers: notifications.receivers.filter((_, i) => i !== index) } };
+    });
+  };
+
+  const testReceiver = async (receiver: NotificationReceiver, index: number) => {
+    if (!receiver.target.trim()) {
+      setNotificationMessageError(true);
+      setNotificationMessage('请先填写接收目标');
+      return;
+    }
+    setNotificationTesting(String(index));
+    setNotificationMessage('');
+    setNotificationMessageError(false);
+    try {
+      const result = await fetch('/api/overseas/enterprise/notifications/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeader() },
+        body: JSON.stringify({ receiver }),
+      }).then(r => r.json());
+      if (result.error) throw new Error(result.error);
+      setProfile(prev => ({
+        ...prev,
+        notifications: result.notifications ?? { ...(prev.notifications ?? DEFAULT.notifications!), lastTestAt: result.lastTestAt || new Date().toISOString() },
+      }));
+      setNotificationMessage('测试提醒已发送');
+    } catch (error) {
+      setNotificationMessageError(true);
+      setNotificationMessage(error instanceof Error ? error.message : '测试提醒发送失败');
+    } finally {
+      setNotificationTesting('');
+    }
+  };
+
+  useEffect(() => {
+    if (localStorage.getItem('lingshu:enterprise:highlight-autonomy') !== 'auto') return;
+    localStorage.removeItem('lingshu:enterprise:highlight-autonomy');
+    setEnterpriseArea('service');
+    setKnowledgeView('advanced');
+    setAutonomyHighlight(true);
+    window.setTimeout(() => document.getElementById('ai-autonomy')?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 80);
+    window.setTimeout(() => setAutonomyHighlight(false), 3200);
+  }, [loading]);
+
+  useEffect(() => {
+    if (localStorage.getItem('lingshu:enterprise:highlight-notifications') !== 'true') return;
+    localStorage.removeItem('lingshu:enterprise:highlight-notifications');
+    setEnterpriseArea('service');
+    setKnowledgeView('advanced');
+    setNotificationsHighlight(true);
+    window.setTimeout(() => document.getElementById('notifications')?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 120);
+    window.setTimeout(() => setNotificationsHighlight(false), 3200);
+  }, [loading]);
+
+  useEffect(() => {
+    if (localStorage.getItem('lingshu:enterprise:highlight-biz-rules') !== 'true') return;
+    localStorage.removeItem('lingshu:enterprise:highlight-biz-rules');
+    setEnterpriseArea('service');
+    setKnowledgeView('bizRules');
+    setBizRulesHighlight(true);
+    window.setTimeout(() => document.getElementById('biz-rules')?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 80);
+    window.setTimeout(() => setBizRulesHighlight(false), 3200);
+  }, [loading]);
+
+  const setAutonomy = (value: AutonomyLevel) => {
+    if (value === 'auto' && !canAutoReply) {
+      window.alert(autoReplyBlockReason || '当前暂不能开放直接回复');
+      return;
+    }
+    if (value === 'auto' && profile.strategy?.aiAutonomy !== 'auto') {
+      const ok = window.confirm(`开启后，只有同时满足以下条件的标准问答才会自动发送：\n\n${AUTO_REPLY_SCOPE.map(item => `• ${item}`).join('\n')}\n\n物流、目录、售后、报价、付款和交期等仍需你确认。`);
+      if (!ok) return;
+    }
+    setProfile(prev => ({ ...prev, strategy: { ...prev.strategy, aiAutonomy: value } }));
+  };
+
+  const setNightModeEnabled = (enabled: boolean) => {
+    if (enabled && !profile.notifications?.nightMode?.enabled) {
+      const ok = window.confirm([
+        '开启夜班后，系统会在非工作时间继续按全局 AI 参与程度处理消息：',
+        '',
+        '· 全局为“只提醒我”时，夜间仍只提醒',
+        '· 全局为“草稿需确认”时，夜间仍只生成草稿',
+        '· 只有全局已允许自动回复时，夜间才可能发送已审批 FAQ 原文',
+        '',
+        '夜班不会扩大自动发送权限。需要人工确认的消息会进入次日晨报。',
+      ].join('\n'));
+      if (!ok) return;
+    }
+    setProfile(prev => ({
+      ...prev,
+      notifications: {
+        ...(prev.notifications ?? DEFAULT.notifications!),
+        nightMode: { enabled, autoCategories: 'approved' },
+      },
+    }));
+  };
+
+  const addHandoffKeyword = () => {
+    const keyword = handoffKeywordInput.trim();
+    if (!keyword) return;
+    setProfile(prev => {
+      const current = prev.handoffRules ?? DEFAULT.handoffRules!;
+      const keywords = Array.from(new Set([...current.keywords, keyword])).slice(0, 20);
+      return { ...prev, handoffRules: { ...current, keywords } };
+    });
+    setHandoffKeywordInput('');
+  };
+
+  const removeHandoffKeyword = (keyword: string) => {
+    setProfile(prev => {
+      const current = prev.handoffRules ?? DEFAULT.handoffRules!;
+      const keywords = current.keywords.filter(item => item !== keyword);
+      return { ...prev, handoffRules: { ...current, keywords: keywords.length ? keywords : [...DEFAULT.handoffRules!.keywords] } };
+    });
+  };
+
+  const setMissStreakToDraft = (value: 1 | 2 | 3) => {
+    setProfile(prev => ({
+      ...prev,
+      handoffRules: { ...(prev.handoffRules ?? DEFAULT.handoffRules!), missStreakToDraft: value },
+    }));
+  };
+
+  const setNegativeSentiment = (value: boolean) => {
+    setProfile(prev => ({
+      ...prev,
+      handoffRules: { ...(prev.handoffRules ?? DEFAULT.handoffRules!), negativeSentiment: value },
+    }));
+  };
+
+  const updateSalesStyleField = (key: 'greeting_style' | 'quoting_stance' | 'followup_rhythm', value: string) => {
+    setProfile(prev => ({
+      ...prev,
+      salesStyleProfile: {
+        ...(prev.salesStyleProfile ?? DEFAULT.salesStyleProfile!),
+        [key]: {
+          value,
+          evidence: prev.salesStyleProfile?.[key]?.evidence ?? '',
+          manual: true,
+        },
+      },
+    }));
+  };
+
+  const deleteSalesStyleField = (key: 'greeting_style' | 'quoting_stance' | 'followup_rhythm') => {
+    setProfile(prev => {
+      const next = { ...(prev.salesStyleProfile ?? DEFAULT.salesStyleProfile!) };
+      delete next[key];
+      return { ...prev, salesStyleProfile: next };
+    });
+  };
+
+  const updateTabooPhrases = (value: string) => {
+    setProfile(prev => ({
+      ...prev,
+      salesStyleProfile: {
+        ...(prev.salesStyleProfile ?? DEFAULT.salesStyleProfile!),
+        taboo_phrases: {
+          value: value.split(/[,\n，、]+/).map(item => item.trim()).filter(Boolean),
+          evidence: prev.salesStyleProfile?.taboo_phrases?.evidence ?? '',
+          manual: true,
+        },
+      },
+    }));
+  };
+
+  const deleteTabooPhrases = () => {
+    setProfile(prev => {
+      const next = { ...(prev.salesStyleProfile ?? DEFAULT.salesStyleProfile!) };
+      delete next.taboo_phrases;
+      return { ...prev, salesStyleProfile: next };
+    });
+  };
+
+  const distillSalesStyle = async () => {
+    setStyleDistilling(true);
+    setStyleMessage('');
+    try {
+      const resp = await fetch('/api/overseas/enterprise/style-profile/distill', {
+        method: 'POST',
+        headers: authHeader(),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.message || data.error || '学习失败');
+      setProfile(prev => ({ ...prev, salesStyleProfile: data.salesStyleProfile ?? prev.salesStyleProfile }));
+      setStyleMessage('销售风格档案已更新');
+    } catch (error) {
+      setStyleMessage(error instanceof Error ? error.message : '学习失败');
+    } finally {
+      setStyleDistilling(false);
+    }
+  };
+
+  const handleSave = async () => {
+    if (!profileLoaded) {
+      setSaveError('企业资料尚未成功加载，请刷新后重试');
+      return;
+    }
+    setSaving(true);
+    setSaved(false);
+    setSaveError('');
+    try {
+      const profileToSave = normalizeEnterpriseProfile(profile);
+      const response = await fetch('/api/overseas/enterprise/profile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-enterprise-save-source': 'enterprise_center', ...authHeader() },
+        body: JSON.stringify(profileToSave),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.message || result.error || `保存失败（${response.status}）`);
+
+      const verifyResponse = await fetch('/api/overseas/enterprise/profile', { headers: authHeader() });
+      const verified = await verifyResponse.json().catch(() => ({})) as Partial<Profile> & { message?: string; error?: string };
+      if (!verifyResponse.ok) throw new Error(verified.message || verified.error || '保存后校验失败');
+      const expectedProducts = normalizeProductItems(profileToSave.products);
+      const verifiedProducts = normalizeProductItems({ ...DEFAULT.products, ...verified.products });
+      const verifiedProductNames = new Set(verifiedProducts.map(item => item.name.trim()));
+      if (expectedProducts.length !== verifiedProducts.length || expectedProducts.some(item => !verifiedProductNames.has(item.name.trim()))) {
+        throw new Error('产品资料保存后校验失败，请重试');
+      }
+      persistedProfileRef.current = profileSnapshot(profileToSave);
+      setProfile(profileToSave);
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2500);
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : '保存失败，请稍后重试');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  useEffect(() => {
+    if (loading || saving || !hasUnsavedChanges) return;
+    const timer = window.setTimeout(() => { void handleSave(); }, 900);
+    return () => window.clearTimeout(timer);
+  }, [profile, loading, saving, hasUnsavedChanges]);
+
+  const importOrderCsv = async (file: File | null) => {
+    if (!file) return;
+    setOrderImporting(true);
+    setOrderImportMessage('');
+    try {
+      const csv = await file.text();
+      const result = await fetch('/api/overseas/enterprise/orders/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeader() },
+        body: JSON.stringify({ csv }),
+      }).then(r => r.json());
+      if (result.error) throw new Error(result.error);
+      setOrderImportMessage(`已导入 ${result.imported} 条真实订单${result.skipped ? `，跳过 ${result.skipped} 条无效行` : ''}`);
+    } catch (e) {
+      setOrderImportMessage(e instanceof Error ? e.message : '订单导入失败，请检查 CSV 字段');
+    } finally {
+      setOrderImporting(false);
+    }
+  };
+
+  const importProductSheet = async (file: File | null) => {
+    if (!file) return;
+    setProductImporting(true);
+    setProductImportMessage('');
+    try {
+      const sheets = await parseWorkbook(file);
+      const selected = sheets.slice().sort((a, b) => b.rowCount - a.rowCount)[0];
+      if (!selected) throw new Error('没有读取到可导入的表格');
+      const prepared = prepareSheet(selected);
+      const mapping = heuristicProductMapping(prepared.headers);
+      const incoming = prepared.dataRows
+        .map(row => mapRowToProduct(row, mapping) as Partial<ProductItem>)
+        .filter(item => item.name || item.sku)
+        .map((item, index): ProductItem => ({
+          name: item.name || item.sku || `导入产品${index + 1}`,
+          sku: item.sku,
+          color: item.color,
+          size: item.size,
+          tagPrice: item.tagPrice,
+          retailPrice: item.retailPrice,
+          moq: item.moq,
+          brand: item.brand,
+          material: item.material,
+          imageUrl: item.imageUrl,
+          priceRange: item.retailPrice || item.tagPrice,
+          category: profile.products.categories,
+          highlights: item.highlights,
+          images: item.imageUrl ? [{ name: item.imageUrl.split('/').pop() || '商品主图', type: 'image/url', size: 0, updatedAt: new Date().toISOString(), url: item.imageUrl }] : [],
+          videos: [],
+          documents: [],
+        }));
+      if (!incoming.length) throw new Error('没有识别到有效产品行，请检查表头是否包含商品名称或 SKU');
+      setProfile(prev => {
+        const existing = normalizeProductItems(prev.products);
+        const next = [...existing];
+        for (const item of incoming) {
+          const sku = item.sku?.trim();
+          const index = sku ? next.findIndex(product => product.sku?.trim() === sku) : -1;
+          if (index >= 0) next[index] = { ...next[index], ...item };
+          else next.push(item);
+        }
+        setProductPage(Math.max(1, Math.ceil(next.length / PAGE_SIZE)));
+        return { ...prev, products: { ...prev.products, items: next } };
+      });
+      const skipped = prepared.dataRows.length - incoming.length;
+      setProductImportMessage(`已导入 ${incoming.length} 个产品${skipped > 0 ? `，跳过 ${skipped} 行` : ''}，点击右上角保存后生效`);
+    } catch (e) {
+      setProductImportMessage(e instanceof Error ? e.message : '产品导入失败，请检查 CSV/XLSX 字段');
+    } finally {
+      setProductImporting(false);
+    }
+  };
+
+  const updateProduct = (index: number, patch: Partial<ProductItem>) => {
+    setProfile(prev => {
+      const items = normalizeProductItems(prev.products).map((item, i) => i === index ? { ...item, ...patch } : item);
+      return { ...prev, products: { ...prev.products, items } };
+    });
+  };
+
+  const addProduct = () => {
+    const nextIndex = products.length;
+    setProductPage(Math.max(1, Math.ceil((nextIndex + 1) / PAGE_SIZE)));
+    setExpandedProductIndexes(previous => new Set(previous).add(nextIndex));
+    setProfile(prev => {
+      const items = normalizeProductItems(prev.products);
+      return { ...prev, products: { ...prev.products, items: [...items, emptyProduct(items.length)] } };
+    });
+  };
+
+  const removeProduct = (index: number) => {
+    setExpandedProductIndexes(previous => new Set(
+      Array.from(previous)
+        .filter(itemIndex => itemIndex !== index)
+        .map(itemIndex => itemIndex > index ? itemIndex - 1 : itemIndex),
+    ));
+    setProfile(prev => {
+      const items = normalizeProductItems(prev.products)
+        .filter((_, i) => i !== index)
+        .map((item, i) => ({ ...item, name: item.name || `产品${i + 1}` }));
+      return { ...prev, products: { ...prev.products, items } };
+    });
+  };
+
+  const addProductDocuments = async (index: number, files: FileList | null) => {
+    if (!files?.length) return;
+    const picked = await Promise.all(Array.from(files).map(file => uploadProductEvidence(file).catch(() => ({
+      name: file.name,
+      type: file.type || 'application/octet-stream',
+      size: file.size,
+      updatedAt: new Date().toISOString(),
+    }))));
+    setProfile(prev => {
+      const items = normalizeProductItems(prev.products);
+      const current = items[index]?.documents ?? [];
+      items[index] = { ...items[index], documents: [...current, ...picked].slice(0, MAX_PRODUCT_DOCUMENTS) };
+      return { ...prev, products: { ...prev.products, items } };
+    });
+  };
+
+  const removeProductDocument = (index: number, assetIndex: number) => {
+    setProfile(prev => {
+      const items = normalizeProductItems(prev.products);
+      items[index] = { ...items[index], documents: (items[index]?.documents ?? []).filter((_, i) => i !== assetIndex) };
+      return { ...prev, products: { ...prev.products, items } };
+    });
+  };
+
+  const openProductMaterials = (product: ProductItem) => {
+    const params = productMaterialLibraryParams(product);
+    const detail = { page: 'socialInspiration', view: 'library', ...params };
+    window.dispatchEvent(new CustomEvent('lingshu:navigate', { detail }));
+    const url = new URL(window.location.href);
+    url.searchParams.set('view', 'library');
+    url.searchParams.set('productId', params.productId);
+    url.searchParams.set('productRef', params.productRef);
+    window.history.replaceState({ ...window.history.state, productionDetail: detail }, '', url);
+  };
+
+  const aiAutonomySection = (
+    <section id="ai-autonomy" data-lingshu-guide="enterprise-autonomy" className={`rounded-lg border border-border bg-white p-5 shadow-sm transition-all ${autonomyHighlight ? 'ring-2 ring-amber-300' : ''}`}>
+      <div className="flex items-start justify-between gap-3">
+        <p className="text-sm font-black text-text-primary">AI 参与程度</p>
+        <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-bold text-slate-600">
+          当前：{AUTONOMY_OPTIONS.find(item => item.value === effectiveAutonomy)?.title}
+        </span>
+      </div>
+      {!customerServiceEnabled && (
+        <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5">
+          <p className="text-xs font-semibold text-slate-700">智能客服总开关未开启，社媒账号接入后也只收消息，不会自动处理。</p>
+          <button
+            type="button"
+            onClick={() => window.dispatchEvent(new CustomEvent('lingshu:navigate', { detail: { page: 'conversion' } }))}
+            className="rounded-lg bg-slate-950 px-3 py-1.5 text-[11px] font-black text-white"
+          >
+            去开启
+          </button>
+        </div>
+      )}
+      {customerServiceEnabled && !customerServiceObservationFinished && (
+        <p className="mt-4 rounded-lg border border-cyan-100 bg-cyan-50 px-3 py-2.5 text-xs font-semibold text-cyan-900">
+          当前处于 3 天建议观察期：AI 只生成建议，所有消息都由你确认后发送。
+        </p>
+      )}
+      {customerServiceObservationFinished && !partialAutoReplyAuthorized && (
+        <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-100 bg-amber-50 px-3 py-2.5">
+          <p className="text-xs font-semibold text-amber-900">建议模式已满 3 天，请在“我的客户”决定是否开放部分直接回复。</p>
+          <button
+            type="button"
+            onClick={() => window.dispatchEvent(new CustomEvent('lingshu:navigate', { detail: { page: 'conversion' } }))}
+            className="rounded-lg bg-amber-600 px-3 py-1.5 text-[11px] font-black text-white"
+          >
+            去决定
+          </button>
+        </div>
+      )}
+      <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-3">
+        {AUTONOMY_OPTIONS.map(option => {
+          const active = effectiveAutonomy === option.value;
+          const disabled = option.value === 'auto' && !canAutoReply;
+          return (
+            <button
+              key={option.value}
+              type="button"
+              title={disabled ? autoReplyBlockReason : undefined}
+              disabled={disabled}
+              onClick={() => setAutonomy(option.value)}
+              className={`min-h-[118px] rounded-lg border p-3 text-left transition-all disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400 ${active ? 'border-slate-950 bg-slate-950 text-white shadow-sm' : 'border-border bg-white text-text-primary hover:border-slate-300 hover:bg-surface-2'}`}
+            >
+              <span className={`inline-flex h-5 w-5 items-center justify-center rounded-full border text-[10px] font-black ${active ? 'border-white bg-white text-slate-950' : 'border-border text-text-muted'}`}>
+                {active ? '✓' : ''}
+              </span>
+              <p className="mt-2 text-xs font-black">{option.title}</p>
+              <p className={`mt-2 text-[11px] leading-5 ${active ? 'text-white/80' : disabled ? 'text-slate-400' : 'text-text-muted'}`}>{option.desc}</p>
+              <p className={`text-[11px] leading-5 ${active ? 'text-white/80' : disabled ? 'text-slate-400' : 'text-text-muted'}`}>{disabled ? autoReplyBlockReason : option.detail}</p>
+            </button>
+          );
+        })}
+      </div>
+      {configuredAutonomy === 'auto' && !canAutoReply && (
+        <p className="mt-3 rounded-md bg-amber-50 px-3 py-2 text-[11px] font-semibold text-amber-800">
+          {autoReplyBlockReason}，当前按“草稿需确认”执行。
+        </p>
+      )}
+      <div className="mt-4 border-t border-border pt-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="text-xs font-black text-text-primary">自动发送边界</p>
+          <span className="text-[11px] font-bold text-text-muted">已审批 {approvedFaqCount} 条 · 启用要求 5 条</span>
+        </div>
+        <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-3">
+          {AUTO_REPLY_SCOPE.map((item, index) => (
+            <div key={item} className="flex items-start gap-2 rounded-md bg-emerald-50 px-3 py-2 text-[11px] font-semibold leading-5 text-emerald-900">
+              <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-emerald-600 text-[9px] font-black text-white">{index + 1}</span>
+              {item}
+            </div>
+          ))}
+        </div>
+        <p className="mt-3 text-[11px] font-semibold leading-5 text-text-muted">
+          物流、目录、售后、报价、折扣、付款、交期和合同均不会自动发送；没有真实业务数据或语境不明确时会降级。
+        </p>
+      </div>
+    </section>
+  );
+
+  const handoffSafetySection = (
+    <section className="rounded-lg border border-border bg-white p-5 shadow-sm">
+      <div>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <p className="text-sm font-black text-amber-950">转人工规则</p>
+            <p className="mt-1 text-[11px] font-semibold leading-5 text-amber-800">触发后，灵小枢会停下自动回复，交给你处理。</p>
+          </div>
+          <span className="rounded-full bg-white px-2.5 py-1 text-[11px] font-black text-red-700 shadow-sm">L4 永不自动</span>
+        </div>
+
+        <div className="mt-4 space-y-4">
+          <div>
+            <p className="mb-2 text-xs font-black text-amber-950">触发人工的关键词</p>
+            <div className="flex flex-wrap gap-2">
+              {(profile.handoffRules?.keywords ?? DEFAULT.handoffRules!.keywords).map(keyword => (
+                <button
+                  key={keyword}
+                  type="button"
+                  onClick={() => removeHandoffKeyword(keyword)}
+                  className="rounded-full border border-amber-200 bg-white px-2.5 py-1 text-[11px] font-bold text-amber-900 hover:bg-amber-100"
+                  title="点击删除"
+                >
+                  {keyword} ×
+                </button>
+              ))}
+            </div>
+            <div className="mt-2 flex gap-2">
+              <input
+                className="min-w-0 flex-1 rounded-lg border border-amber-200 bg-white px-3 py-2 text-xs outline-none focus:border-amber-400"
+                value={handoffKeywordInput}
+                onChange={event => setHandoffKeywordInput(event.target.value)}
+                onKeyDown={event => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    addHandoffKeyword();
+                  }
+                }}
+                placeholder="输入关键词，如 refund / 老板"
+              />
+              <button type="button" onClick={addHandoffKeyword} className="rounded-lg bg-amber-600 px-3 py-2 text-xs font-black text-white hover:bg-amber-700">
+                添加
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <label className="rounded-lg border border-amber-100 bg-white p-3">
+              <span className="text-xs font-black text-amber-950">连续未命中阈值</span>
+              <select
+                className="mt-2 w-full rounded-lg border border-border bg-white px-2 py-2 text-xs font-bold text-text-primary"
+                value={profile.handoffRules?.missStreakToDraft ?? 2}
+                onChange={event => setMissStreakToDraft(Number(event.target.value) as 1 | 2 | 3)}
+              >
+                <option value={1}>1 条就转草稿</option>
+                <option value={2}>2 条连续未命中</option>
+                <option value={3}>3 条连续未命中</option>
+              </select>
+            </label>
+            <label className="flex items-center justify-between gap-3 rounded-lg border border-amber-100 bg-white p-3">
+              <span>
+                <span className="block text-xs font-black text-amber-950">负面情绪转人工</span>
+                <span className="mt-1 block text-[11px] text-amber-700">投诉、退款、愤怒语气会提醒你亲自处理</span>
+              </span>
+              <input
+                type="checkbox"
+                className="h-4 w-4 accent-amber-600"
+                checked={profile.handoffRules?.negativeSentiment !== false}
+                onChange={event => setNegativeSentiment(event.target.checked)}
+              />
+            </label>
+          </div>
+          <p className="rounded-lg bg-red-50 px-3 py-2 text-[11px] font-semibold leading-5 text-red-700">
+            红线声明：报价、折扣、付款条款、交期承诺、合同条款、赔付等 L4 动作永不自动发送，不可配置放开。
+          </p>
+        </div>
+      </div>
+    </section>
+  );
+
+  const marketSection = (
+    <KnowledgeCard id="enterprise-language-settings" highlight={languageSettingsHighlight} icon={Globe2} title="目标市场与语言" purpose="决定 AI 说什么语言、按哪个时区建议联系时间" completed={completions.market}>
+      <div className="space-y-4">
+        <Field label="主要市场">
+          <OptionSelector value={profile.company.mainMarkets} options={MARKET_OPTIONS} onChange={value => set('company')('mainMarkets', value)} placeholder="选择目标市场" />
+        </Field>
+        <Field label="主要语言">
+          <OptionSelector value={profile.company.primaryLanguages ?? ''} options={LANGUAGE_OPTIONS} onChange={value => set('company')('primaryLanguages', value)} placeholder="选择主要语言" />
+        </Field>
+      </div>
+    </KnowledgeCard>
+  );
+
+  const companySection = (
+    <KnowledgeCard icon={Building2} title="公司介绍" purpose="AI 开场白和自我介绍的素材" completed={completions.company} stat={`已填写 ${profile.company.description.trim().length} 字 · 建议至少 50 字`}>
+      <div className="grid grid-cols-2 gap-4">
+        <Field label="公司名称">
+          <input className={inputCls} value={profile.company.name} onChange={e => set('company')('name', e.target.value)} placeholder="示例贸易有限公司" />
+        </Field>
+        <Field label="行业类目">
+          <OptionSelector value={profile.company.industry} options={CATEGORY_OPTIONS} onChange={value => set('company')('industry', value)} placeholder="选择行业类目" />
+        </Field>
+        <Field label="企业类型">
+          <OptionSelector value={profile.company.companyType ?? ''} options={COMPANY_TYPE_OPTIONS} multiple={false} onChange={value => set('company')('companyType', value)} placeholder="选择企业类型" />
+        </Field>
+        <Field label="成立年份">
+          <input className={inputCls} value={profile.company.founded} onChange={e => set('company')('founded', e.target.value)} placeholder="2018" />
+        </Field>
+        <Field label="海外平台经验">
+          <OptionSelector value={profile.company.socialPlatformExperience ?? ''} options={['做过', '没做过', '正在准备']} multiple={false} onChange={value => set('company')('socialPlatformExperience', value)} placeholder="选择海外平台经验" />
+        </Field>
+      </div>
+      <Field label="公司简介">
+        <textarea className={textareaCls} rows={4} value={profile.company.description} onChange={e => set('company')('description', e.target.value)} placeholder="介绍公司背景、主营品类、供应链优势、交付能力和海外服务经验。" />
+      </Field>
+      <button type="button" onClick={() => { setEnterpriseArea('social'); setKnowledgeView('socialStrategy'); }} className="mt-4 flex w-full items-center justify-between rounded-xl border border-emerald-200 bg-emerald-50/60 px-4 py-3 text-left hover:bg-emerald-50">
+        <span><span className="block text-xs font-black text-emerald-900">社媒脚本策略</span><span className="mt-1 block text-[11px] text-emerald-700">已启用 {profile.socialStrategy?.enabledRoutes.length ?? 0} 条合作路线 · 管理默认买家与主 CTA</span></span>
+        <ChevronRight size={16} className="text-emerald-700" />
+      </button>
+    </KnowledgeCard>
+  );
+
+  const socialStrategySection = (
+    <KnowledgeCard icon={Megaphone} title="社媒策略" purpose="为新建社媒脚本提供路线、默认买家和主 CTA" completed={Boolean(profile.socialStrategy?.enabledRoutes.length)}>
+      <p className="mb-4 text-[11px] leading-5 text-text-muted">系统会参考企业资料预填；你修改过的内容会作为企业默认值保留。多条路线时，创作工作台会为单条视频再次确认路线。</p>
+      <div className="mb-4 rounded-xl border border-border bg-surface-2/60 p-3">
+        <p className="text-xs font-black text-text-primary">承接渠道</p>
+        <p className="mt-1 text-[11px] text-text-muted">状态仅从账号连接或官网配置同步，此处不可手动修改。</p>
+        <div className="mt-2 flex flex-wrap gap-2">{['Messenger', '表单', '私信', '官网'].map(channel => <span key={channel} className="rounded-full border border-slate-200 bg-white px-2 py-1 text-[10px] font-bold text-slate-500">{channel} · 未验证</span>)}</div>
+      </div>
+      <div className="space-y-3">
+        {COOPERATION_ROUTE_OPTIONS.map(option => {
+          const selected = profile.socialStrategy?.enabledRoutes.includes(option.value) ?? false;
+          const route = profile.socialStrategy?.routeStrategies[option.value];
+          return <div key={option.value} className={`rounded-lg border p-4 ${selected ? 'border-emerald-200 bg-emerald-50/40' : 'border-border bg-white'}`}>
+            <label className="flex cursor-pointer items-center gap-2 text-sm font-black text-text-primary">
+              <input type="checkbox" className="h-4 w-4 accent-emerald-600" checked={selected} onChange={event => setProfile(prev => {
+                const current = prev.socialStrategy ?? DEFAULT.socialStrategy!;
+                const enabledRoutes = event.target.checked ? [...current.enabledRoutes, option.value] : current.enabledRoutes.filter(value => value !== option.value);
+                const routeStrategies = { ...current.routeStrategies };
+                if (event.target.checked && !routeStrategies[option.value]) routeStrategies[option.value] = { targetBuyerRoles: option.buyers, primaryCta: '引导通过 Messenger 联系' };
+                return { ...prev, socialStrategy: { ...current, enabledRoutes, routeStrategies } };
+              })} />
+              {option.label}
+            </label>
+            {selected && <div className="mt-4 grid gap-4 md:grid-cols-2">
+              <Field label="默认买家（顺序即优先级）"><input className={inputCls} value={(route?.targetBuyerRoles ?? option.buyers).join('、')} onChange={event => setProfile(prev => ({ ...prev, socialStrategy: { ...(prev.socialStrategy ?? DEFAULT.socialStrategy!), routeStrategies: { ...(prev.socialStrategy?.routeStrategies ?? {}), [option.value]: { targetBuyerRoles: splitTokens(event.target.value), primaryCta: route?.primaryCta ?? '引导通过 Messenger 联系' } } } }))} /></Field>
+              <Field label="默认主 CTA"><input className={inputCls} value={route?.primaryCta ?? '引导通过 Messenger 联系'} onChange={event => setProfile(prev => ({ ...prev, socialStrategy: { ...(prev.socialStrategy ?? DEFAULT.socialStrategy!), routeStrategies: { ...(prev.socialStrategy?.routeStrategies ?? {}), [option.value]: { targetBuyerRoles: route?.targetBuyerRoles ?? option.buyers, primaryCta: event.target.value } } } }))} /></Field>
+            </div>}
+          </div>;
+        })}
+      </div>
+    </KnowledgeCard>
+  );
+
+  const notificationSettingsSection = (
+    <div id="notifications" className={`rounded-lg border border-border bg-surface-2/40 p-4 transition-all ${notificationsHighlight ? 'ring-2 ring-sky-300' : ''}`}>
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <Bell size={14} className="text-text-secondary" />
+          <h3 className="text-sm font-black text-text-primary">通知接收方式</h3>
+        </div>
+        <span className={`rounded-full px-2 py-0.5 text-[11px] font-black ${notificationCompleted ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'}`}>
+          {notificationCompleted ? '已完成' : '未完成'}
+        </span>
+      </div>
+      <p className="mb-4 text-[11px] leading-relaxed text-text-muted">大单、客户要通话时，提醒发给谁</p>
+      <div className="space-y-3">
+        {(profile.notifications?.receivers ?? []).map((receiver, index) => (
+          <div key={index} className="grid grid-cols-1 gap-2 rounded-lg border border-border bg-white p-3 sm:grid-cols-2 xl:grid-cols-[minmax(0,1fr)_130px_minmax(0,1.3fr)_auto_auto]">
+            <input className={inputCls} value={receiver.name} onChange={e => updateReceiver(index, { name: e.target.value })} placeholder="接收人姓名" />
+            <select className={inputCls} value={receiver.channel} onChange={e => updateReceiver(index, { channel: e.target.value as NotificationChannel })}>
+              {CHANNEL_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+            </select>
+            <input className={`${inputCls} sm:col-span-2 xl:col-span-1`} value={receiver.target} onChange={e => updateReceiver(index, { target: e.target.value })} placeholder="Webhook / 手机号 / 账号" />
+            <div className="grid grid-cols-[1fr_auto] gap-2 sm:col-span-2 xl:contents">
+              <button type="button" onClick={() => void testReceiver(receiver, index)} disabled={notificationTesting === String(index)} className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-slate-950 px-3 py-2 text-xs font-bold text-white disabled:opacity-60">
+                {notificationTesting === String(index) ? <Loader2 size={12} className="animate-spin" /> : <Bell size={12} />}测试
+              </button>
+              <button type="button" onClick={() => removeReceiver(index)} aria-label={`删除接收人 ${receiver.name || index + 1}`} title="删除接收人" className="flex min-h-10 items-center justify-center rounded-lg border border-border bg-white px-3 text-text-muted hover:text-red"><X size={13} /></button>
+            </div>
+          </div>
+        ))}
+        <button type="button" onClick={addReceiver} className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-white px-3 py-2 text-xs font-bold text-text-secondary hover:bg-surface-2">
+          <Plus size={12} />添加接收人
+        </button>
+        {notificationMessage && <p className={`text-xs font-bold ${notificationMessageError ? 'text-red-600' : 'text-emerald-700'}`}>{notificationMessage}</p>}
+      </div>
+      <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        <Field label="工作开始时间">
+          <input className={inputCls} type="time" value={profile.notifications?.workHours.start ?? '09:00'} onChange={e => setProfile(prev => ({ ...prev, notifications: { ...(prev.notifications ?? DEFAULT.notifications!), workHours: { ...(prev.notifications?.workHours ?? DEFAULT.notifications!.workHours), start: e.target.value } } }))} />
+        </Field>
+        <Field label="工作结束时间">
+          <input className={inputCls} type="time" value={profile.notifications?.workHours.end ?? '22:00'} onChange={e => setProfile(prev => ({ ...prev, notifications: { ...(prev.notifications ?? DEFAULT.notifications!), workHours: { ...(prev.notifications?.workHours ?? DEFAULT.notifications!.workHours), end: e.target.value } } }))} />
+        </Field>
+        <div className="sm:col-span-2 xl:col-span-1">
+        <Field label="非工作时段">
+          <div className="flex h-10 items-center gap-2 rounded-lg border border-border bg-white px-3">
+            <Toggle checked={profile.notifications?.quietOutsideHours ?? true} onChange={checked => setProfile(prev => ({ ...prev, notifications: { ...(prev.notifications ?? DEFAULT.notifications!), quietOutsideHours: checked } }))} />
+            <span className="text-xs text-text-secondary">仅记录不即时推送</span>
+          </div>
+        </Field>
+        </div>
+      </div>
+      <div data-lingshu-guide="enterprise-night-mode" className="mt-4 flex items-start justify-between gap-4 border-t border-border pt-4">
+        <p className="text-xs font-black text-text-primary">非工作时间继续接待</p>
+        <label className="inline-flex shrink-0 cursor-pointer items-center gap-2 text-xs font-bold text-text-secondary">
+          <Toggle checked={Boolean(profile.notifications?.nightMode?.enabled)} onChange={setNightModeEnabled} />
+          {profile.notifications?.nightMode?.enabled ? '已开启' : '未开启'}
+        </label>
+      </div>
+    </div>
+  );
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <Loader2 size={20} className="text-text-muted animate-spin" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-full flex-col bg-white" data-lingshu-guide="enterprise-center">
+      <div className="shrink-0 bg-white px-4 sm:px-6">
+        <div className="flex w-full items-center gap-4 border-b border-border">
+          <div className="flex min-w-0 flex-1 gap-7 overflow-x-auto">
+          {([
+            { id: 'facts' as EnterpriseArea, label: '企业真实资料', icon: Building2, initialView: 'company' as KnowledgeView },
+            { id: 'social' as EnterpriseArea, label: '社媒策略', icon: Megaphone, initialView: 'socialStrategy' as KnowledgeView },
+            { id: 'service' as EnterpriseArea, label: '智能客服规范', icon: MessageSquare, initialView: 'bizRules' as KnowledgeView },
+          ]).map(item => {
+            const active = enterpriseArea === item.id;
+            const Icon = item.icon;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => {
+                  setEnterpriseArea(item.id);
+                  setKnowledgeView(item.initialView);
+                  if (item.id === 'service') openKnowledgeIntakeOnce();
+                }}
+                className={`flex h-12 shrink-0 items-center justify-center gap-2 border-b-2 px-1 text-sm font-semibold transition-colors ${active ? 'border-accent text-text-primary' : 'border-transparent text-text-muted hover:text-text-secondary'}`}
+              >
+                <Icon size={18} className={active ? 'text-accent' : 'text-text-muted'} />
+                <span className="min-w-0 truncate">{item.label}</span>
+              </button>
+            );
+          })}
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            {saveError && <span className="hidden max-w-48 truncate text-[11px] font-bold text-red-600 sm:block" title={saveError}>{saveError}</span>}
+            <motion.button
+              onClick={handleSave}
+              disabled={saving || !hasUnsavedChanges}
+              title={saveError || (hasUnsavedChanges ? '保存后，灵小枢、客服和社媒创作会使用这些资料' : '资料已保存在企业空间，并授权给 AI 使用')}
+              className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-bold text-white transition-all disabled:opacity-60"
+              style={{ background: saveError ? '#b74d43' : 'var(--color-accent)' }}
+            >
+              {saving ? <Loader2 size={12} className="animate-spin" /> : saveError ? <X size={12} /> : !hasUnsavedChanges ? <CheckCircle2 size={12} /> : <Save size={12} />}
+              {saving ? '保存中' : saveError ? '保存失败' : !hasUnsavedChanges ? '已保存' : '保存'}
+            </motion.button>
+          </div>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-y-auto">
+        <div className="mx-auto max-w-5xl space-y-5 px-6 py-5">
+          {enterpriseArea !== 'social' && (
+            <div className="overflow-x-auto pb-0.5">
+              <div className={`flex gap-6 border-b border-border ${enterpriseArea === 'facts' ? 'min-w-[360px]' : 'min-w-[680px]'}`}>
+                {(enterpriseArea === 'facts' ? FACT_VIEWS : SERVICE_VIEWS).map(item => {
+                  const active = knowledgeView === item.id;
+                  const Icon = KNOWLEDGE_VIEW_ICONS[item.id];
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => setKnowledgeView(item.id)}
+                      title={`${item.label} · ${item.hint}`}
+                      className={`flex h-11 flex-1 items-center justify-center gap-2 border-b-2 px-2 text-sm font-semibold transition-colors ${active ? 'border-accent text-text-primary' : 'border-transparent text-text-muted hover:text-text-secondary'}`}
+                    >
+                      <Icon size={16} className={active ? (enterpriseArea === 'facts' ? 'text-emerald-600' : 'text-sky-600') : 'text-text-muted'} />
+                      <span className="min-w-0 truncate">{item.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          <div className={`rounded-lg border p-4 ${enterpriseArea === 'facts' ? 'border-emerald-100 bg-emerald-50/60' : enterpriseArea === 'social' ? 'border-violet-100 bg-violet-50/60' : 'border-sky-100 bg-sky-50/60'}`}>
+            <div className="flex items-start gap-3">
+              {enterpriseArea === 'facts' ? <Building2 size={15} className="mt-0.5 shrink-0 text-emerald-700" /> : enterpriseArea === 'social' ? <Megaphone size={15} className="mt-0.5 shrink-0 text-violet-700" /> : <ShieldCheck size={15} className="mt-0.5 shrink-0 text-sky-700" />}
+              <div className="min-w-0 flex-1">
+                <p className="text-xs font-black text-text-primary">{enterpriseArea === 'facts' ? '已保存资料可供 AI 使用' : enterpriseArea === 'social' ? '设置社媒创作默认策略' : '设置客服边界'}</p>
+              </div>
+              {enterpriseArea === 'service' && (
+                <button type="button" onClick={openKnowledgeIntake} className="shrink-0 rounded-lg border border-sky-200 bg-white px-3 py-2 text-[11px] font-black text-sky-700 hover:bg-sky-50">
+                  打开灵小枢快速采集
+                </button>
+              )}
+            </div>
+          </div>
+
+          {knowledgeView === 'company' && <>{marketSection}{companySection}</>}
+          {knowledgeView === 'socialStrategy' && <>{socialStrategySection}<EnterprisePresenters /></>}
+
+          {knowledgeView === 'products' && (
+          <KnowledgeCard
+            icon={Package}
+            title="产品资料"
+            purpose="AI 推荐产品、整理询价条件和生成内容的原料"
+            completed={completions.products}
+            stat={`${products.length} 个产品 · ${assetStats.documents} 份资质凭证 · ${assetStats.creative} 项历史素材记录`}
+          >
+            <div className="mb-4 rounded-xl border border-emerald-200 bg-emerald-50/70 px-4 py-3">
+              <p className="text-sm font-black text-emerald-950">产品素材统一在“我的素材”管理</p>
+              <p className="mt-1 text-xs leading-5 text-emerald-800">企业知识库只维护产品事实和资质凭证。图片、视频和音频只需上传一次；从内容任务上传的素材也会归入同一个素材库。</p>
+            </div>
+            <div className="mb-4 grid gap-4 md:grid-cols-2">
+              <Field label="主营品类">
+                <OptionSelector value={profile.products.categories} options={CATEGORY_OPTIONS} onChange={value => set('products')('categories', value)} placeholder="选择主营品类" />
+              </Field>
+              <Field label="认证资质">
+                <OptionSelector value={profile.products.certifications} options={CERTIFICATION_OPTIONS} onChange={value => set('products')('certifications', value)} placeholder="选择认证资质" />
+              </Field>
+            </div>
+            <p className="mb-4 rounded-lg border border-violet-100 bg-violet-50/60 px-3 py-2 text-[11px] leading-5 text-violet-800">社媒发现范围不在企业中心重复维护。这里保存真实产品资料；产品、市场和沟通对象会在“灵感中心”组合成可追溯的发现范围。</p>
+            <Field label="产品核心优势">
+              <textarea className={textareaCls} rows={2} value={profile.products.highlights} onChange={e => set('products')('highlights', e.target.value)} placeholder="工厂直供、支持 OEM/ODM、备货稳定" />
+            </Field>
+            <div className="mt-4 flex flex-wrap items-center gap-2">
+              <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-border bg-white px-3 py-2 text-xs font-bold text-text-secondary hover:bg-surface-2">
+                {productImporting ? <Loader2 size={12} className="animate-spin" /> : <FileSpreadsheet size={12} />}
+                导入产品表
+                <input type="file" accept=".xlsx,.csv" className="hidden" disabled={productImporting} onChange={e => { void importProductSheet(e.currentTarget.files?.[0] ?? null); e.currentTarget.value = ''; }} />
+              </label>
+              <button type="button" onClick={addProduct} className="inline-flex items-center gap-1.5 rounded-lg bg-slate-950 px-3 py-2 text-xs font-bold text-white">
+                <Plus size={12} />添加产品
+              </button>
+              {productImportMessage && <span className="text-[11px] font-bold text-emerald-700">{productImportMessage}</span>}
+            </div>
+            <div className="mt-4 space-y-3">
+              {visibleProducts.map((product, pageIndex) => {
+                const index = (productPage - 1) * PAGE_SIZE + pageIndex;
+                return (
+                <details
+                  key={index}
+                  className="group relative rounded-lg border border-border bg-surface-2/50 p-4"
+                  open={expandedProductIndexes.has(index)}
+                  onToggle={event => {
+                    const isOpen = event.currentTarget.open;
+                    setExpandedProductIndexes(previous => {
+                      if (previous.has(index) === isOpen) return previous;
+                      const next = new Set(previous);
+                      if (isOpen) next.add(index);
+                      else next.delete(index);
+                      return next;
+                    });
+                  }}
+                >
+                  <summary className="flex cursor-pointer list-none items-center justify-between gap-3 pr-9 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2">
+                    <div className="min-w-0">
+                      <p className="truncate text-xs font-black text-text-primary">{product.name.trim() || `产品 ${index + 1}`}</p>
+                      <p className="mt-1 text-[10px] text-text-muted">产品事实 · 资质凭证 {product.documents?.length ?? 0} 份 · 现有素材记录 {productCreativeMaterialCount(product)} 项</p>
+                    </div>
+                    <ChevronDown size={14} className="shrink-0 text-text-muted transition-transform group-open:rotate-180" />
+                  </summary>
+                  <button type="button" onClick={() => removeProduct(index)} aria-label={`删除产品 ${product.name || index + 1}`} className="absolute right-3 top-3 rounded-md p-1 text-text-muted hover:bg-white hover:text-red" title="删除产品"><X size={13} /></button>
+                  <div className="mt-4 border-t border-border pt-4">
+                  <div className="grid grid-cols-2 gap-3">
+                    <Field label="产品名称">
+                      <input className={inputCls} value={product.name} onChange={e => updateProduct(index, { name: e.target.value })} placeholder={`产品${index + 1}`} />
+                    </Field>
+                    <Field label="产品类目">
+                      <OptionSelector value={product.category ?? ''} options={CATEGORY_OPTIONS} multiple={false} onChange={value => updateProduct(index, { category: value })} placeholder="选择产品类目" />
+                    </Field>
+                    <Field label="参考价或标签价">
+                      <input className={inputCls} value={product.priceRange ?? product.retailPrice ?? product.tagPrice ?? ''} onChange={e => updateProduct(index, { priceRange: e.target.value })} placeholder="$5 - $500 USD" />
+                    </Field>
+                    <Field label="起订量">
+                      <input className={inputCls} value={product.moq ?? ''} onChange={e => updateProduct(index, { moq: e.target.value })} placeholder="50 件起，支持混批" />
+                    </Field>
+                  </div>
+                  <Field label="产品卖点">
+                    <textarea className={textareaCls} rows={2} value={product.highlights ?? ''} onChange={e => updateProduct(index, { highlights: e.target.value })} placeholder="核心卖点、适用场景、可定制项、交付优势" />
+                  </Field>
+                  <div className="mt-3 space-y-3 border-t border-border pt-3">
+                    <div className="flex flex-col gap-3 rounded-xl border border-emerald-200 bg-emerald-50/70 p-4 sm:flex-row sm:items-center sm:justify-between">
+                      <div>
+                        <p className="text-xs font-black text-emerald-950">产品素材统一在“我的素材”管理</p>
+                        <p className="mt-1 text-[11px] leading-5 text-emerald-800">当前产品有 {productCreativeMaterialCount(product)} 项历史素材记录。进入素材库后可按产品查看、上传和复用。</p>
+                      </div>
+                      <button type="button" onClick={() => openProductMaterials(product)} className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-lg bg-emerald-700 px-3 py-2 text-xs font-black text-white hover:bg-emerald-800">
+                        <Image size={13} />去我的素材
+                      </button>
+                    </div>
+                    <div className="rounded-lg border border-border bg-white p-3">
+                      <div className="mb-2 flex items-center justify-between gap-2">
+                        <span className="inline-flex items-center gap-1.5 text-[11px] font-bold text-text-secondary"><FileText size={12} />资质凭证</span>
+                        <span className="text-[10px] text-text-muted">{product.documents?.length ?? 0}/{MAX_PRODUCT_DOCUMENTS}</span>
+                      </div>
+                      <p className="mb-2 text-[10px] leading-4 text-text-muted">这里只保存用于证明产品事实的证书、检测报告等资料，不作为视频创作素材。</p>
+                      <label className={`flex h-8 items-center justify-center gap-1.5 rounded-md border border-dashed text-[11px] font-bold ${(product.documents?.length ?? 0) >= MAX_PRODUCT_DOCUMENTS ? 'cursor-not-allowed bg-surface-2 text-text-muted' : 'cursor-pointer text-text-secondary hover:border-border-bright hover:text-text-primary'}`}>
+                        <Upload size={12} />上传资质凭证
+                        <input className="hidden" type="file" multiple accept=".pdf,.doc,.docx,.xls,.xlsx,.png,.jpg,.jpeg" disabled={(product.documents?.length ?? 0) >= MAX_PRODUCT_DOCUMENTS} onChange={e => { addProductDocuments(index, e.currentTarget.files); e.currentTarget.value = ''; }} />
+                      </label>
+                      <div className="mt-2 space-y-1">
+                        {(product.documents ?? []).map((asset, assetIndex) => (
+                          <div key={`${asset.name}-${assetIndex}`} className="flex min-w-0 items-center gap-1.5 text-[10px] text-text-secondary">
+                            {asset.url ? <a href={asset.url} target="_blank" rel="noreferrer" className="flex-1 truncate hover:text-text-primary">{asset.name}</a> : <span className="flex-1 truncate">{asset.name}</span>}
+                            <span className="shrink-0 text-text-muted">{formatSize(asset.size)}</span>
+                            <button type="button" onClick={() => removeProductDocument(index, assetIndex)} aria-label={`删除资质凭证 ${asset.name}`} title="删除资质凭证" className="shrink-0 rounded p-0.5 text-text-muted hover:text-red"><X size={10} /></button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                  </div>
+                </details>
+                );
+              })}
+              {!products.length && <p className="rounded-lg bg-surface-2 px-3 py-3 text-xs text-text-muted">还没有产品，先添加一个产品或导入产品表。</p>}
+            </div>
+            <PaginationControls page={productPage} total={products.length} pageSize={PAGE_SIZE} onChange={setProductPage} />
+          </KnowledgeCard>
+          )}
+
+          {knowledgeView === 'bizRules' && (
+          <KnowledgeCard id="biz-rules" icon={ShieldCheck} title="报价与业务规则" purpose="决定 AI 回复客户时的分寸——它能说什么、不能说什么" completed={completions.bizRules} highlight={bizRulesHighlight}>
+            {!completions.bizRules && <p className="mb-4 rounded-lg bg-sky-50 px-3 py-2 text-xs font-bold text-sky-800">补充样品、付款和交期后，AI 转人工时会替销售整理好询价条件。</p>}
+            <div className="space-y-4">
+              <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
+                <p className="text-sm font-black text-amber-900">客户询价 → 标记“等待人工报价”</p>
+                <p className="mt-1 text-xs leading-5 text-amber-800">AI 不回复价格，也不发送“稍后报价”占位消息；系统提醒销售查看数量、规格和包装要求后亲自回复。</p>
+              </div>
+              <div className="rounded-lg border border-border bg-surface-2/50 p-4">
+                <p className="text-sm font-black text-text-primary">业务资料</p>
+                <p className="mt-1 text-[11px] text-text-muted">与“产品资料 → 资质文书”同步显示，同一文件不重复上传。</p>
+                <div className="mt-3 space-y-1">{products.flatMap(product => (product.documents ?? []).map(file => ({ product: product.name || '未命名产品', file }))).map(({ product, file }, index) => <div key={`${file.name}-${index}`} className="flex items-center gap-2 rounded bg-white px-2 py-1.5 text-[11px]"><FileText size={12} className="text-text-muted" /><span className="min-w-0 flex-1 truncate">{file.name}</span><span className="text-text-muted">{product}</span></div>)}</div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <Field label="内部参考价格（不会自动发给客户）">
+                  <input className={inputCls} value={profile.bizRules?.priceRange ?? ''} onChange={e => setBizRule('priceRange', e.target.value)} placeholder="$5 - $500 USD，仅供销售参考" />
+                </Field>
+                <Field label="客户问 MOQ 时，AI 应怎么说">
+                  <input className={inputCls} value={profile.bizRules?.moq ?? ''} onChange={e => setBizRule('moq', e.target.value)} placeholder="常规 50 件起，支持混批" />
+                </Field>
+                <Field label="样品是否免费、运费谁出">
+                  <input className={inputCls} value={profile.bizRules?.samplePolicy ?? ''} onChange={e => setBizRule('samplePolicy', e.target.value)} placeholder="样品可付费申请，运费由买家承担" />
+                </Field>
+                <Field label="付款方式和节点">
+                  <input className={inputCls} value={profile.bizRules?.paymentTerms ?? ''} onChange={e => setBizRule('paymentTerms', e.target.value)} placeholder="T/T 30% 预付，尾款出货前结清" />
+                </Field>
+                <Field label="交期怎么表述">
+                  <input className={inputCls} value={profile.bizRules?.leadTime ?? ''} onChange={e => setBizRule('leadTime', e.target.value)} placeholder="样品 3-7 天，大货 20-35 天" />
+                </Field>
+                <Field label="议价底线说明">
+                  <input className={inputCls} value={profile.bizRules?.bargainFloor ?? ''} onChange={e => setBizRule('bargainFloor', e.target.value)} placeholder="可小幅让利，但不承诺低于成本线" />
+                </Field>
+              </div>
+              <Field label="销售议价偏好（仅用于内部建议）：">
+                <div className="flex flex-wrap gap-2">
+                  {[
+                    { value: 'no' as BargainPolicy, label: '不议价' },
+                    { value: 'limited' as BargainPolicy, label: '有限让步' },
+                    { value: 'open' as BargainPolicy, label: '开放协商' },
+                  ].map(option => (
+                    <button key={option.value} type="button" onClick={() => setBizRule('bargainPolicy', option.value)} className={`rounded-lg border px-3 py-2 text-xs font-bold ${profile.bizRules?.bargainPolicy === option.value ? 'border-slate-950 bg-slate-950 text-white' : 'border-border bg-white text-text-secondary'}`}>
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              </Field>
+            </div>
+          </KnowledgeCard>
+          )}
+
+          {knowledgeView === 'faq' && (
+          <div data-enterprise-faq>
+          <KnowledgeCard icon={BookOpen} title="常见问答" purpose="客户问到这些，AI 直接用你的标准答案回复" completed={completions.faq} stat={`${profile.faq?.length ?? 0} 条 · ${approvedFaqCount} 条已审批`}>
+            {faqPacks.length > 0 && (
+              <div data-lingshu-guide="enterprise-faq-pack" className="mb-4 rounded-xl border border-border bg-surface-2/40 p-3">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <p className="text-xs font-black text-text-primary">场景知识包</p>
+                  <button type="button" onClick={() => setFaqPacksOpen(open => !open)} className="rounded-lg border border-border bg-white px-3 py-2 text-[11px] font-bold text-text-secondary hover:bg-surface-2">
+                    {faqPacksOpen ? '收起知识包' : `打开知识包（推荐${faqPacks.find(pack => pack.industry === recommendedPackIndustry)?.industryLabel || '通用'}）`}
+                  </button>
+                </div>
+                {faqPacksOpen && (
+                <div className="grid gap-3 md:grid-cols-2">
+                  {[...faqPacks].sort((a, b) => Number(b.industry === recommendedPackIndustry) - Number(a.industry === recommendedPackIndustry)).map(pack => {
+                    const open = openPackId === pack.id;
+                    const selected = selectedQuestionsForPack(pack);
+                    const readyCount = pack.items.filter(item => item.ready && !item.exists).length;
+                    return (
+                      <div key={pack.id} className={`rounded-xl border bg-white p-3 ${open ? 'border-sky-200 ring-2 ring-sky-50' : 'border-border'}`}>
+                        <button type="button" onClick={() => setOpenPackId(open ? '' : pack.id)} className="flex w-full items-start justify-between gap-3 text-left">
+                          <div>
+                            <p className="text-xs font-black text-text-primary">{pack.industryLabel} · {pack.scenarioLabel}</p>
+                            <p className="mt-1 text-[11px] text-text-muted">{pack.count} 条 · 可导入 {readyCount} 条</p>
+                          </div>
+                          <span className="rounded-full bg-surface-2 px-2 py-1 text-[10px] font-bold text-text-secondary">{open ? '收起' : '预览'}</span>
+                        </button>
+                        {!open && (
+                          <div className="mt-3 space-y-1.5">
+                            {pack.preview.map(item => <p key={item.q} className="truncate text-[11px] text-text-secondary">Q：{item.q}</p>)}
+                            <button type="button" onClick={() => setOpenPackId(pack.id)} className="mt-2 rounded-lg border border-border bg-white px-3 py-1.5 text-[11px] font-bold text-text-secondary hover:bg-surface-2">一键添加</button>
+                          </div>
+                        )}
+                        {open && (
+                          <div className="mt-3 border-t border-border pt-3">
+                            <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
+                              {pack.items.map(item => {
+                                const disabled = !item.ready || item.exists;
+                                const checked = selected.includes(item.q) && !disabled;
+                                return (
+                                  <label key={item.q} className={`block rounded-lg border p-2 ${!item.ready ? 'border-amber-200 bg-amber-50' : item.exists ? 'border-slate-200 bg-slate-50 opacity-70' : 'border-border bg-white'}`}>
+                                    <div className="flex items-start gap-2">
+                                      <input type="checkbox" checked={checked} disabled={disabled} onChange={() => togglePackQuestion(pack, item.q)} className="mt-0.5" />
+                                      <div className="min-w-0 flex-1">
+                                        <p className="text-[11px] font-black text-text-primary">Q：{item.q}</p>
+                                        <p className="mt-1 text-[11px] leading-5 text-text-secondary">A：{item.a}</p>
+                                        {!item.ready && <p className="mt-1 text-[11px] font-bold text-amber-700">先完善报价规则板块：{item.missingVars.join('、')}</p>}
+                                        {item.exists && <p className="mt-1 text-[11px] font-bold text-slate-500">已存在，重复导入会跳过</p>}
+                                      </div>
+                                    </div>
+                                  </label>
+                                );
+                              })}
+                            </div>
+                            <div className="mt-3 flex items-center justify-between gap-2">
+                              <p className="text-[11px] text-text-muted">已选 {selected.filter(q => pack.items.some(item => item.q === q && item.ready && !item.exists)).length} 条</p>
+                              <button type="button" onClick={() => importFaqPack(pack)} disabled={packImporting === pack.id || selected.length === 0} className="inline-flex items-center gap-1.5 rounded-lg bg-slate-950 px-3 py-2 text-xs font-bold text-white disabled:opacity-60">
+                                {packImporting === pack.id ? <Loader2 size={12} className="animate-spin" /> : <Plus size={12} />}确认导入
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+                )}
+              </div>
+            )}
+            {profile.customers?.commonQuestions?.trim() && !(profile.faq ?? []).length && (
+              <div className="mb-4 rounded-lg border border-sky-200 bg-sky-50 p-3">
+                <p className="text-xs font-bold text-sky-900">检测到旧版问答内容，让 AI 帮你整理成问答条目？</p>
+                <button type="button" onClick={structureLegacyFaq} disabled={faqStructuring} className="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-sky-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-60">
+                  {faqStructuring ? <Loader2 size={12} className="animate-spin" /> : <Zap size={12} />}整理旧版内容
+                </button>
+              </div>
+            )}
+            {faqPreview.length > 0 && (
+              <div className="mb-4 rounded-lg border border-border bg-surface-2 p-3">
+                <p className="text-xs font-black text-text-primary">结构化预览</p>
+                <div className="mt-2 space-y-2">
+                  {faqPreview.map(item => <p key={item.id} className="text-xs text-text-secondary">Q：{item.question}<br />A：{item.answer}</p>)}
+                </div>
+                <div className="mt-3 flex gap-2">
+                  <button type="button" onClick={importFaqPreview} className="rounded-lg bg-slate-950 px-3 py-2 text-xs font-bold text-white">确认导入</button>
+                  <button type="button" onClick={() => setFaqPreview([])} className="rounded-lg border border-border bg-white px-3 py-2 text-xs font-bold text-text-secondary">取消</button>
+                </div>
+              </div>
+            )}
+            <div className="mb-4 flex justify-between gap-3">
+              <p className="text-xs text-text-muted">关闭自动回复时，AI 只写草稿等你确认。</p>
+              <button type="button" onClick={addFaq} className="inline-flex items-center gap-1.5 rounded-lg bg-slate-950 px-3 py-2 text-xs font-bold text-white"><Plus size={12} />添加问答</button>
+            </div>
+            <div className="space-y-3">
+              {visibleFaqs.map((item, index) => (
+                <details key={item.id} className="rounded-lg border border-border bg-surface-2/50 p-3" open={index === 0}>
+                  <summary className="flex cursor-pointer list-none items-center justify-between gap-3">
+                    <input className={`${inputCls} flex-1`} value={item.question} onChange={e => updateFaq(item.id, { question: e.target.value })} placeholder="客户会怎么问？" />
+                    <div className="flex items-center gap-2">
+                      <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${item.source === 'pack' ? 'bg-sky-50 text-sky-700' : item.source === 'learned' ? 'bg-emerald-50 text-emerald-700' : 'bg-white text-text-muted'}`}>
+                        {item.source === 'pack' ? '知识包' : item.source === 'learned' ? '学习' : '手动'}
+                      </span>
+                      <span className="text-[11px] text-text-muted">允许 AI 自动回复</span>
+                      <Toggle checked={item.approvedForAuto} onChange={checked => updateFaq(item.id, { approvedForAuto: checked })} />
+                      <button type="button" onClick={(event) => { event.preventDefault(); removeFaq(item.id); }} aria-label={`删除问答 ${item.question || index + 1}`} title="删除问答" className="rounded-md p-1 text-text-muted hover:text-red"><X size={13} /></button>
+                    </div>
+                  </summary>
+                  <textarea className={`${textareaCls} mt-3`} rows={3} value={item.answer} onChange={e => updateFaq(item.id, { answer: e.target.value })} placeholder="标准答案" />
+                </details>
+              ))}
+              {!(profile.faq ?? []).length && <p className="rounded-lg bg-surface-2 px-3 py-3 text-xs text-text-muted">还没有问答，先添加 5 条常见问题。</p>}
+            </div>
+            <PaginationControls page={faqPage} total={faqItems.length} pageSize={PAGE_SIZE} onChange={setFaqPage} />
+          </KnowledgeCard>
+          </div>
+          )}
+
+          {knowledgeView === 'salesStyle' && (
+          <section className="rounded-lg border border-border bg-white p-5 shadow-sm">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-sm font-black text-text-primary">你的销售风格</p>
+                <p className="mt-1 text-[11px] leading-relaxed text-text-muted">
+                  AI 从你 {profile.salesStyleProfile?.learnedFromCount ?? 0} 次真实回复中学到的风格，持续更新，生成回复时会参考。
+                </p>
+                {styleMessage && <p className="mt-2 text-[11px] font-bold text-primary">{styleMessage}</p>}
+              </div>
+              <div className="flex items-center gap-2">
+                {profile.salesStyleProfile?.lastDistilledAt && (
+                  <span className="rounded-full bg-surface-2 px-2.5 py-1 text-[11px] font-bold text-text-muted">
+                    {new Date(profile.salesStyleProfile.lastDistilledAt).toLocaleDateString('zh-CN')} 更新
+                  </span>
+                )}
+                <button type="button" onClick={distillSalesStyle} disabled={styleDistilling} className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-white px-3 py-2 text-xs font-bold text-text-secondary hover:bg-surface-2 disabled:opacity-60">
+                  {styleDistilling ? <Loader2 size={12} className="animate-spin" /> : <RotateCcw size={12} />}重新学习
+                </button>
+              </div>
+            </div>
+            <div className="mt-4 grid grid-cols-3 gap-3">
+              {([
+                ['greeting_style', '开场称呼'],
+                ['quoting_stance', '报价姿态'],
+                ['followup_rhythm', '跟进节奏'],
+              ] as const).map(([key, label]) => {
+                const item = profile.salesStyleProfile?.[key];
+                return (
+                  <div key={key} className="rounded-lg border border-border bg-surface-2/50 p-3">
+                    <div className="mb-2 flex items-center justify-between gap-2">
+                      <p className="text-xs font-black text-text-primary">{label}</p>
+                      <button type="button" onClick={() => deleteSalesStyleField(key)} aria-label={`删除${label}销售风格`} className="text-[11px] font-bold text-text-muted hover:text-red">删除</button>
+                    </div>
+                    <textarea
+                      className={textareaCls}
+                      rows={3}
+                      value={item?.value ?? ''}
+                      onChange={event => updateSalesStyleField(key, event.target.value)}
+                      placeholder="暂未学习到，或手动补充"
+                    />
+                    <p className="mt-2 line-clamp-2 text-[11px] leading-5 text-text-muted">佐证：{item?.evidence || '暂无'}</p>
+                    {item?.manual && <span className="mt-2 inline-flex rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-bold text-amber-700">人工锁定</span>}
+                  </div>
+                );
+              })}
+            </div>
+            <div className="mt-3 rounded-lg border border-border bg-surface-2/50 p-3">
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <p className="text-xs font-black text-text-primary">禁用表达</p>
+                <button type="button" onClick={deleteTabooPhrases} aria-label="删除禁用表达" className="text-[11px] font-bold text-text-muted hover:text-red">删除</button>
+              </div>
+              <input
+                className={inputCls}
+                value={(profile.salesStyleProfile?.taboo_phrases?.value ?? []).join('，')}
+                onChange={event => updateTabooPhrases(event.target.value)}
+                placeholder="用逗号分隔，例如：最低价，马上下单"
+              />
+              <p className="mt-2 text-[11px] text-text-muted">佐证：{profile.salesStyleProfile?.taboo_phrases?.evidence || '暂无'}</p>
+            </div>
+            {(profile.salesStyleProfile?.sample_pairs ?? []).length > 0 && (
+              <div className="mt-3 rounded-lg border border-border bg-surface-2/50 p-3">
+                <p className="text-xs font-black text-text-primary">代表样本</p>
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  {(profile.salesStyleProfile?.sample_pairs ?? []).slice(0, 4).map((pair, index) => (
+                    <div key={`${pair.trigger}-${index}`} className="rounded-lg bg-white p-2 text-[11px] leading-5 text-text-secondary">
+                      <p className="font-bold text-text-primary">买家：{pair.trigger}</p>
+                      <p className="mt-1">定稿：{pair.final}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </section>
+          )}
+
+          {knowledgeView === 'advanced' && (
+          <section className="rounded-lg border border-border bg-white shadow-sm">
+            <div className="flex w-full items-center justify-between px-5 py-4 text-left">
+              <span>
+                <span className="block text-sm font-black text-text-primary">接待规则与高级设置</span>
+                <span className="mt-1 block text-[11px] text-text-muted">先选灵小枢参与到哪一步，再设置什么时候交给你。</span>
+              </span>
+            </div>
+              <div className="space-y-5 border-t border-border p-5">
+                {aiAutonomySection}
+                {handoffSafetySection}
+                {notificationSettingsSection}
+
+                <SupportAccessControl />
+
+                <div className="rounded-lg border border-border bg-surface-2/40 p-4">
+                  <div className="mb-3 flex items-center gap-2"><Compass size={14} className="text-text-secondary" /><h3 className="text-sm font-black text-text-primary">经营策略</h3></div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <Field label="当前阶段目标"><input className={inputCls} value={profile.strategy?.currentGoal ?? ''} onChange={e => set('strategy')('currentGoal', e.target.value)} /></Field>
+                    <Field label="本期重点产品"><input className={inputCls} value={profile.strategy?.focusProducts ?? ''} onChange={e => set('strategy')('focusProducts', e.target.value)} /></Field>
+                    <Field label="重点市场"><OptionSelector value={profile.strategy?.focusMarkets ?? ''} options={MARKET_OPTIONS} onChange={value => set('strategy')('focusMarkets', value)} placeholder="选择重点市场" /></Field>
+                    <Field label="暂不经营市场"><OptionSelector value={profile.strategy?.excludedMarkets ?? ''} options={MARKET_OPTIONS} onChange={value => set('strategy')('excludedMarkets', value)} placeholder="选择暂不经营市场" /></Field>
+                    <Field label="最低利润率"><input className={inputCls} value={profile.strategy?.minMargin ?? ''} onChange={e => set('strategy')('minMargin', e.target.value)} /></Field>
+                  </div>
+                  <Field label="价格策略"><textarea className={textareaCls} rows={2} value={profile.strategy?.pricingStrategy ?? ''} onChange={e => set('strategy')('pricingStrategy', e.target.value)} /></Field>
+                </div>
+
+                <div className="rounded-lg border border-border bg-surface-2/40 p-4">
+                  <div className="mb-3 flex items-center gap-2"><Megaphone size={14} className="text-text-secondary" /><h3 className="text-sm font-black text-text-primary">品牌调性</h3></div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <Field label="品牌调性关键词"><OptionSelector value={profile.brand.tone} options={BRAND_TONE_OPTIONS} onChange={value => set('brand')('tone', value)} placeholder="选择品牌调性" /></Field>
+                    <Field label="沟通风格"><OptionSelector value={profile.brand.style} options={COMMUNICATION_STYLE_OPTIONS} multiple={false} onChange={value => set('brand')('style', value)} placeholder="选择沟通风格" /></Field>
+                    <Field label="首选输出语言"><OptionSelector value={profile.brand.preferredLanguages ?? ''} options={LANGUAGE_OPTIONS} onChange={value => set('brand')('preferredLanguages', value)} placeholder="选择首选输出语言" /></Field>
+                    <Field label="核心卖点"><input className={inputCls} value={profile.brand.usp} onChange={e => set('brand')('usp', e.target.value)} /></Field>
+                  </div>
+                  <Field label="禁忌话题"><input className={inputCls} value={profile.brand.taboos} onChange={e => set('brand')('taboos', e.target.value)} /></Field>
+                </div>
+
+                <div className="rounded-lg border border-border bg-surface-2/40 p-4">
+                  <div className="mb-3 flex items-center gap-2"><BookOpen size={14} className="text-text-secondary" /><h3 className="text-sm font-black text-text-primary">Agent 学习记录</h3></div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <Field label="已验证有效角度"><textarea className={textareaCls} rows={2} value={profile.agentLearning?.provenAngles ?? ''} onChange={e => set('agentLearning')('provenAngles', e.target.value)} /></Field>
+                    <Field label="低效角度 / 需降权"><textarea className={textareaCls} rows={2} value={profile.agentLearning?.weakAngles ?? ''} onChange={e => set('agentLearning')('weakAngles', e.target.value)} /></Field>
+                    <Field label="待确认推断"><textarea className={textareaCls} rows={2} value={profile.agentLearning?.pendingAssumptions ?? ''} onChange={e => set('agentLearning')('pendingAssumptions', e.target.value)} /></Field>
+                    <Field label="用户纠正偏好"><textarea className={textareaCls} rows={2} value={profile.agentLearning?.userCorrections ?? ''} onChange={e => set('agentLearning')('userCorrections', e.target.value)} /></Field>
+                  </div>
+                  <Field label="自由填写"><textarea className={textareaCls} rows={5} value={profile.knowledge} onChange={e => setProfile(prev => ({ ...prev, knowledge: e.target.value }))} /></Field>
+                </div>
+
+                <div className="rounded-lg border border-border bg-surface-2/40 p-4">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-border bg-white px-3 py-2 text-xs font-bold text-text-secondary">
+                      {orderImporting ? <Loader2 size={12} className="animate-spin" /> : <Upload size={12} />}上传订单 CSV
+                      <input type="file" accept=".csv,text/csv" className="hidden" disabled={orderImporting} onChange={e => { const file = e.target.files?.[0] || null; e.currentTarget.value = ''; void importOrderCsv(file); }} />
+                    </label>
+                  </div>
+                  {orderImportMessage && <p className="mt-2 text-[11px] font-bold text-emerald-700">{orderImportMessage}</p>}
+                </div>
+              </div>
+          </section>
+          )}
+
+          <div className="h-4" />
+        </div>
+      </div>
+    </div>
+  );
+}
